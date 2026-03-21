@@ -1,0 +1,12 @@
+product_key	alias	status	comment
+Gift_cards-PlayStation_network_aka_psn	playstation	active	allowed short market name
+currys-pc-world-gift-card	currys	active	allowed short market name
+Gift_cards-PlayStation_network_aka_psn	psn	active	allowed abbreviation
+Gift_cards-PlayStation_network_aka_psn	play station	active	allowed spaced short market name
+Gift_cards-PlayStation_network_aka_psn	playstation network	active	allowed full market name
+Gift_cards-PlayStation_network_aka_psn	ps network	active	allowed short market phrase
+currys-pc-world-gift-card	currys pc world	active	allowed full market name
+currys-pc-world-gift-card	currys pc	active	allowed short market phrase
+currys-pc-world-gift-card	currys gift card	active	allowed market phrase from product names
+currys-pc-world-gift-card	currys giftcard	active	allowed compact market phrase
+Gift_cards-PlayStation_network_aka_psn	playstation gift card	active	allowed market phrase from product names
