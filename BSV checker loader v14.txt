@@ -1,0 +1,1 @@
+javascript:(async()=>{const url='https://vitalijsf-dev.github.io/bsv-catalogue-rules/bsv_integrated_checker_catalogue_v14.txt';const r=await fetch(url,{cache:'no-store'});if(!r.ok){alert('Failed to load checker: '+r.status);return;}const code=await r.text();eval(code);})()
