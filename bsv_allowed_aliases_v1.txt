@@ -11,4 +11,4 @@ currys-pc-world-gift-card	currys gift card	active	allowed market phrase from pro
 currys-pc-world-gift-card	currys giftcard	active	allowed compact market phrase
 Gift_cards-PlayStation_network_aka_psn	playstation gift card	active	allowed market phrase from product names
 Games-League_of_Legends	lol	active	allowed short market name
-Apple	itunes	active	allowed short market name
+gift-cards-apple	itunes	active	allowed short market name
