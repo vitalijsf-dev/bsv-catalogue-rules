@@ -1,0 +1,499 @@
+(async () => {
+  const CHECKER_NS = "__BSV_QC_INTEGRATED_CATALOGUE_V22__";
+  const LOGGER_NS = "__BSV_QC_HANDOFF_LOGGER_V049__";
+  const GATEWAY_URL = "https://script.google.com/a/macros/buysellvouchers.com/s/AKfycbwdgKEJCe-uIKAJuPV61Nx7STt9-pA9ryKocgjbIx9iJqxOlGiofj4OYCkO0TFmFMkw/exec";
+
+  function createToastHost() {
+    let host = document.querySelector('[data-bsv-global-toast-host="1"]');
+    if (host) return host;
+    host = document.createElement("div");
+    host.setAttribute("data-bsv-global-toast-host", "1");
+    host.style.cssText = "position:fixed;top:18px;right:18px;z-index:2147483647;display:flex;flex-direction:column;gap:10px;align-items:flex-end;pointer-events:none;";
+    document.body.appendChild(host);
+    return host;
+  }
+
+  function showGlobalToast(message, tone = "info", timeoutMs = 3200) {
+    const host = createToastHost();
+    const palette = {
+      info: { bg: "rgba(11,36,71,.96)", border: "rgba(191,219,254,.28)", color: "#dbeafe" },
+      ok: { bg: "rgba(6,78,59,.96)", border: "rgba(110,231,183,.35)", color: "#d1fae5" },
+      warn: { bg: "rgba(120,53,15,.97)", border: "rgba(253,224,71,.34)", color: "#fef3c7" },
+      err: { bg: "rgba(127,29,29,.97)", border: "rgba(252,165,165,.34)", color: "#fee2e2" }
+    };
+    const c = palette[tone] || palette.info;
+    const toast = document.createElement("div");
+    toast.style.cssText = "max-width:440px;padding:12px 14px;border-radius:14px;background:"+c.bg+";color:"+c.color+";border:1px solid "+c.border+";box-shadow:0 12px 28px rgba(0,0,0,.28);font:14px/1.45 Arial,sans-serif;pointer-events:none;opacity:0;transform:translateY(-6px);transition:opacity .18s ease, transform .18s ease;";
+    toast.textContent = String(message || "").trim();
+    host.appendChild(toast);
+    requestAnimationFrame(() => {
+      toast.style.opacity = "1";
+      toast.style.transform = "translateY(0)";
+    });
+    setTimeout(() => {
+      toast.style.opacity = "0";
+      toast.style.transform = "translateY(-6px)";
+      setTimeout(() => { try { toast.remove(); } catch (_) {} }, 220);
+    }, Math.max(1200, Number(timeoutMs) || 3200));
+  }
+
+
+  if (window[LOGGER_NS] && window[LOGGER_NS].attached) {
+    showGlobalToast("Кнопка отправки уже добавлена в текущую панель checker.", "info", 2200);
+    return;
+  }
+
+  const checkerState = window[CHECKER_NS];
+  if (!checkerState || !checkerState.panel) {
+    showGlobalToast("Сначала запустите основной support checker, а потом подключайте logger-модуль.", "warn", 3200);
+    return;
+  }
+
+  const panel = checkerState.panel;
+
+  function normalizeText(value) {
+    return String(value == null ? "" : value).replace(/\s+/g, " ").trim();
+  }
+
+  function getDirectButtons(node) {
+    return [...(node ? node.children : [])].filter((el) => el && el.tagName === "BUTTON");
+  }
+
+  function hasButtonText(buttons, text) {
+    return buttons.some((btn) => normalizeText(btn.textContent) === text);
+  }
+
+  function findActionRow(hostPanel) {
+    if (!hostPanel) return null;
+
+    const directDivs = [...hostPanel.children].filter((el) => el && el.tagName === "DIV");
+
+    for (const div of directDivs) {
+      const buttons = getDirectButtons(div);
+      if (buttons.length >= 2 && hasButtonText(buttons, "Применить") && hasButtonText(buttons, "Проверить")) {
+        return div;
+      }
+    }
+
+    for (const div of hostPanel.querySelectorAll("div")) {
+      const buttons = getDirectButtons(div);
+      if (buttons.length >= 2 && hasButtonText(buttons, "Применить") && hasButtonText(buttons, "Проверить")) {
+        return div;
+      }
+    }
+
+    return null;
+  }
+
+  const actionRow = findActionRow(panel);
+  if (!actionRow) {
+    showGlobalToast("Не удалось найти строку кнопок checker для подключения logger-модуля.", "err", 3600);
+    return;
+  }
+
+  if (panel.querySelector('[data-bsv-handoff-btn="1"]')) {
+    showGlobalToast("Кнопка отправки уже добавлена в текущую панель checker.", "info", 2200);
+    return;
+  }
+
+  function btn(label, bg) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.style.cssText = "border:none;border-radius:11px;padding:8px 14px;cursor:pointer;font-weight:700;font-size:15px;color:#fff;background:" + bg + ";";
+    return b;
+  }
+
+  function formatLocalDate(date) {
+    const p = (n) => String(n).padStart(2, "0");
+    return date.getFullYear() + "-" + p(date.getMonth() + 1) + "-" + p(date.getDate()) + " " + p(date.getHours()) + ":" + p(date.getMinutes()) + ":" + p(date.getSeconds());
+  }
+
+  function buildHandoffId(productId) {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, "0");
+    return "CHK-" + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + "-" + (productId || "unknown");
+  }
+
+  function extractProductId(url) {
+    const match = String(url || "").match(/[?&]id=(\d+)/i);
+    return match ? match[1] : "";
+  }
+
+  function getOperatorName() {
+    const selectors = [
+      '#logo a[href*="/xdm/site/preferences"]',
+      '#header a[href*="/xdm/site/preferences"]'
+    ];
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      if (el && normalizeText(el.textContent)) {
+        return normalizeText(el.textContent);
+      }
+    }
+    return "unknown";
+  }
+
+  function getCheckerVersion() {
+    const titleEl = [...panel.children].find((el) => el && el.tagName === "DIV");
+    return titleEl ? normalizeText(titleEl.textContent) : "unknown";
+  }
+
+  function getCurrentProductType() {
+    const select = document.querySelector("#Product_product_type_id");
+    return select && select.selectedOptions && select.selectedOptions[0]
+      ? normalizeText(select.selectedOptions[0].textContent)
+      : "";
+  }
+
+  function getCurrentRegion() {
+    const items = [...document.querySelectorAll("#region-container .region-item .region-name")]
+      .map((el) => normalizeText(el.textContent))
+      .filter(Boolean);
+    return items.join(", ");
+  }
+
+  function getCurrentDenomination() {
+    const select = document.querySelector("#denomination-select");
+    return select && select.selectedOptions && select.selectedOptions[0]
+      ? normalizeText(select.selectedOptions[0].textContent)
+      : "none";
+  }
+
+  function getNameValue() {
+    const el = document.querySelector("#Product_name");
+    return el ? String(el.value || "").trim() : "";
+  }
+
+  function getDescriptionValue() {
+    const el = document.querySelector("#Product_description");
+    return el ? String(el.value || "").trim() : "";
+  }
+
+  function uiStatusText(result, fallback) {
+    const map = {
+      ok: "ПОДТВЕРЖДЁН",
+      passed: "АКТИВЕН",
+      failed: "НЕ ПОДТВЕРЖДЁН",
+      denied: "ЗАБЛОКИРОВАН",
+      error: "ОШИБКА",
+      "change required": "ТРЕБУЕТ ИЗМЕНЕНИЯ",
+      "manual review": "ТРЕБУЕТСЯ ПРОВЕРКА",
+      skipped: "ПРОПУЩЕН"
+    };
+    return map[result] || normalizeText(fallback || result || "ТРЕБУЕТСЯ ПРОВЕРКА").toUpperCase();
+  }
+
+  function computeOverallStatus(r) {
+    if (!r || !r.final) return "ТРЕБУЕТСЯ ПРОВЕРКА";
+    if (r.final.activeCatalogue && r.final.activeCatalogue.result !== "passed") {
+      return "ТРЕБУЕТСЯ ПРОВЕРКА";
+    }
+    if (r.final.product && r.final.product.result !== "ok") {
+      return uiStatusText(r.final.product.result, r.final.product.text);
+    }
+    if (r.final.region && r.final.region.result !== "ok") {
+      return uiStatusText(r.final.region.result, r.final.region.text);
+    }
+    if (r.final.denomination && r.final.denomination.result !== "ok") {
+      return uiStatusText(r.final.denomination.result, r.final.denomination.text);
+    }
+    return "ПОДТВЕРЖДЁН";
+  }
+
+  function computeMainReason(r) {
+    if (!r || !r.final) return "Требуется проверка";
+    if (r.final.activeCatalogue && r.final.activeCatalogue.result !== "passed") {
+      return normalizeText(r.final.activeCatalogue.text || r.final.activeCatalogue.note || "Требуется проверка");
+    }
+    if (r.final.product && r.final.product.result !== "ok") {
+      return normalizeText(r.final.product.text);
+    }
+    if (r.final.region && r.final.region.result !== "ok") {
+      return normalizeText(r.final.region.text);
+    }
+    if (r.final.denomination && r.final.denomination.result !== "ok") {
+      return normalizeText(r.final.denomination.text);
+    }
+    return "Проверка пройдена";
+  }
+
+  function computeActionNeeded(r) {
+    if (!r || !r.final) return "провести ручную проверку";
+    if (r.final.activeCatalogue && r.final.activeCatalogue.result !== "passed") return "провести ручную проверку";
+    if (r.final.product && r.final.product.result !== "ok") return "проверить ProductType";
+    if (r.final.region && r.final.region.result !== "ok") return "проверить регион";
+    if (r.final.denomination && r.final.denomination.result !== "ok") return "проверить denomination";
+    return "действий не требуется";
+  }
+
+  function computeBlockingModule(r) {
+    if (!r || !r.final) return "Unknown";
+    if (r.final.activeCatalogue && r.final.activeCatalogue.result !== "passed") return "ActiveCatalogue";
+    if (r.final.product && r.final.product.result !== "ok") return "ProductType";
+    if (r.final.region && r.final.region.result !== "ok") return "Region";
+    if (r.final.denomination && r.final.denomination.result !== "ok") return "Denomination";
+    return "None";
+  }
+
+  function computeReasonCategory(r) {
+    if (!r || !r.final) return "manual_review";
+    const block = computeBlockingModule(r);
+    const denomText = normalizeText(r.final.denomination && r.final.denomination.text);
+    if (block === "ProductType") {
+      if (r.final.product.result === "change required") return "product_type_mismatch";
+      if (r.final.product.result === "manual review") return "manual_review";
+      if (r.final.product.result === "denied") return "active_catalogue_failed";
+      return "product_type_issue";
+    }
+    if (block === "Region") {
+      if (/blocked until ProductType/i.test(String(r.final.region.text || ""))) return "blocked_by_product";
+      if (r.final.region.result === "change required") return "region_mismatch";
+      return "region_issue";
+    }
+    if (block === "Denomination") {
+      if (/blocked until ProductType/i.test(denomText)) return "blocked_by_product";
+      if (/blocked until Region/i.test(denomText)) return "blocked_by_region";
+      if (/absent in catalogue denomination rules|not found|нет в таблице|отсутствует/i.test(denomText)) return "denomination_missing";
+      if (/parsing/i.test(denomText)) return "parsing_issue";
+      if (/ambiguous/i.test(denomText)) return "ambiguous_target";
+      if (/table|rules mismatch/i.test(denomText)) return "table_rules_mismatch";
+      return "denomination_issue";
+    }
+    if (block === "ActiveCatalogue") return "active_catalogue_failed";
+    return "confirmed";
+  }
+
+  function buildDiagnosticsJson(r) {
+    const compact = {
+      final: r && r.final ? r.final : null,
+      heuristic: {
+        currentTypeText: r && r.heuristic ? r.heuristic.currentTypeText : null,
+        currentRegions: r && r.heuristic ? r.heuristic.currentRegions : null,
+        denomMode: r && r.heuristic && r.heuristic.denom ? r.heuristic.denom.mode : null,
+        logs: r && r.heuristic ? r.heuristic.log : null
+      },
+      catalogue: r && r.catalogue ? {
+        activeCatalogue: r.catalogue.activeCatalogue || null,
+        meta: r.catalogue.meta || null,
+        error: r.catalogue.error || null
+      } : null
+    };
+    try {
+      return JSON.stringify(compact);
+    } catch (error) {
+      return JSON.stringify({ error: "Failed to stringify diagnostics" });
+    }
+  }
+
+  function postCheckerHandoffToAppsScript(webAppUrl, payload) {
+    return new Promise((resolve, reject) => {
+      try {
+        const iframeName = 'bsv_checker_handoff_iframe_' + Date.now();
+        const iframe = document.createElement('iframe');
+        iframe.name = iframeName;
+        iframe.style.display = 'none';
+
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = webAppUrl;
+        form.target = iframeName;
+        form.style.display = 'none';
+
+        const envelope = Object.assign({}, payload || {}, {
+          transport: 'postmessage',
+          client_handoff_id: payload && payload.handoff_id ? String(payload.handoff_id) : ''
+        });
+
+        Object.entries(envelope).forEach(([key, value]) => {
+          const input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = key;
+          input.value = value == null ? '' : String(value);
+          form.appendChild(input);
+        });
+
+        let settled = false;
+        const cleanup = () => {
+          window.removeEventListener('message', onMessage);
+          setTimeout(() => {
+            try { form.remove(); } catch (_) {}
+            try { iframe.remove(); } catch (_) {}
+          }, 1000);
+        };
+
+        const onMessage = (event) => {
+          const data = event && event.data;
+          if (!data || typeof data !== 'object') return;
+          if (data.source !== 'BSV_CHECKER_HANDOFF_GATEWAY_V048') return;
+          if ((payload && payload.handoff_id) && data.client_handoff_id && data.client_handoff_id !== payload.handoff_id) return;
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (data.ok) {
+            resolve({ ok: true, handoff_id: data.handoff_id || '', product_id: data.product_id || '', message: data.message || '' });
+          } else {
+            reject(new Error(data.error || 'Gateway returned error'));
+          }
+        };
+
+        window.addEventListener('message', onMessage);
+
+        iframe.addEventListener('load', () => {
+          // wait for postMessage from the gateway; plain load is not enough
+        });
+
+        setTimeout(() => {
+          if (settled) return;
+          settled = true
+          cleanup();
+          reject(new Error('Timeout while waiting for gateway confirmation'));
+        }, 20000);
+
+        document.body.appendChild(iframe);
+        document.body.appendChild(form);
+        form.submit();
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  function buildPayloadFromCurrentAnalysis(r) {
+    const productUrl = window.location.href;
+    const productId = extractProductId(productUrl);
+    const loggedAt = formatLocalDate(new Date());
+    return {
+      product_id: productId,
+      product_url: productUrl,
+      logged_at: loggedAt,
+      handoff_id: buildHandoffId(productId),
+      operator_name: getOperatorName(),
+      checker_version: getCheckerVersion(),
+      overall_status: computeOverallStatus(r),
+      main_reason: computeMainReason(r),
+      action_needed: computeActionNeeded(r),
+      blocking_module: computeBlockingModule(r),
+      current_product_type: getCurrentProductType(),
+      recommended_product_type: normalizeText(r && r.final && r.final.product ? r.final.product.recommended : ""),
+      product_type_source: normalizeText(r && r.final && r.final.product ? r.final.product.source : ""),
+      current_region: getCurrentRegion(),
+      recommended_region: normalizeText(r && r.final && r.final.region ? r.final.region.recommended : ""),
+      region_source: normalizeText(r && r.final && r.final.region ? r.final.region.source : ""),
+      current_denomination: getCurrentDenomination(),
+      recommended_denomination: normalizeText(r && r.final && r.final.denomination ? r.final.denomination.recommended : ""),
+      denomination_source: normalizeText(r && r.final && r.final.denomination ? r.final.denomination.source : ""),
+      denomination_mode: normalizeText((r && r.final && r.final.denomination ? r.final.denomination.mode : "") || (r && r.heuristic && r.heuristic.denom ? r.heuristic.denom.mode : "")),
+      name: getNameValue(),
+      description: getDescriptionValue(),
+      reason_category: computeReasonCategory(r),
+      diagnostics_json: buildDiagnosticsJson(r),
+      next_department_status: "NEW",
+      next_department_comment: ""
+    };
+  }
+
+  const handoffBtn = btn("Отправить в таблицу", "#7c3aed");
+  handoffBtn.setAttribute("data-bsv-handoff-btn", "1");
+  handoffBtn.title = "Отправить текущий результат checker в Google Таблицу";
+
+  const statusNote = document.createElement("div");
+  statusNote.setAttribute("data-bsv-handoff-note", "1");
+  statusNote.style.cssText = "margin-top:8px;padding:8px 10px;border-radius:10px;background:#0b2447;color:#bfdbfe;font-size:13px;display:none;";
+  statusNote.textContent = "";
+
+  let panelNoteTimer = null;
+  function showPanelNote(message, tone = "info", timeoutMs = 0) {
+    const palette = {
+      info: { bg: "rgba(11,36,71,.92)", border: "rgba(191,219,254,.22)", color: "#dbeafe" },
+      ok: { bg: "rgba(6,78,59,.92)", border: "rgba(110,231,183,.28)", color: "#d1fae5" },
+      warn: { bg: "rgba(120,53,15,.94)", border: "rgba(253,224,71,.30)", color: "#fef3c7" },
+      err: { bg: "rgba(127,29,29,.94)", border: "rgba(252,165,165,.28)", color: "#fee2e2" }
+    };
+    const c = palette[tone] || palette.info;
+    if (panelNoteTimer) {
+      clearTimeout(panelNoteTimer);
+      panelNoteTimer = null;
+    }
+    statusNote.style.display = "block";
+    statusNote.style.background = c.bg;
+    statusNote.style.color = c.color;
+    statusNote.style.border = "1px solid " + c.border;
+    statusNote.textContent = String(message || "").trim();
+    if ((Number(timeoutMs) || 0) > 0) {
+      panelNoteTimer = setTimeout(() => {
+        statusNote.style.display = "none";
+        statusNote.textContent = "";
+      }, Number(timeoutMs));
+    }
+  }
+
+
+
+  async function sendCurrentAnalysis() {
+    const r = checkerState.lastAnalysis;
+    if (!r) {
+      showPanelNote("Сначала дождитесь завершения проверки или нажмите «Проверить».", "warn", 4200);
+      return;
+    }
+
+    const payload = buildPayloadFromCurrentAnalysis(r);
+
+    if (!payload.product_id) {
+      showPanelNote("Не удалось определить product_id из URL страницы.", "err", 5200);
+      return;
+    }
+
+    const originalText = handoffBtn.textContent;
+    handoffBtn.disabled = true;
+    handoffBtn.textContent = "Отправка...";
+    showPanelNote("Отправка записи в Google Таблицу...", "info", 0);
+
+    try {
+      const result = await postCheckerHandoffToAppsScript(GATEWAY_URL, payload);
+      window[LOGGER_NS].lastPayload = payload;
+      window[LOGGER_NS].lastResult = result;
+      window[LOGGER_NS].lastError = null;
+      showPanelNote("Запись отправлена в таблицу · Handoff ID: " + payload.handoff_id, "ok", 6500);
+      showGlobalToast("Запись по товару " + payload.product_id + " отправлена в таблицу.", "ok", 2600);
+    } catch (error) {
+      window[LOGGER_NS].lastPayload = payload;
+      window[LOGGER_NS].lastResult = null;
+      window[LOGGER_NS].lastError = error && error.message ? error.message : String(error);
+      showPanelNote("Ошибка отправки: " + (error && error.message ? error.message : String(error)), "err", 9000);
+      showGlobalToast("Не удалось отправить запись в таблицу.", "err", 3200);
+    } finally {
+      handoffBtn.disabled = false;
+      handoffBtn.textContent = originalText;
+    }
+  }
+
+  handoffBtn.addEventListener("click", async (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    await sendCurrentAnalysis();
+  }, true);
+
+  const directButtons = getDirectButtons(actionRow);
+  const closeButton = directButtons.find((btn) => normalizeText(btn.textContent) === "×");
+  if (closeButton) {
+    actionRow.insertBefore(handoffBtn, closeButton);
+  } else {
+    actionRow.appendChild(handoffBtn);
+  }
+  actionRow.insertAdjacentElement("afterend", statusNote);
+
+  window[LOGGER_NS] = {
+    attached: true,
+    button: handoffBtn,
+    note: statusNote,
+    panel,
+    gatewayUrl: GATEWAY_URL,
+    cleanup: () => {
+      try { handoffBtn.remove(); } catch (_) {}
+      try { statusNote.remove(); } catch (_) {}
+    }
+  };
+
+  showPanelNote("Кнопка «Отправить в таблицу» добавлена.", "info", 2400);
+})();
