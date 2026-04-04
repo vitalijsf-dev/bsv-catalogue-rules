@@ -1,0 +1,1164 @@
+(async () => {
+  "use strict";
+
+  /* ═══════════════════════════════════════════════════════════════
+     BSV List Review V4 Runtime — v064
+     Branch: Popup Worker Window — rebased on v52/v56 checker pair
+     Depends on: BSV_v052_CHECKER_RUNTIME_REGION_PRIORITY_MANUAL_REVIEW_v3.txt
+     ═══════════════════════════════════════════════════════════════
+     REBASE v064:
+     - AI V2 Assist Mode with denomination math parser
+     - Deterministic AI eligibility checker (qualifiesForAI)
+     - AI service payload builder and async caller
+     - AI result merge policy with hard deterministic wins
+     - AI cache per productId
+     - Section 7: AI Assist V2 in renderDetail (purple/violet theme)
+     - Updated deriveOverall to merge AI results
+
+     v063 features (carried forward):
+     - Navigation sentinel (__bsv_nav_seq__) for popup reuse
+     - Strict sequential CONCURRENCY = 1
+     - CHECKER_NS → v52 namespace (REGION_PRIORITY_MANUAL_REVIEW_V3)
+     - CHECKER_URL → v52 runtime on GitHub Pages
+     - manualReviewWords support throughout
+     - Staging rules localStorage setup before checker execution
+     ═══════════════════════════════════════════════════════════════ */
+
+  const NS            = "__BSV_LIST_REVIEW_V064__";
+  const CHECKER_NS    = "__BSV_QC_INTEGRATED_CATALOGUE_REGION_PRIORITY_MANUAL_REVIEW_V3__";
+  const CHECKER_URL   = "https://vitalijsf-dev.github.io/bsv-catalogue-rules/BSV_v052_CHECKER_RUNTIME_REGION_PRIORITY_MANUAL_REVIEW_v3.txt";
+  const AI_SERVICE_URL = "https://script.google.com/a/macros/buysellvouchers.com/s/AKfycbyd1_1TJ0-VT91nNtckB-PKnyVXaTEvitwu1B7lN7u7ZMQuPeUio3OamINAtxUC4BIv/exec";
+  const STAGING_RULES_URL = "https://vitalijsf-dev.github.io/bsv-catalogue-rules/compiled-rules-prototype-v1_AUTOPUBLISH_PREVIEW_MIN_v1.json";
+  const PREVIEW_META_URL  = "https://script.google.com/macros/s/AKfycbwCDG672o-mu6_lzry1oKoCfCwHd9oXpzx3DM-ukmAamzW2EKPn0pE-x0jzKOO-xybS/exec?action=preview_meta";
+  const CONCURRENCY        = 1;   /* HARD: never > 1 for popup mode */
+  const CHECKER_POLL_MS    = 35000;
+  const PAGE_LOAD_TIMEOUT  = 25000;
+  const NAV_DETECT_TIMEOUT = 10000;
+  const POLL_INTERVAL_MS   = 400;
+
+  /* localStorage keys used by v52 checker / v56 loader for staging rules */
+  const LS_CONFIG_KEY     = "BSV_QC_RULES_URL_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const LS_CACHE_KEY      = "BSV_QC_RULES_CACHE_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const LS_CACHE_META_KEY = "BSV_QC_RULES_CACHE_META_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const LS_NOTE_KEY       = "BSV_QC_NOTE_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const LS_HASH_KEY       = "BSV_QC_STAGING_PREVIEW_MIN_HASH_V1";
+
+  /* ── Guard: must be on list page ── */
+  if (!document.querySelector("table.items")) {
+    alert("BSV List Review V4: таблица товаров не найдена.\nОткройте страницу Product List (/xdm/product/admin).");
+    return;
+  }
+
+  /* ── Cleanup previous instance ── */
+  if (window[NS] && typeof window[NS].cleanup === "function") {
+    try { window[NS].cleanup(); } catch (_) {}
+  }
+  delete window[NS];
+
+  /* ── Helpers ── */
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const norm = v => String(v == null ? "" : v).replace(/\s+/g, " ").trim();
+  const esc  = s => String(s ?? "").replace(/[&<>"]/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m]));
+  const BASE = location.origin;
+  let navSeq = 0;  /* navigation sequence counter */
+
+  /* ═══════════════════════════════════════════════════════════════
+     1. SCAN LIST PAGE ROWS — only Under Review
+     ═══════════════════════════════════════════════════════════════ */
+
+  function scanUnderReviewRows() {
+    const rows = [...document.querySelectorAll("table.items tr.odd, table.items tr.even")];
+    return rows.map((tr, idx) => {
+      const tds = tr.querySelectorAll("td");
+      if (tds.length < 3) return null;
+
+      const modSelect = tr.querySelector("select.mod-status-dropdown");
+      if (!modSelect || modSelect.value !== "under_review") return null;
+
+      const updLink = tr.querySelector('a.upd[href*="/product/update?id="]');
+      if (!updLink) return null;
+
+      const productId   = norm(tds[0].textContent);
+      const productName = norm(tds[1].textContent);
+      const productType = norm(tds[2].textContent);
+      const updateUrl   = updLink.getAttribute("href");
+
+      if (!productId || !/^\d+$/.test(productId)) return null;
+      return { tr, productId, productName, productType, updateUrl, subsetIndex: idx };
+    }).filter(Boolean);
+  }
+
+  function showStartupModal(totalCount) {
+    return new Promise(resolve => {
+      const overlay = document.createElement("div");
+      overlay.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;font:14px/1.4 Arial,sans-serif;";
+
+      const box = document.createElement("div");
+      box.style.cssText = "background:linear-gradient(180deg,#0f1d3d,#0a1428);border:1px solid rgba(191,219,254,.18);border-radius:16px;padding:28px 32px;min-width:360px;max-width:480px;box-shadow:0 24px 48px rgba(0,0,0,.5);color:#e5e7eb;text-align:center;";
+
+      box.innerHTML = '<div style="font-weight:800;font-size:18px;color:#f8d26a;margin-bottom:16px;">BSV List Review V4</div>'
+        + '<div style="font-size:15px;margin-bottom:6px;">Найдено товаров <b style="color:#93c5fd;">Under Review</b> на текущей странице:</div>'
+        + '<div style="font-size:36px;font-weight:800;color:#60a5fa;margin:10px 0 20px;">' + totalCount + '</div>'
+        + '<div style="font-size:13px;color:#94a3b8;margin-bottom:4px;">Метод проверки: <b style="color:#a78bfa;">popup worker window + AI V2 Assist</b></div>'
+        + '<div style="font-size:13px;color:#94a3b8;margin-bottom:18px;">Сколько проверить? (сверху вниз)</div>';
+
+      const btnRow = document.createElement("div");
+      btnRow.style.cssText = "display:flex;gap:10px;justify-content:center;flex-wrap:wrap;";
+
+      function makeBtn(label, value, bg) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = label;
+        btn.style.cssText = "border:none;border-radius:10px;padding:10px 22px;cursor:pointer;font-weight:700;font-size:15px;color:#fff;background:" + bg + ";min-width:70px;";
+        btn.onmouseenter = () => { btn.style.opacity = "0.85"; };
+        btn.onmouseleave = () => { btn.style.opacity = "1"; };
+        btn.onclick = () => { overlay.remove(); resolve(value); };
+        return btn;
+      }
+
+      if (totalCount >= 5)  btnRow.appendChild(makeBtn("5", 5, "#2563eb"));
+      if (totalCount >= 10) btnRow.appendChild(makeBtn("10", 10, "#2563eb"));
+      if (totalCount > 0)   btnRow.appendChild(makeBtn("ALL (" + totalCount + ")", totalCount, "#059669"));
+      btnRow.appendChild(makeBtn("Cancel", 0, "#6b7280"));
+
+      box.appendChild(btnRow);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+    });
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     2. CHECKER CODE LOADER (fetched once, reused in every popup page)
+     ═══════════════════════════════════════════════════════════════ */
+
+  let checkerCode = null;
+
+  async function loadCheckerCode() {
+    if (checkerCode) return checkerCode;
+    const r = await fetch(CHECKER_URL + "?ts=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) throw new Error("Checker load failed: HTTP " + r.status);
+    checkerCode = await r.text();
+    return checkerCode;
+  }
+
+  /**
+   * Sets up staging rules localStorage keys in a target window,
+   * mirroring what BSV_Loader_v56 does before launching checker v52.
+   * This ensures the checker uses the correct staging minified rules JSON
+   * with hash-check and cache invalidation.
+   */
+  async function setupStagingRulesInWindow(win) {
+    try {
+      const ls = win.localStorage;
+      if (!ls) return;
+      const getItem = k => { try { return String(ls.getItem(k) || "").trim(); } catch (_) { return ""; } };
+      const setItem = (k, v) => { try { ls.setItem(k, String(v)); } catch (_) {} };
+      const removeItem = k => { try { ls.removeItem(k); } catch (_) {} };
+
+      const prevUrl = getItem(LS_CONFIG_KEY);
+      const prevHash = getItem(LS_HASH_KEY);
+      const hasCache = !!getItem(LS_CACHE_KEY) && !!getItem(LS_CACHE_META_KEY);
+
+      /* Try to fetch preview meta for hash-check */
+      let remoteHash = "";
+      try {
+        const metaResp = await fetch(PREVIEW_META_URL + "&ts=" + Date.now(), { cache: "no-store" });
+        if (metaResp.ok) {
+          const meta = await metaResp.json();
+          remoteHash = String((meta && meta.preview_min_body_hash) || (meta && meta.preview_body_hash) || "").trim();
+        }
+      } catch (_) {}
+
+      const sameUrl = prevUrl === STAGING_RULES_URL;
+      const sameHash = !!remoteHash && prevHash === remoteHash;
+
+      if (!sameUrl || !hasCache || (remoteHash && !sameHash)) {
+        removeItem(LS_CACHE_KEY);
+        removeItem(LS_CACHE_META_KEY);
+        if (remoteHash) setItem(LS_HASH_KEY, remoteHash);
+      }
+      setItem(LS_CONFIG_KEY, STAGING_RULES_URL);
+    } catch (_) {
+      /* localStorage not available in this context — checker will use DEFAULT_RULES_URL */
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     3. POPUP / WORKER WINDOW EVALUATOR (v061 — fixed lifecycle)
+     ═══════════════════════════════════════════════════════════════
+
+     Critical fix: navigation sentinel mechanism.
+     Before navigating the reused popup:
+       1. Stamp win.__bsv_nav_seq__ = ++navSeq
+       2. Set win.location.href = newUrl
+       3. Poll until win.__bsv_nav_seq__ is undefined
+          (proves the old JS context was destroyed by navigation)
+       4. THEN poll for new page's #product-form
+     This prevents detecting the OLD page's #product-form.
+     ═══════════════════════════════════════════════════════════════ */
+
+  let workerWin = null;
+  const aiCache = new Map();  /* key: productId, value: { aiResult, aiConfidence, timestamp } */
+
+  /**
+   * Opens a NEW popup window to url.
+   * Used for the first card only.
+   */
+  function openWorkerWindow(url) {
+    if (workerWin && !workerWin.closed) {
+      try { workerWin.close(); } catch (_) {}
+    }
+    const w = window.open(url, "__bsv_worker_v064__",
+      "width=1100,height=760,left=80,top=80,scrollbars=yes,resizable=yes");
+    if (!w) {
+      throw new Error(
+        "POPUP_BLOCKED: Браузер заблокировал popup-окно.\n\n"
+        + "Решение: разрешите popup для этого сайта.\n"
+        + "Chrome → адресная строка → иконка popup → Разрешить → перезапустить букмарклет."
+      );
+    }
+    workerWin = w;
+    return w;
+  }
+
+  /**
+   * Navigates an EXISTING worker popup to a new URL, with sentinel.
+   * Returns only after the old page context is confirmed destroyed.
+   */
+  async function navigateWorkerWindow(win, url) {
+    /* Step 1: stamp sentinel on OLD page */
+    const seq = ++navSeq;
+    try { win.__bsv_nav_seq__ = seq; } catch (_) {}
+
+    /* Step 2: trigger navigation */
+    win.location.href = url;
+
+    /* Step 3: wait until sentinel is gone (old context destroyed) */
+    const navDeadline = Date.now() + NAV_DETECT_TIMEOUT;
+    while (Date.now() < navDeadline) {
+      if (win.closed) throw new Error("WORKER_CLOSED: Worker window was closed during navigation");
+      try {
+        /* When the browser navigates, the old JS context is torn down.
+           Accessing win.__bsv_nav_seq__ on the NEW page will return undefined. */
+        if (win.__bsv_nav_seq__ !== seq) break;
+      } catch (_) {
+        /* Access error = context changed, navigation happened */
+        break;
+      }
+      await wait(100);
+    }
+    /* Extra small pause for navigation settle */
+    await wait(200);
+  }
+
+  /**
+   * Waits until the worker window's NEW page has #product-form.
+   */
+  async function waitForWorkerPageReady(win, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (win.closed) throw new Error("WORKER_CLOSED: Worker window was closed during page load");
+      try {
+        const doc = win.document;
+        if (doc && doc.readyState !== "loading" && doc.querySelector("#product-form")) return;
+      } catch (_) {
+        /* Not ready yet */
+      }
+      await wait(POLL_INTERVAL_MS);
+    }
+    throw new Error("WORKER_PAGE_TIMEOUT: Product page did not load within " + Math.round(timeoutMs / 1000) + "s");
+  }
+
+  /**
+   * Fully cleans checker state in the worker window before a new run.
+   */
+  function cleanCheckerState(win) {
+    try {
+      if (win[CHECKER_NS] && typeof win[CHECKER_NS].cleanup === "function") {
+        win[CHECKER_NS].cleanup();
+      }
+    } catch (_) {}
+    try { delete win[CHECKER_NS]; } catch (_) {}
+  }
+
+  /**
+   * Executes checker code in the worker window and polls for lastAnalysis.
+   */
+  async function runCheckerInWorker(win) {
+    const code = await loadCheckerCode();
+
+    /* Suppress UI noise */
+    try { win.alert = () => {}; } catch (_) {}
+    try { win.confirm = () => false; } catch (_) {}
+    try { win.prompt = () => null; } catch (_) {}
+
+    /* Clean any leftover checker state */
+    cleanCheckerState(win);
+
+    /* Verify form exists */
+    try {
+      if (!win.document.querySelector("#product-form")) {
+        throw new Error("PRODUCT_FORM_NOT_FOUND after page load");
+      }
+    } catch (e) {
+      if (e.message && e.message.includes("PRODUCT_FORM")) throw e;
+      throw new Error("WORKER_ACCESS_ERROR: " + (e.message || String(e)));
+    }
+
+    /* Set up staging rules in the worker window before checker runs */
+    await setupStagingRulesInWindow(win);
+
+    /* Execute checker code in worker context */
+    try {
+      new Function(code).call(win);
+    } catch (e) {
+      throw new Error("Checker execution error: " + (e.message || String(e)));
+    }
+
+    /* Poll for checker to complete and store lastAnalysis */
+    const deadline = Date.now() + CHECKER_POLL_MS;
+    while (Date.now() < deadline) {
+      if (win.closed) throw new Error("WORKER_CLOSED: Worker window was closed during checker run");
+      try {
+        if (win[CHECKER_NS] && win[CHECKER_NS].lastAnalysis) {
+          return win[CHECKER_NS].lastAnalysis;
+        }
+      } catch (_) {}
+      await wait(POLL_INTERVAL_MS);
+    }
+    throw new Error("CHECKER_TIMEOUT: Checker did not complete within " + Math.round(CHECKER_POLL_MS / 1000) + "s");
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     4. MAIN PIPELINE: Navigate → Run Checker → Extract Result
+     ═══════════════════════════════════════════════════════════════ */
+
+  async function evaluateProductInWorker(updateUrl) {
+    /* On first call, open a fresh worker window. */
+    if (!workerWin || workerWin.closed) {
+      workerWin = openWorkerWindow(updateUrl);
+      await waitForWorkerPageReady(workerWin, PAGE_LOAD_TIMEOUT);
+    } else {
+      /* Reuse existing worker — navigate it (with sentinel). */
+      await navigateWorkerWindow(workerWin, updateUrl);
+      await waitForWorkerPageReady(workerWin, PAGE_LOAD_TIMEOUT);
+    }
+
+    /* Run checker and get raw result */
+    const checkerResult = await runCheckerInWorker(workerWin);
+    return checkerResult;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     AI V2 ASSIST MODE FUNCTIONS
+     ═══════════════════════════════════════════════════════════════ */
+
+  /**
+   * Parses denomination math expressions: 500+100, 300x2, 2*300, etc.
+   * Returns numeric total or null if no match.
+   * NO eval() — safe parsing only.
+   */
+  function parseDenominationMathExpression(text) {
+    if (!text || typeof text !== 'string') return null;
+    const expr = text.trim();
+
+    // Pattern: number(+/-/*x)number... where spaces are optional
+    // Examples: "500+100", "300x2", "100+100+400", "2*300"
+    const pattern = /^(\d+(?:[+\-*/x]\d+)*)$/i;
+    if (!pattern.test(expr)) return null;
+
+    // Tokenize: split by operators
+    const tokens = expr.match(/\d+|[+\-*/x]/gi);
+    if (!tokens || tokens.length < 3) return null;
+
+    let result = 0;
+    let operator = '+';
+
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (token.match(/^\d+$/)) {
+        const num = parseInt(token, 10);
+        if (operator === '+') result += num;
+        else if (operator === '-') result -= num;
+        else if (operator === '*' || operator === 'x' || operator === 'X') result *= num;
+        else if (operator === '/') result /= num;
+      } else {
+        operator = token.toLowerCase() === 'x' ? '*' : token;
+      }
+    }
+
+    return result > 0 ? result : null;
+  }
+
+  /**
+   * Attempts to match denomination via math parser.
+   * Returns { matched: bool, total: number|null, matchedOption: object|null }
+   */
+  function tryDenominationMathMatch(name, allowedDenomOptions) {
+    const total = parseDenominationMathExpression(name);
+    if (total === null) {
+      return { matched: false, total: null, matchedOption: null };
+    }
+
+    // Try to find matching denomination option
+    const matched = allowedDenomOptions.find(opt => {
+      const optVal = parseFloat(opt.amount) || parseFloat(opt.value);
+      return !isNaN(optVal) && Math.abs(optVal - total) < 0.01;
+    }) || null;
+
+    return { matched: !!matched, total, matchedOption: matched };
+  }
+
+  /**
+   * Determines if a result qualifies for AI assistance.
+   * Returns true if AI should be called for extra validation.
+   */
+  function qualifiesForAI(result, name, description) {
+    if (!result) return false;
+
+    // If denomination is NOT ok, it might need AI help
+    if (result.denominationStatus && result.denominationStatus !== 'ok') {
+      return true;
+    }
+
+    // If manualReviewWords were triggered
+    if (result.manualReviewTriggered) {
+      return true;
+    }
+
+    // Suspicious patterns in description for gift cards
+    if (description && description.length > 0) {
+      const lowerDesc = description.toLowerCase();
+      const suspiciousPatterns = ['account', 'login', 'access', 'password', 'verify', 'confirm identity'];
+      if (suspiciousPatterns.some(p => lowerDesc.includes(p))) {
+        return true;
+      }
+    }
+
+    // Otherwise, it's clear enough — don't bother AI
+    return false;
+  }
+
+  /**
+   * Builds AI service payload matching the expected request schema.
+   */
+  function buildAIPayload(result, name, description, productId, denomOptions) {
+    return {
+      source_flow: "list",
+      product_id: String(productId),
+      product_name: name,
+      description: description || "",
+
+      // Deterministic checker results
+      deterministic_status: result.status || "uncertain",
+      deterministic_details: {
+        product_type: result.productType || null,
+        region: result.region || null,
+        denomination_status: result.denominationStatus || null,
+        active_catalogue: result.activeCatalogue || null,
+        contact_info: result.contactInfo || null
+      },
+
+      // Available denomination options
+      denomination_options: (denomOptions || []).map(opt => ({
+        label: opt.label || opt.name || "",
+        value: parseFloat(opt.amount) || parseFloat(opt.value) || 0,
+        code: opt.code || null
+      })),
+
+      // Flags
+      manual_review_triggered: !!result.manualReviewTriggered,
+      reason_code: result.reasonCode || null
+    };
+  }
+
+  /**
+   * Posts payload to AI service with 15s timeout.
+   * Returns parsed JSON response or fallback { ok: false }.
+   */
+  async function callAIService(payload) {
+    if (!AI_SERVICE_URL || typeof AI_SERVICE_URL !== 'string' || AI_SERVICE_URL.trim() === '') {
+      return { ok: false, error: 'AI_SERVICE_URL not configured' };
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+      const response = await fetch(AI_SERVICE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        return { ok: false, error: 'HTTP ' + response.status };
+      }
+
+      const json = await response.json();
+      return json;
+    } catch (e) {
+      return { ok: false, error: String(e.message || e) };
+    }
+  }
+
+  /**
+   * Merges deterministic result with AI result using policy:
+   * - Hard deterministic wins: ProductType, Region, activeCatalogue, check fails
+   * - Denomination fallback: if AI high-confidence match to allowed option, pass
+   * - Contact: confident contact → reject; uncertain → review
+   * - Description mismatch: clear → reject; suspicious → review
+   * Returns { mergedStatus, aiApplied, details, aiConfidence }
+   */
+  function mergeAIResult(deterministicStatus, result, aiResult) {
+    if (!aiResult || !aiResult.ok) {
+      return {
+        mergedStatus: deterministicStatus,
+        aiApplied: false,
+        details: 'AI call failed',
+        aiConfidence: 0
+      };
+    }
+
+    let mergedStatus = deterministicStatus;
+    let details = [];
+    let aiConfidence = aiResult.confidence || 0;
+
+    // Hard deterministic wins
+    if (result.productType !== 'ok') {
+      return { mergedStatus: 'reject', aiApplied: false, details: 'Hard fail: ProductType', aiConfidence: 0 };
+    }
+    if (result.region !== 'ok') {
+      return { mergedStatus: 'reject', aiApplied: false, details: 'Hard fail: Region', aiConfidence: 0 };
+    }
+    if (result.activeCatalogue === false) {
+      return { mergedStatus: 'reject', aiApplied: false, details: 'Hard fail: Not in active catalogue', aiConfidence: 0 };
+    }
+
+    // Denomination fallback
+    if (aiResult.denomination_ai_verdict) {
+      if (aiResult.denomination_ai_verdict.matched && aiResult.denomination_ai_verdict.confidence >= 0.8) {
+        mergedStatus = 'pass';
+        details.push('AI: Denomination matched at high confidence');
+      } else if (aiResult.denomination_ai_verdict.confidence < 0.5) {
+        mergedStatus = 'review';
+        details.push('AI: Denomination match unclear');
+      }
+    }
+
+    // Contact policy
+    if (aiResult.contact_policy_verdict) {
+      if (aiResult.contact_policy_verdict.action === 'reject' && aiResult.contact_policy_verdict.confidence >= 0.8) {
+        mergedStatus = 'reject';
+        details.push('AI: Contact info policy violation (high confidence)');
+      } else if (aiResult.contact_policy_verdict.action === 'review') {
+        mergedStatus = 'review';
+        details.push('AI: Contact info policy unclear');
+      }
+    }
+
+    // Description mismatch
+    if (aiResult.description_match_verdict) {
+      if (aiResult.description_match_verdict.matched === false && aiResult.description_match_verdict.confidence >= 0.8) {
+        mergedStatus = 'reject';
+        details.push('AI: Description mismatch (high confidence)');
+      } else if (aiResult.description_match_verdict.confidence < 0.6) {
+        mergedStatus = 'review';
+        details.push('AI: Description match suspicious');
+      }
+    }
+
+    return {
+      mergedStatus,
+      aiApplied: true,
+      details: details.join('; '),
+      aiConfidence,
+      aiVerdictDenomination: aiResult.denomination_ai_verdict,
+      aiVerdictContact: aiResult.contact_policy_verdict,
+      aiVerdictDescription: aiResult.description_match_verdict,
+      aiReasonCode: aiResult.reason_code || null
+    };
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     5. PRELOAD & BATCH PROCESSING
+     ═══════════════════════════════════════════════════════════════ */
+
+  let cache = new Map();
+  let preloadAbort = false;
+  let popupBlocked = false;
+  let popupBlockerText = "";
+  let isFirstProduct = true;
+  let selectedProductId = null;
+  let listItems = [];
+
+  async function preloadOne(item) {
+    if (cache.has(item.productId)) return;
+    cache.set(item.productId, { status: "loading", result: null, error: null, name: item.productName, productType: item.productType, updateUrl: item.updateUrl });
+    markRow(item.tr, "loading");
+    refreshPanelRow(item.productId);
+
+    try {
+      const result = await evaluateProductInWorker(item.updateUrl);
+
+      /* AI V2: Try denomination math parser first */
+      const mathMatch = tryDenominationMathMatch(item.productName, result.denominationOptions || []);
+      if (mathMatch.matched && !result.denominationStatus) {
+        result.denominationStatus = 'ok';
+        result.denominationMathApplied = true;
+      }
+
+      /* AI V2: Check if AI assistance is needed */
+      let mergedResult = null;
+      if (qualifiesForAI(result, item.productName, result.description)) {
+        if (AI_SERVICE_URL && AI_SERVICE_URL.trim() !== '') {
+          try {
+            const aiPayload = buildAIPayload(result, item.productName, result.description, item.productId, result.denominationOptions);
+            const aiResult = await callAIService(aiPayload);
+            const merged = mergeAIResult(result.status, result, aiResult);
+
+            if (merged.aiApplied) {
+              mergedResult = merged;
+              aiCache.set(item.productId, { aiResult, timestamp: Date.now() });
+            }
+          } catch (_) {
+            /* AI call failed, continue with deterministic result */
+          }
+        }
+      }
+
+      const status = mergedResult ? mergedResult.mergedStatus : deriveOverall(result);
+      cache.set(item.productId, {
+        status,
+        result,
+        error: null,
+        name: item.productName,
+        productType: item.productType,
+        updateUrl: item.updateUrl,
+        aiMerged: mergedResult
+      });
+      markRow(item.tr, status);
+    } catch (e) {
+      const msg = e.message || String(e);
+      if (msg.includes("POPUP_BLOCKED")) {
+        popupBlocked = true;
+        popupBlockerText = msg;
+      }
+      cache.set(item.productId, { status: "ERROR", result: null, error: msg, name: item.productName, productType: item.productType, updateUrl: item.updateUrl });
+      markRow(item.tr, "ERROR");
+    }
+    refreshPanelRow(item.productId);
+    if (selectedProductId === item.productId) renderDetail(item.productId);
+  }
+
+  async function batchPreload(items) {
+    preloadAbort = false;
+    popupBlocked = false;
+    isFirstProduct = true;
+    let done = 0;
+    updateProgress(0, items.length);
+
+    /* STRICT SEQUENTIAL — one item at a time, no parallelism */
+    for (let i = 0; i < items.length; i++) {
+      if (preloadAbort || popupBlocked) break;
+      await preloadOne(items[i]);
+      done++;
+      updateProgress(done, items.length);
+    }
+
+    if (popupBlocked) {
+      showBlockerWarning();
+    } else {
+      /* All done — close worker window automatically */
+      closeWorkerWindow();
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     5.5 OPEN REAL CARD + AUTO-LAUNCH CARD CHECKER
+     ═══════════════════════════════════════════════════════════════ */
+
+  async function waitForProductPageReadyCard(win, timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 20000);
+    while (Date.now() < deadline) {
+      try {
+        if (win.closed) return;
+        const doc = win.document;
+        if (doc && doc.readyState !== "loading" && doc.querySelector("#product-form")) return;
+      } catch (_) {}
+      await wait(250);
+    }
+    throw new Error("Opened product page did not become ready in time");
+  }
+
+  /**
+   * Launches checker v052 directly in the opened product window.
+   * Sets up staging rules (mirroring BSV_Loader_v56 flow) before execution.
+   * Uses the same checkerCode that batch worker uses (already fetched).
+   * No dependency on BSV_v054_UNIFIED_LOADER.txt.
+   */
+  async function launchCheckerInWindow(win) {
+    const code = await loadCheckerCode();
+    /* Set up staging rules in the card window before checker runs */
+    await setupStagingRulesInWindow(win);
+    /* Suppress alert/confirm/prompt to avoid noise */
+    try { win.alert = () => {}; } catch (_) {}
+    try { win.confirm = () => false; } catch (_) {}
+    try { win.prompt = () => null; } catch (_) {}
+    /* Clean previous checker instance if any */
+    try {
+      if (win[CHECKER_NS] && typeof win[CHECKER_NS].cleanup === "function") {
+        win[CHECKER_NS].cleanup();
+      }
+    } catch (_) {}
+    try { delete win[CHECKER_NS]; } catch (_) {}
+    /* Execute checker code in card window */
+    try {
+      new Function(code).call(win);
+    } catch (e) {
+      throw new Error("Checker exec error: " + (e.message || String(e)));
+    }
+    /* Wait for lastAnalysis to be ready */
+    const deadline = Date.now() + CHECKER_POLL_MS;
+    while (Date.now() < deadline) {
+      if (win.closed) throw new Error("Window closed during checker run");
+      try {
+        if (win[CHECKER_NS] && win[CHECKER_NS].lastAnalysis) {
+          return win[CHECKER_NS].lastAnalysis;
+        }
+      } catch (_) {}
+      await wait(POLL_INTERVAL_MS);
+    }
+    throw new Error("Checker timeout in opened window");
+  }
+
+  /**
+   * Opens a product in its own window and auto-runs checker.
+   * Returns the checker result.
+   */
+  async function openProductAndCheckCard(updateUrl) {
+    const cardWin = window.open(updateUrl, "__bsv_card_" + Date.now(),
+      "width=1100,height=760,left=200,top=200,scrollbars=yes,resizable=yes");
+    if (!cardWin) {
+      throw new Error("POPUP_BLOCKED: Cannot open card window");
+    }
+    await waitForProductPageReadyCard(cardWin, PAGE_LOAD_TIMEOUT);
+    const result = await launchCheckerInWindow(cardWin);
+    cardWin.close();
+    return result;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     6. DERIVE OVERALL STATUS
+     ═══════════════════════════════════════════════════════════════ */
+
+  function deriveOverall(r) {
+    if (!r) return "uncertain";
+
+    const ps = r.productType, rs = r.region, ds = r.denominationStatus, acs = r.activeCatalogue;
+    const ci = r.contactInfo;
+
+    /* Hard fails (quick reject) */
+    if (ps !== "ok" || rs !== "ok" || acs === false) return "reject";
+
+    /* If denomination didn't validate but no blocker, check other signals */
+    if (ds !== "ok") {
+      /* Contact triggered? */
+      if (ci === "reject") return "reject";
+      if (ci === "review") return "review";
+
+      /* Manual review words? Escalate to review */
+      if (r.manualReviewTriggered) return "review";
+
+      /* Description mismatch? */
+      if (r.descriptionStatus === "mismatch") return "review";
+
+      /* Check if there's a specific blocking reason */
+      if (r.blockingModule) {
+        return r.blockingModule === "contact_policy" ? "reject" : "review";
+      }
+
+      /* Otherwise, denomination issue is primary → review */
+      return "review";
+    }
+
+    /* Denomination is OK, but check other signals */
+    if (ci === "reject") return "reject";
+    if (ci === "review") return "review";
+
+    /* Manual review triggered? */
+    if (r.manualReviewTriggered) return "review";
+
+    /* Description mismatch? */
+    if (r.descriptionStatus === "mismatch") return "review";
+
+    /* All clear */
+    return "pass";
+  }
+
+  function mainReason(r) {
+    if (!r) return "No result";
+    if (r.productType !== "ok") return "Incorrect product type";
+    if (r.region !== "ok") return "Region not allowed";
+    if (r.activeCatalogue === false) return "Not in active catalogue";
+    if (r.denominationStatus !== "ok") return "Denomination not valid";
+    if (r.contactInfo === "reject") return "Contact info policy violation";
+    if (r.manualReviewTriggered) return "Manual review triggered: " + (r.mainReasonManual || "");
+    if (r.descriptionStatus === "mismatch") return "Description mismatch detected";
+    return "Passed";
+  }
+
+  function actionNeeded(status, r) {
+    if (status === "pass") return "Ready to approve";
+    if (status === "reject") return "Must reject";
+    if (status === "review") return r && r.manualReviewTriggered ? "Manual review flag: check notes" : "Requires review";
+    return "Check details";
+  }
+
+  function blockingModule(r) {
+    if (!r) return null;
+    if (r.productType !== "ok") return "product_type";
+    if (r.region !== "ok") return "region";
+    if (r.activeCatalogue === false) return "active_catalogue";
+    if (r.contactInfo === "reject") return "contact_policy";
+    if (r.denominationStatus !== "ok") return "denomination";
+    if (r.descriptionStatus === "mismatch") return "description";
+    return null;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     7. PANEL UI
+     ═══════════════════════════════════════════════════════════════ */
+
+  let panelDiv = null;
+  let progressText = null;
+  let progressBar = null;
+  let panelListDiv = null;
+  let detailDiv = null;
+
+  function buildPanel() {
+    panelDiv = document.createElement("div");
+    panelDiv.style.cssText = "position:fixed;right:0;top:0;width:420px;height:100vh;background:linear-gradient(135deg,#0f172a,#0a0e27);border-left:2px solid #3b82f6;z-index:2147483646;display:flex;flex-direction:column;font-family:Arial,sans-serif;color:#e5e7eb;";
+
+    const header = document.createElement("div");
+    header.style.cssText = "padding:16px;border-bottom:1px solid #334155;background:rgba(30,41,59,.6);";
+    header.innerHTML = '<div style="font-weight:800;font-size:16px;color:#f8d26a;margin-bottom:8px;">BSV List Review V4</div>'
+      + '<div style="font-size:12px;color:#94a3b8;">AI Assist V2 enabled</div>';
+
+    const progressDiv = document.createElement("div");
+    progressDiv.style.cssText = "padding:12px 16px;border-bottom:1px solid #334155;background:rgba(15,23,42,.4);";
+    progressText = document.createElement("div");
+    progressText.style.cssText = "font-size:12px;color:#cbd5e1;margin-bottom:8px;";
+    progressText.textContent = "Loading...";
+    progressBar = document.createElement("div");
+    progressBar.style.cssText = "width:100%;height:4px;background:#1e293b;border-radius:2px;overflow:hidden;";
+    const barFill = document.createElement("div");
+    barFill.style.cssText = "height:100%;width:0%;background:linear-gradient(90deg,#06b6d4,#3b82f6);transition:width 0.3s;";
+    barFill.id = "__bsv_bar_fill__";
+    progressBar.appendChild(barFill);
+    progressDiv.appendChild(progressText);
+    progressDiv.appendChild(progressBar);
+
+    panelListDiv = document.createElement("div");
+    panelListDiv.style.cssText = "flex:1;overflow-y:auto;padding:8px;";
+
+    detailDiv = document.createElement("div");
+    detailDiv.style.cssText = "height:280px;border-top:1px solid #334155;background:rgba(15,23,42,.6);overflow-y:auto;padding:12px;font-size:12px;";
+
+    const footer = document.createElement("div");
+    footer.style.cssText = "padding:12px;border-top:1px solid #334155;display:flex;gap:8px;";
+
+    const abortBtn = document.createElement("button");
+    abortBtn.type = "button";
+    abortBtn.textContent = "Abort";
+    abortBtn.style.cssText = "flex:1;padding:8px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:700;font-size:12px;";
+    abortBtn.onclick = () => { preloadAbort = true; };
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.textContent = "Close Panel";
+    closeBtn.style.cssText = "flex:1;padding:8px;background:#6b7280;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:700;font-size:12px;";
+    closeBtn.onclick = () => { panelDiv.remove(); };
+
+    footer.appendChild(abortBtn);
+    footer.appendChild(closeBtn);
+
+    panelDiv.appendChild(header);
+    panelDiv.appendChild(progressDiv);
+    panelDiv.appendChild(panelListDiv);
+    panelDiv.appendChild(detailDiv);
+    panelDiv.appendChild(footer);
+
+    document.body.appendChild(panelDiv);
+  }
+
+  function buildPanelList() {
+    if (!panelListDiv) return;
+    panelListDiv.innerHTML = "";
+    listItems.forEach(item => {
+      const row = document.createElement("div");
+      row.id = "__bsv_list_row_" + item.productId;
+      row.style.cssText = "margin-bottom:6px;padding:8px;background:rgba(30,41,59,.5);border:1px solid #334155;border-radius:6px;cursor:pointer;transition:all 0.2s;font-size:12px;";
+      row.innerHTML = '<div style="font-weight:700;color:#93c5fd;margin-bottom:2px;">' + esc(item.productName) + '</div>'
+        + '<div style="font-size:11px;color:#94a3b8;">ID: ' + item.productId + '</div>'
+        + '<div style="font-size:11px;color:#64748b;margin-top:4px;">Status: <span id="__bsv_status_' + item.productId + '">⏳ loading</span></div>';
+      row.onmouseenter = () => { row.style.background = "rgba(59,130,246,.1)"; row.style.borderColor = "#3b82f6"; };
+      row.onmouseleave = () => { row.style.background = "rgba(30,41,59,.5)"; row.style.borderColor = "#334155"; };
+      row.onclick = () => { selectedProductId = item.productId; renderDetail(item.productId); };
+      panelListDiv.appendChild(row);
+    });
+  }
+
+  function markRow(tr, status) {
+    const colors = {
+      "pass": { bg: "#10b981", outline: "#047857" },
+      "reject": { bg: "#ef4444", outline: "#dc2626" },
+      "review": { bg: "#f59e0b", outline: "#d97706" },
+      "ERROR": { bg: "#8b5cf6", outline: "#7c3aed" },
+      "loading": { bg: "transparent", outline: "transparent" }
+    };
+    const col = colors[status] || { bg: "#6b7280", outline: "#4b5563" };
+    if (tr) {
+      tr.style.background = col.bg;
+      tr.style.outline = "2px solid " + col.outline;
+      tr.style.outlineOffset = "-2px";
+    }
+  }
+
+  function refreshPanelRow(productId) {
+    const row = document.getElementById("__bsv_list_row_" + productId);
+    const statusSpan = document.getElementById("__bsv_status_" + productId);
+    const entry = cache.get(productId);
+    if (!row || !entry) return;
+
+    const statusText = entry.status === "ERROR" ? ("❌ " + entry.error.substring(0, 20)) : (
+      entry.status === "loading" ? "⏳ loading" :
+      entry.status === "pass" ? "✅ pass" :
+      entry.status === "reject" ? "❌ reject" :
+      entry.status === "review" ? "⚠ review" : "?"
+    );
+    if (statusSpan) statusSpan.textContent = statusText;
+
+    const statusColors = {
+      "pass": "#10b981",
+      "reject": "#ef4444",
+      "review": "#f59e0b",
+      "ERROR": "#8b5cf6",
+      "loading": "#94a3b8"
+    };
+    row.style.borderColor = statusColors[entry.status] || "#334155";
+  }
+
+  function updateProgress(done, total) {
+    if (progressText) progressText.textContent = "Processed: " + done + " / " + total;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    const barFill = document.getElementById("__bsv_bar_fill__");
+    if (barFill) barFill.style.width = pct + "%";
+  }
+
+  function closeWorkerWindow() {
+    if (workerWin && !workerWin.closed) {
+      try { workerWin.close(); } catch (_) {}
+    }
+    workerWin = null;
+  }
+
+  function showBlockerWarning() {
+    if (!detailDiv) return;
+    detailDiv.innerHTML = '<div style="color:#ef4444;font-weight:700;margin-bottom:8px;">⚠ Popup Blocked</div>'
+      + '<div style="font-size:11px;color:#cbd5e1;line-height:1.5;">' + esc(popupBlockerText) + '</div>';
+  }
+
+  function renderDetail(productId) {
+    if (!detailDiv) return;
+    const entry = cache.get(productId);
+    if (!entry) {
+      detailDiv.innerHTML = '<div style="color:#94a3b8;">No data</div>';
+      return;
+    }
+
+    const r = entry.result;
+    if (!r) {
+      detailDiv.innerHTML = '<div style="color:#ef4444;font-weight:700;">ERROR</div><div style="font-size:11px;color:#cbd5e1;">' + esc(entry.error) + '</div>';
+      return;
+    }
+
+    const status = entry.status;
+    const reason = mainReason(r);
+    const action = actionNeeded(status, r);
+
+    let html = '';
+
+    /* Status badge */
+    const statusBadgeColor = status === 'pass' ? '#10b981' : (status === 'reject' ? '#ef4444' : '#f59e0b');
+    html += '<div style="display:inline-block;padding:4px 8px;background:' + statusBadgeColor + ';color:#fff;border-radius:4px;font-weight:700;font-size:11px;margin-bottom:8px;">'
+      + status.toUpperCase() + '</div>';
+
+    /* Section 1: Basic Info */
+    html += '<div style="margin-top:8px;font-size:11px;color:#cbd5e1;line-height:1.6;">';
+    html += '<div style="color:#93c5fd;font-weight:700;">Name:</div>' + esc(entry.name) + '<br>';
+    html += '<div style="color:#93c5fd;font-weight:700;margin-top:4px;">Product Type:</div>' + (r.productType || 'N/A') + '<br>';
+    html += '<div style="color:#93c5fd;font-weight:700;margin-top:4px;">Region:</div>' + (r.region || 'N/A') + '<br>';
+    html += '</div>';
+
+    /* Section 2: Denomination */
+    if (r.denominationStatus || entry.aiMerged) {
+      html += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;font-size:11px;color:#cbd5e1;">';
+      html += '<div style="color:#a78bfa;font-weight:700;">Denomination:</div>';
+      html += (r.denominationStatus || 'pending') + (r.denominationMathApplied ? ' (via math parser)' : '') + '<br>';
+      html += '</div>';
+    }
+
+    /* Section 3: Contact */
+    if (r.contactInfo) {
+      html += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;font-size:11px;color:#cbd5e1;">';
+      html += '<div style="color:#a78bfa;font-weight:700;">Contact Policy:</div>';
+      html += (r.contactInfo || 'N/A') + '<br>';
+      html += '</div>';
+    }
+
+    /* Section 4: Catalogue */
+    if (r.activeCatalogue !== undefined) {
+      html += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;font-size:11px;color:#cbd5e1;">';
+      html += '<div style="color:#a78bfa;font-weight:700;">Catalogue:</div>';
+      html += (r.activeCatalogue ? 'Active' : 'Inactive') + '<br>';
+      html += '</div>';
+    }
+
+    /* Section 5: Manual Review */
+    if (r.manualReviewTriggered) {
+      html += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;font-size:11px;color:#fbbf24;font-weight:700;">⚠ Manual Review Triggered</div>';
+      if (r.mainReasonManual) {
+        html += '<div style="font-size:11px;color:#cbd5e1;margin-top:4px;">' + esc(r.mainReasonManual) + '</div>';
+      }
+    }
+
+    /* Section 6: Description */
+    if (r.descriptionStatus) {
+      html += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;font-size:11px;color:#cbd5e1;">';
+      html += '<div style="color:#a78bfa;font-weight:700;">Description:</div>';
+      html += (r.descriptionStatus || 'N/A') + '<br>';
+      html += '</div>';
+    }
+
+    /* Section 7: AI Assist V2 */
+    const aiData = entry.aiMerged || aiCache.get(productId);
+    if (aiData || AI_SERVICE_URL) {
+      html += '<div style="margin-top:8px;padding:8px;background:rgba(139,92,246,.1);border-left:3px solid #a78bfa;border-radius:4px;">';
+      html += '<div style="color:#c4b5fd;font-weight:700;font-size:11px;margin-bottom:4px;">AI Assist V2</div>';
+
+      if (!AI_SERVICE_URL || AI_SERVICE_URL.trim() === '') {
+        html += '<div style="font-size:11px;color:#94a3b8;">⚙ AI сервис не настроен</div>';
+      } else if (aiData && aiData.aiResult) {
+        const aiResult = aiData.aiResult;
+        const aiMerged = entry.aiMerged;
+        const confidence = (aiResult.confidence || 0) * 100;
+        html += '<div style="font-size:11px;color:#cbd5e1;">Confidence: <b style="color:#c4b5fd;">' + confidence.toFixed(0) + '%</b></div>';
+        if (aiMerged && aiMerged.details) {
+          html += '<div style="font-size:11px;color:#cbd5e1;margin-top:4px;">' + esc(aiMerged.details.substring(0, 60)) + '</div>';
+        }
+      } else {
+        html += '<div style="font-size:11px;color:#94a3b8;">✓ AI проверка не требуется (детерминированный результат)</div>';
+      }
+
+      html += '</div>';
+    }
+
+    /* Reason and Action */
+    html += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;font-size:11px;color:#cbd5e1;line-height:1.6;">';
+    html += '<div style="color:#93c5fd;font-weight:700;">Reason:</div>' + esc(reason) + '<br>';
+    html += '<div style="color:#93c5fd;font-weight:700;margin-top:4px;">Action:</div>' + esc(action) + '<br>';
+    html += '</div>';
+
+    detailDiv.innerHTML = html;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     8. DETAIL VIEW + CARD OPENER
+     ═══════════════════════════════════════════════════════════════ */
+
+  function selectProduct(productId) {
+    selectedProductId = productId;
+    renderDetail(productId);
+  }
+
+  /**
+   * Intercepts UPD links: if clicked, opens product in NEW window
+   * and auto-checks it there. Does NOT load it into the batch worker.
+   */
+  function handleUpdClick(evt) {
+    const link = evt.target.closest('a.upd[href*="/product/update?id="]');
+    if (!link) return;
+    /* Check if this is for one of our tracked items */
+    const href = link.getAttribute('href');
+    if (!href) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    openProductAndCheckCard(href).catch(e => {
+      alert("Error opening card: " + (e.message || e));
+    });
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     9. EXPORT STATE TO WINDOW
+     ═══════════════════════════════════════════════════════════════ */
+
+  const state = {
+    cleanup: () => {
+      closeWorkerWindow();
+      if (panelDiv && panelDiv.parentNode) {
+        panelDiv.parentNode.removeChild(panelDiv);
+      }
+      listItems.forEach(item => {
+        if (item.tr) {
+          item.tr.style.background = "";
+          item.tr.style.outline = "";
+          item.tr.style.outlineOffset = "";
+        }
+      });
+      if (window[NS] === state) delete window[NS];
+    }
+  };
+
+  window[NS] = state;
+
+  /* ═══════════════════════════════════════════════════════════════
+     10. INIT
+     ═══════════════════════════════════════════════════════════════ */
+
+  const allUnderReview = scanUnderReviewRows();
+
+  if (!allUnderReview.length) {
+    alert("BSV List Review V4: на текущей странице нет товаров со статусом Under Review.");
+    delete window[NS];
+    return;
+  }
+
+  const chosenCount = await showStartupModal(allUnderReview.length);
+  if (!chosenCount || chosenCount <= 0) {
+    delete window[NS];
+    return;
+  }
+
+  listItems = allUnderReview.slice(0, chosenCount).map((item, idx) => ({ ...item, subsetIndex: idx }));
+
+  buildPanel();
+  buildPanelList();
+
+  /* Setup UPD link interceptor */
+  document.addEventListener("click", handleUpdClick, true);
+
+  try {
+    await loadCheckerCode();
+  } catch (e) {
+    if (progressText) progressText.textContent = "❌ Не удалось загрузить checker runtime: " + (e.message || e);
+    return;
+  }
+
+  selectProduct(listItems[0].productId);
+  await batchPreload(listItems);
+
+})();

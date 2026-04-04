@@ -1,0 +1,1820 @@
+(async () => {
+  const NS = "__BSV_QC_INTEGRATED_CATALOGUE_REGION_PRIORITY_MANUAL_REVIEW_V3_AI_V2__";
+  const CONFIG_KEY = "BSV_QC_RULES_URL_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const CACHE_KEY = "BSV_QC_RULES_CACHE_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const CACHE_META_KEY = "BSV_QC_RULES_CACHE_META_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+  const NOTE_KEY = "BSV_QC_NOTE_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const DEFAULT_ALLOWED_ALIASES_FILE = "bsv_allowed_aliases_v1.txt";
+
+  function safeStorageGet(key){ try{return localStorage.getItem(key);}catch(_e){return null;} }
+  function safeStorageRemove(key){ try{localStorage.removeItem(key);}catch(_e){} }
+  function clearLegacyRuleCaches(){
+    try{
+      const keys=[];
+      for(let i=0;i<localStorage.length;i++){
+        const k=localStorage.key(i);
+        if(k && (/^BSV_QC_RULES_CACHE/i.test(k) || /^BSV_QC_RULES_CACHE_META/i.test(k) || /^BSV_QC_RULES_URL/i.test(k))){
+          keys.push(k);
+        }
+      }
+      keys.forEach(k=>safeStorageRemove(k));
+    }catch(_e){}
+  }
+  function safeStorageSet(key,value){
+    try{ localStorage.setItem(key,value); return true; }
+    catch(_e){
+      try{
+        clearLegacyRuleCaches();
+        localStorage.setItem(key,value);
+        return true;
+      }catch(_e2){
+        return false;
+      }
+    }
+  }
+  const DEFAULT_RULES_URL = "https://vitalijsf-dev.github.io/bsv-catalogue-rules/compiled-rules-prototype-v1_REGION_PRIORITY_v1.json";
+  const MANUAL_REVIEW_WORDS_URL = "https://script.google.com/a/macros/buysellvouchers.com/s/AKfycbwZm_Yv-hHrHjSygXM-hIV5TLnRjYJFeXYKhJYqVZBsKrtOogTHERmiCvfIbPlJLsbD/exec";
+
+  const form = document.querySelector("#product-form");
+  const nameInput = document.querySelector("#Product_name");
+  const descInput = document.querySelector("#Product_description");
+  const typeSelect = document.querySelector("#Product_product_type_id");
+  const regionContainer = document.querySelector("#region-container");
+  const denomSelect = document.querySelector("#denomination-select");
+
+  if (!form || !nameInput || !descInput || !typeSelect || !regionContainer || !denomSelect) {
+    alert("Сначала откройте страницу Update Product.");
+    return;
+  }
+
+  const PRODUCT_STOP = new Set(["gift","gifts","card","cards","code","codes","key","keys","pin","voucher","vouchers","subscription","subscriptions","membership","memberships","wallet","wallets","online","store","official","digital","stockable","global","region","usd","eur","gbp","aed","rub","try","hkd","jpy","cad","aud","nok","sek","dkk","uah","sar","qar","kwd","month","months","year","years","day","days","for","the","and","or","with","from","to","of","new","old","token","based"]);
+  const REGION_RULES = [
+    {key:"global",aliases:["global","worldwide","world wide","international"],tokens:["global","ww","worldwide"]},
+    {key:"latam",aliases:["latam","latin america"],tokens:["latam"]},
+    {key:"mena",aliases:["mena","middle east and north africa","middle east","north africa"],tokens:["mena"]},
+    {key:"us",aliases:["united states","united states of america","america"],tokens:["us","usa"]},
+    {key:"uk",aliases:["united kingdom","great britain","britain","uk region"],tokens:["uk"]},
+    {key:"eu",aliases:["europe","european union","eu region"],tokens:["eu"]},
+    {key:"hong kong",aliases:["hong kong","hongkong"],tokens:["hk","hongkong"]},
+    {key:"japan",aliases:["japan","jp region"],tokens:["jp","japan"]},
+    {key:"turkey",aliases:["turkey"],tokens:["tr","turkey"]},
+    {key:"mexico",aliases:["mexico"],tokens:["mx","mexico"]},
+    {key:"norway",aliases:["norway"],tokens:["no","norway"]},
+    {key:"uae",aliases:["united arab emirates","arab emirates","emirates","uae region"],tokens:["uae","ae"]},
+    {key:"saudi arabia",aliases:["saudi arabia"],tokens:["ksa","sa"]},
+    {key:"germany",aliases:["germany"],tokens:["de","germany"]},
+    {key:"france",aliases:["france"],tokens:["fr","france"]},
+    {key:"italy",aliases:["italy"],tokens:["it","italy"]},
+    {key:"spain",aliases:["spain"],tokens:["es","spain"]},
+    {key:"poland",aliases:["poland"],tokens:["pl","poland"]},
+    {key:"brazil",aliases:["brazil"],tokens:["br","brazil"]}
+  ];
+  function isGenericHeuristicRegionKey(key){
+    return new Set(["global","latam","mena","eu"]).has(String(key||"").toLowerCase());
+  }
+  function isGenericCatalogueRegionKey(key){
+    return new Set(["WW","XL","XM","GC","EU","E2"]).has(String(key||"").toUpperCase());
+  }
+  const PLAN_MODIFIERS = [
+    ["premium",["premium","prem","prm"]],
+    ["ultimate",["ultimate","ult"]],
+    ["core",["core"]],
+    ["family",["family","fam"]],
+    ["individual",["individual","indiv","single"]],
+    ["standard",["standard","std","basic"]],
+    ["trial",["trial","test"]],
+    ["membership",["membership","member"]],
+    ["subscription",["subscription","sub"]],
+    ["nitro",["nitro"]],
+    ["server boost",["server boost","server boosts","boost","boosts"]]
+  ];
+
+  function normalize(s) {
+    return String(s || "")
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/&/g, " and ")
+      .replace(/[^a-z0-9+]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  function words(s){return normalize(s).split(" ").filter(Boolean)}
+  function tokenize(s){return words(s)}
+  function uniq(a){return Array.from(new Set(a))}
+  function extractRawShortAliases(text){
+    const src=String(text||"");
+    const out=[];
+    const parenRe=/\(([^)]+)\)/g;
+    let m;
+    while((m=parenRe.exec(src))){
+      const raw=String(m[1]||"").trim();
+      if(raw) out.push(raw);
+    }
+    const akaRe=/(?:^|[^a-z0-9])aka[_\s:-]*([A-Za-z0-9+]{2,12})(?=$|[^a-z0-9])/ig;
+    while((m=akaRe.exec(src))){
+      const raw=String(m[1]||"").trim();
+      if(raw) out.push(raw);
+    }
+    return uniq(out);
+  }
+  const SHORT_ALIAS_BLOCKLIST = new Set(["gift","card","cards","code","pin","play","game","games","plus","cash","gold","coin","coins","live","global","world","mobile","digital","shop","mall"]);
+  function aliasBoundaryMatch(alias, normalizedText, tokenSet, opts={}){
+    const a=normalize(alias);
+    if(!a) return false;
+    const minLongLen=opts.minLongLen??5;
+    const allowShort=!!opts.allowShort;
+    const shortMin=opts.shortMin??3;
+    const shortMax=opts.shortMax??4;
+    const shortBlocklist=opts.shortBlocklist||SHORT_ALIAS_BLOCKLIST;
+    if(a.includes(" ")) return (" "+normalizedText+" ").includes(" "+a+" ");
+    if(a.length>=minLongLen) return tokenSet.has(a);
+    if(allowShort && a.length>=shortMin && a.length<=shortMax && !shortBlocklist.has(a)) return tokenSet.has(a);
+    return false;
+  }
+  function collectAliasBoundaryMatches(aliases, text, opts={}){
+    const normalizedText=normalize(text);
+    const tokenSet=new Set(tokenize(text));
+    return uniq((aliases||[]).map(a=>normalize(a)).filter(Boolean).filter(a=>aliasBoundaryMatch(a, normalizedText, tokenSet, opts)));
+  }
+  function esc(s){return String(s ?? "").replace(/[&<>"]/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[m]))}
+  function rowHtml(label, value, tone){const colors={ok:"#86efac",warn:"#fcd34d",err:"#fca5a5",info:"#dbeafe"};return '<div style="margin:4px 0;font-size:15px;line-height:1.45;color:'+colors[tone]+';"><span style="font-weight:700;">'+esc(label)+':</span> '+esc(value)+'</div>'}
+  function logBlock(title, lines){return '<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#0b2447;"><div style="font-weight:700;font-size:14px;color:#bfdbfe;margin-bottom:6px;">'+esc(title)+'</div>'+lines.map(x=>'<div style="font-size:13px;line-height:1.45;color:#dbeafe;margin:2px 0;">• '+esc(x)+'</div>').join("")+'</div>'}
+  function uiToneFromResult(result){
+    if(result==="ok"||result==="passed") return "ok";
+    if(result==="change required"||result==="error"||result==="failed"||result==="denied") return "err";
+    return "warn";
+  }
+  function hasActionableReplacement(recommended){
+    const s=String(recommended==null?"":recommended).trim().toLowerCase();
+    if(!s) return false;
+    return !["not found","not available","none","нет","не найдено","unknown","manual review","требуется проверка","n/a","—"].includes(s);
+  }
+  function isBlockedDecision(decision){
+    const text=String(decision&&decision.text||"").trim();
+    return !!(
+      decision && (
+        decision.blocked_by_product ||
+        decision.blocked_by_region ||
+        /blocked until ProductType is confirmed/i.test(text) ||
+        /blocked until Region is resolved/i.test(text)
+      )
+    );
+  }
+  function uiToneForDecision(decision){
+    if(isBlockedDecision(decision)) return "blocked";
+    const result=String(decision&&decision.result||"").trim();
+    if(result==="ok"||result==="passed") return "ok";
+    if(result==="manual review"||result==="skipped") return "warn";
+    if(result==="change required" && hasActionableReplacement(decision&&decision.recommended)) return "warn";
+    return "err";
+  }
+  function uiBadgeTextForDecision(decision){
+    if(isBlockedDecision(decision)) return "blocked";
+    return uiStatusText(decision&&decision.result, decision&&decision.text);
+  }
+  function uiMapText(value){
+    const s=String(value==null?"":value).trim();
+    if(!s) return "—";
+    const normalized=s.replace(/\s+/g," ").trim();
+    if(/^Name confirms exactly one active catalogue ProductType and it differs from current selection\.?$/i.test(normalized)) return "Название товара однозначно подтверждает другой активный ProductType, а не текущий выбранный.";
+    if(/^Name confirms exactly one ProductType by allowed alias match and it differs from current selection\.?$/i.test(normalized)) return "Название товара однозначно подтверждает другой ProductType по разрешённому алиасу. Необходимо изменить ProductType.";
+    const dynamicRegionMissing=s.match(/^Region\s+([^\s]+)\s+is\s+not\s+present\s+in\s+the\s+catalogue\s+table\s+for\s+this\s+product\.$/i);
+    if(dynamicRegionMissing) return "Региона "+dynamicRegionMissing[1]+" нет в таблице для данного товара.";
+    const dynamicDetectedRegionMissing=s.match(/^Detected\s+region\s+([^\s]+)\s+is\s+not\s+present\s+in\s+the\s+catalogue\s+table\s+for\s+this\s+product\.$/i);
+    if(dynamicDetectedRegionMissing) return "Найденного региона "+dynamicDetectedRegionMissing[1]+" нет в таблице для данного товара.";
+    const dynamicRegionDiff=s.match(/^Current\s+region\s+([^\s]+)\s+differs\s+from\s+detected\s+region\s+([^\s]+)\s+found\s+in\s+(.+)\.$/i);
+    if(dynamicRegionDiff){
+      const srcMap={"Name":"названии","Description":"описании","Name + Description":"названии и описании"};
+      const src=srcMap[dynamicRegionDiff[3]]||"тексте товара";
+      return "В карточке товара указан регион "+dynamicRegionDiff[1]+", но в "+src+" найден регион "+dynamicRegionDiff[2]+". Проверьте, какой регион указан корректно.";
+    }
+    const dynamicOnlyAllowed=s.match(/^Current\s+region\s+is\s+not\s+allowed\s+by\s+catalogue\s+table\s+for\s+this\s+product;\s+only\s+([^\s]+)\s+is\s+allowed\.$/i);
+    if(dynamicOnlyAllowed) return "Текущий регион не входит в список разрешённых регионов для данного товара. Разрешён только регион "+dynamicOnlyAllowed[1]+".";
+    const dynamicAmountMissing=s.match(/^Amount\s+([^\s]+)\s+from\s+Name\s+is\s+absent\s+in\s+catalogue\s+denomination\s+rules\s+for\s+this\s+product\/region\.$/i);
+    if(dynamicAmountMissing) return "Суммы "+dynamicAmountMissing[1]+" нет в таблице для данного товара и региона.";
+    const exact={
+      "none":"нет",
+      "not found":"не найдено",
+      "unknown":"неизвестно",
+      "manual review":"требуется проверка",
+      "ok":"ok",
+      "passed":"пройдено",
+      "Unavailable":"Недоступно"
+    };
+    if(exact[s]!=null) return exact[s];
+    if(exact[normalized]!=null) return exact[normalized];
+    const map=[
+      ["Current ProductType exists in active catalogue, but Name does not confirm active product identity.","Текущий ProductType есть в активном каталоге, но название товара не подтверждает его однозначно. Проверьте ProductType вручную."],
+      ["Current ProductType exists in active catalogue, but Name does not confirm it.","Текущий ProductType есть в активном каталоге, но название товара не подтверждает его однозначно. Проверьте ProductType вручную."],
+      ["Current ProductType is confirmed by allowed alias match in Name.","Текущий ProductType подтверждён по разрешённому алиасу в названии."],
+      ["Current ProductType is confirmed by Name against active catalogue.","Текущий ProductType подтверждён по названию относительно активного каталога."],
+      ["Name confirms exactly one active catalogue ProductType and it differs from current selection.","Название товара однозначно подтверждает другой активный ProductType, а не текущий выбранный."],
+      ["Name confirms exactly one ProductType by allowed alias match and it differs from current selection.","Название товара однозначно подтверждает другой ProductType по разрешённому алиасу. Необходимо изменить ProductType."],
+      ["Name matches multiple ProductTypes by allowed alias table; manual review required.","Название товара совпадает сразу с несколькими ProductType по таблице разрешённых алиасов. Требуется ручная проверка."],
+      ["Name matches multiple active catalogue ProductTypes; manual review required.","Название товара совпадает сразу с несколькими активными ProductType из каталога. Требуется ручная проверка."],
+      ["Name matches multiple active catalogue products; manual review required.","Название товара совпадает сразу с несколькими активными товарами из каталога. Требуется ручная проверка."],
+      ["Weak Name evidence found, but not enough to confirm ProductType.","Найдены слабые совпадения по названию, но их недостаточно для подтверждения ProductType."],
+      ["No strong active catalogue ProductType evidence found in Name.","В названии товара не найдено достаточного подтверждения активного ProductType из каталога."],
+      ["Only weak active catalogue evidence found in Name; manual review required.","По названию найдены только слабые совпадения с активным каталогом. Требуется ручная проверка."],
+      ["Active catalogue match is not confirmed; manual review required.","Совпадение с активным каталогом не подтверждено. Требуется ручная проверка."],
+      ["Inactive / legacy product detected; weak active matches are ignored.","Обнаружен неактивный или legacy товар. Слабые совпадения с активным каталогом игнорируются."],
+      ["Denied — Not found in active catalogue","Не найден в активном каталоге"],
+      ["Current denomination matches exact duration-based catalogue rule.","Текущая denomination подтверждена по точному duration-правилу из таблицы."],
+      ["Catalogue found exact duration-based denomination rule.","В таблице найдено точное duration-совпадение по denomination."],
+      ["Detected duration is absent in catalogue denomination rules for this product/region.","Срок из названия или описания отсутствует в таблице для данного товара и региона."],
+      ["Current ProductType is confirmed by direct alias match in Name against active catalogue.","Текущий ProductType подтверждён по прямому алиасу в названии относительно активного каталога."],
+      ["Active product confirmed by Name against active catalogue.","Активный товар подтверждён по названию относительно активного каталога."],
+      ["Manual review required","Требуется ручная проверка"],
+      ["Current region is allowed by active catalogue product.","Текущий регион подтверждён по таблице для данного товара."],
+      ["Current region matches detected catalogue region.","Текущий регион совпадает с регионом, найденным в названии или описании."],
+      ["Region check blocked until ProductType is confirmed by Name.","Проверка региона заблокирована, пока не подтверждён ProductType."],
+      ["Denomination check blocked until ProductType is confirmed by Name.","Проверка denomination заблокирована, пока не подтверждён ProductType."],
+      ["Current denomination matches numeric catalogue rule.","Текущая denomination подтверждена по таблице для данного товара."],
+      ["Current denomination matches duration-based catalogue rule.","Текущая denomination подтверждена по таблице для данного товара."],
+      ["No exact catalogue denomination match found.","Точное совпадение denomination в таблице не найдено. Проверьте сумму, срок или формат товара."],
+      ["Amount from Name is absent in catalogue denomination rules for this product/region.","Суммы из названия нет в таблице для данного товара и региона."],
+      ["Current product was found only in inactive/legacy catalogue entries.","Текущий товар найден только в неактивных / legacy записях каталога."],
+      ["Name confirms a different active product than current ProductType.","Название подтверждает другой активный товар, а не текущий ProductType."],
+      ["Name matches multiple ProductTypes by allowed alias table.","Название совпадает сразу с несколькими ProductType по таблице разрешённых алиасов."],
+      ["Name confirms a different ProductType by allowed alias match.","Название подтверждает другой ProductType по разрешённому алиасу."],
+      ["Running integrated check...","Выполняется интегрированная проверка..."],
+      ["Rules URL and cache were reset.","URL правил и кэш были сброшены."],
+      ["This case is not set for automatic Apply yet. Review the explanation log.","Для этого кейса автоматическое применение пока не настроено. Проверьте блок диагностики."],
+      ["Server error","Ошибка сервера"],
+      ["Region was not confirmed by catalogue table.","Регион не удалось подтвердить по таблице для данного товара. Требуется проверка."],
+      ["Name and Description point to different regions.","В названии и описании найдены разные регионы. Проверьте регион вручную."],
+      ["Current region is allowed by catalogue table for this product.","Текущий регион подтверждён по таблице для данного товара."],
+      ["Current region matches detected region and is present in the catalogue table.","Текущий регион совпадает с найденным регионом и подтверждён таблицей."],
+      ["Current region is not allowed by catalogue table for this product.","Текущий регион не входит в список разрешённых регионов для данного товара. Проверьте и исправьте регион."],
+      ["Catalogue table allows exactly one region and current region matches it.","Текущий регион совпадает с единственным разрешённым регионом из таблицы."],
+      ["Denomination check blocked until Region is resolved.","Проверка denomination заблокирована, пока не исправлен регион."],
+      ["Catalogue found exact numeric denomination rule.","В таблице найдено точное совпадение по denomination."],
+      ["Catalogue found exact duration denomination rule.","В таблице найдено точное совпадение по denomination."],
+      ["ProductType check skipped due to catalogue error.","Проверка ProductType пропущена из-за ошибки каталога."],
+      ["Region check skipped due to catalogue error.","Проверка региона пропущена из-за ошибки каталога."],
+      ["Denomination check skipped due to catalogue error.","Проверка denomination пропущена из-за ошибки каталога."]
+    ];
+    for(const [from,to] of map){ if(s===from || normalized===from || normalized===from.replace(/\.$/,"")) return to; }
+    return s;
+  }
+  function uiStatusText(result, fallback){
+    const map={
+      ok:"ПОДТВЕРЖДЁН",
+      passed:"АКТИВЕН",
+      failed:"НЕ ПОДТВЕРЖДЁН",
+      denied:"ЗАБЛОКИРОВАН",
+      error:"ОШИБКА",
+      "change required":"ТРЕБУЕТ ИЗМЕНЕНИЯ",
+      "manual review":"ТРЕБУЕТСЯ ПРОВЕРКА"
+    };
+    return map[result] || uiMapText(fallback || result || "неизвестно").toUpperCase();
+  }
+  function uiBadge(text, tone){
+    const colors={ok:["#0f3d2e","#86efac"],warn:["#4a3207","#fcd34d"],err:["#5f1d1d","#fca5a5"],blocked:["#374151","#e5e7eb"],info:["#172554","#bfdbfe"]};
+    const c=colors[tone]||colors.info;
+    return '<span style="display:inline-block;padding:4px 9px;border-radius:999px;background:'+c[0]+';color:'+c[1]+';font-weight:700;font-size:11px;letter-spacing:.01em;">'+esc(text)+'</span>';
+  }
+  function uiField(label, value, opts={}){
+    const tone=opts.tone||"info";
+    const colors={ok:"#86efac",warn:"#fcd34d",err:"#fca5a5",blocked:"#d1d5db",info:"#e5e7eb"};
+    return '<div style="margin:4px 0;font-size:14px;line-height:1.4;color:'+colors[tone]+';"><span style="font-weight:700;color:#f8d26a;">'+esc(label)+':</span> '+esc(uiMapText(value))+'</div>';
+  }
+  function uiSection(title, body, options={}){
+    const tone=options.tone||"info";
+    const headerBg={ok:"linear-gradient(90deg, rgba(34,197,94,.95), rgba(187,247,208,.9), rgba(220,252,231,.88))",warn:"linear-gradient(90deg, rgba(250,204,21,.96), rgba(253,224,71,.9), rgba(254,240,138,.88))",err:"linear-gradient(90deg, rgba(239,68,68,.95), rgba(252,165,165,.9), rgba(254,202,202,.88))",blocked:"linear-gradient(90deg, rgba(107,114,128,.96), rgba(156,163,175,.92), rgba(209,213,219,.88))",info:"linear-gradient(90deg, rgba(254,240,138,.88), rgba(191,219,254,.35), rgba(165,243,252,.28))"};
+    const border={ok:"rgba(34,197,94,.98)",warn:"rgba(250,204,21,.98)",err:"rgba(239,68,68,.98)",blocked:"rgba(156,163,175,.95)",info:"rgba(191,219,254,.22)"};
+    return '<div style="margin-bottom:10px;border:2px solid '+border[tone]+';border-radius:14px;overflow:hidden;background:linear-gradient(180deg, rgba(10,25,58,.96), rgba(8,18,44,.95));box-shadow:inset 0 1px 0 rgba(255,255,255,.03), 0 10px 24px rgba(0,0,0,.18);"><div style="padding:8px 12px;background:'+headerBg[tone]+';color:#101828;font-size:16px;font-weight:800;">'+esc(title)+'</div><div style="padding:10px 12px;">'+body+'</div></div>';
+  }
+  function uiDetailsBlock(title, lines){
+    return '<details style="margin:6px 0;border-radius:10px;background:rgba(11,36,71,.7);border:1px solid rgba(191,219,254,.12);overflow:hidden;"><summary style="cursor:pointer;list-style:none;padding:9px 12px;color:#e5e7eb;font-weight:700;font-size:13px;">'+esc(title)+'</summary><div style="padding:0 12px 10px 12px;">'+(lines||[]).map(x=>'<div style="font-size:12px;line-height:1.4;color:#cbd5e1;margin:3px 0;">• '+esc(x)+'</div>').join("")+'</div></details>';
+  }
+  function uiMainReason(r){
+    if(r.final.manualReviewWords && r.final.manualReviewWords.result==="manual review") return r.final.manualReviewWords.text;
+    if(r.final.activeCatalogue.result!=="passed") return r.final.activeCatalogue.text || r.final.activeCatalogue.note || "Требуется проверка";
+    if(r.final.product.result!=="ok") return r.final.product.text;
+    if(r.final.region.result!=="ok") return r.final.region.text;
+    if(r.final.denomination.result!=="ok") return r.final.denomination.text;
+    return "Проверка пройдена";
+  }
+  function uiRequiredAction(r){
+    if(r.final.manualReviewWords && r.final.manualReviewWords.result==="manual review") return "передать на ручную проверку";
+    if(r.final.activeCatalogue.result!=="passed") return "провести ручную проверку";
+    if(r.final.product.result!=="ok") return "проверить ProductType";
+    if(r.final.region.result!=="ok") return "проверить регион";
+    if(r.final.denomination.result!=="ok") return "проверить denomination";
+    return "действий не требуется";
+  }
+  function uiOverallStatus(r){
+    if(r.final.manualReviewWords && r.final.manualReviewWords.result==="manual review") return {text:"ТРЕБУЕТСЯ ПРОВЕРКА", tone:"warn"};
+    if(r.final.activeCatalogue.result!=="passed") return {text:"ТРЕБУЕТСЯ ПРОВЕРКА", tone:"err"};
+    if(r.final.product.result!=="ok") return {text:uiStatusText(r.final.product.result, r.final.product.text), tone:uiToneForDecision(r.final.product)};
+    if(r.final.region.result!=="ok") return {text:uiStatusText(r.final.region.result, r.final.region.text), tone:uiToneForDecision(r.final.region)};
+    if(r.final.denomination.result!=="ok") return {text:uiStatusText(r.final.denomination.result, r.final.denomination.text), tone:uiToneForDecision(r.final.denomination)};
+    return {text:"ПОДТВЕРЖДЁН", tone:"ok"};
+  }
+  function mark(el, color, bg){ if(!el) return; el.style.boxShadow = "0 0 0 3px "+color; el.style.background = bg || ""; }
+  function rememberStyle(el, key){ if(!el) return; const dataKey="bsvOrig"+key.charAt(0).toUpperCase()+key.slice(1); if(!(dataKey in el.dataset)) el.dataset[dataKey]=el.style[key]||""; }
+  function restoreStyle(el, key){ if(!el) return; const dataKey="bsvOrig"+key.charAt(0).toUpperCase()+key.slice(1); if(dataKey in el.dataset){ el.style[key]=el.dataset[dataKey]||""; delete el.dataset[dataKey]; } }
+  function clearGeneratedPreviews(){ document.querySelectorAll('[data-bsv-highlight-preview="1"]').forEach(el=>el.remove()); }
+  function clearMarks(){
+    [nameInput, descInput, typeSelect, regionContainer, denomSelect].forEach(el=>{ if(!el) return; el.style.boxShadow=""; el.style.background=""; });
+    [nameInput, descInput].forEach(el=>{ if(!el) return; ["width","maxWidth","height","overflow","resize"].forEach(k=>restoreStyle(el,k)); });
+    clearGeneratedPreviews();
+  }
+  function availableFieldWidth(el){ const row=el?.closest('.row'); const rowRect=row?row.getBoundingClientRect():null; const label=row?row.querySelector('label'):null; const labelRect=label?label.getBoundingClientRect():null; const viewport=Math.max(420, window.innerWidth-80); const raw=rowRect?Math.max(320, rowRect.width-(labelRect?labelRect.width:0)-70):Math.floor(viewport*0.68); return Math.min(1120, raw); }
+  function measureTextWidth(el, text){ const span=document.createElement('span'); const cs=window.getComputedStyle(el); span.style.cssText='position:absolute;left:-99999px;top:-99999px;visibility:hidden;white-space:pre;font:'+cs.font+';font-size:'+cs.fontSize+';font-family:'+cs.fontFamily+';font-weight:'+cs.fontWeight+';letter-spacing:'+cs.letterSpacing+';'; span.textContent=String(text||''); document.body.appendChild(span); const w=Math.ceil(span.getBoundingClientRect().width); span.remove(); return w; }
+  function expandNameField(){ if(!nameInput) return; rememberStyle(nameInput,'width'); rememberStyle(nameInput,'maxWidth'); const target=Math.min(availableFieldWidth(nameInput), Math.max(nameInput.getBoundingClientRect().width, measureTextWidth(nameInput, nameInput.value||'')+40)); nameInput.style.width=target+'px'; nameInput.style.maxWidth=target+'px'; }
+  function expandDescriptionField(){ if(!descInput) return; rememberStyle(descInput,'width'); rememberStyle(descInput,'maxWidth'); rememberStyle(descInput,'height'); rememberStyle(descInput,'overflow'); rememberStyle(descInput,'resize'); const targetW=Math.max(descInput.getBoundingClientRect().width, availableFieldWidth(descInput)); descInput.style.width=Math.min(1120, targetW)+'px'; descInput.style.maxWidth=Math.min(1120, targetW)+'px'; descInput.style.overflow='hidden'; descInput.style.resize='none'; descInput.style.height='auto'; const targetH=Math.max(descInput.scrollHeight+8, descInput.getBoundingClientRect().height); descInput.style.height=targetH+'px'; }
+  function scrollProductTypeToTop(){ const anchor=typeSelect?.closest('.row')||typeSelect; if(!anchor) return; const top=Math.max(0, window.scrollY + anchor.getBoundingClientRect().top - 12); window.scrollTo({top, behavior:'auto'}); }
+  function pushMarker(list, text, tone){ const val=String(text||'').trim(); if(!val || val.length<2) return; const key=(tone||'ok')+'::'+val.toLowerCase(); if(list.some(x=>x.key===key)) return; list.push({key,text:val,tone:tone||'ok'}); }
+  function buildFieldMarkers(r){
+    const nameMarkers=[]; const descMarkers=[];
+    const addBoth=(text,tone='ok')=>{ pushMarker(nameMarkers,text,tone); pushMarker(descMarkers,text,tone); };
+    const addName=(text,tone='ok')=>pushMarker(nameMarkers,text,tone);
+    const addDesc=(text,tone='ok')=>pushMarker(descMarkers,text,tone);
+    addBoth(r?.heuristic?.currentTypeText||'', r?.final?.product?.result==='change required'?'err':'ok');
+    if(r?.final?.product?.recommended && r.final.product.recommended!==r.heuristic.currentTypeText) addBoth(r.final.product.recommended, 'ok');
+    const curRegions=(r?.heuristic?.currentRegions||[]).map(x=>x.name).filter(Boolean);
+    curRegions.forEach(x=>addBoth(x, r?.final?.region?.result==='change required'?'err':'ok'));
+    if(r?.final?.region?.recommended && r.final.region.recommended!=='not found') addBoth(r.final.region.recommended, r?.final?.region?.result==='ok'?'ok':'ok');
+    const denom=r?.heuristic?.denom||{};
+    const denomResult=String(r?.final?.denomination?.result||'').trim();
+    const denomError=denomResult==='error';
+    const denomChange=denomResult==='change required';
+    const denomEvidenceTone=denomError ? 'err' : 'ok';
+    if(denom.evidenceDuration){ addBoth(denom.evidenceDuration.label, denomEvidenceTone); addBoth(String(denom.evidenceDuration.value), denomEvidenceTone); addBoth(denom.evidenceDuration.unit, denomEvidenceTone); }
+    if(denom.amount!==null && denom.amount!==undefined){ addBoth(String(denom.amount), denomEvidenceTone); }
+    if(Array.isArray(denom.allAmounts) && denom.allAmounts.length){ denom.allAmounts.forEach(x=>addBoth(String(x), denomError?'err':'ok')); }
+    const currentParts=denom.currentOpt?.parts||[];
+    if(currentParts[2]) addBoth(String(currentParts[2]), (denomChange||denomError)?'err':'ok');
+    if(currentParts[3]) addBoth(String(currentParts[3]), (denomChange||denomError)?'err':'ok');
+    if(r?.heuristic?.regionEvidenceName) addName(r.heuristic.regionEvidenceName, r?.final?.region?.result==='change required'?'err':'ok');
+    if(r?.heuristic?.regionEvidenceDesc) addDesc(r.heuristic.regionEvidenceDesc, r?.final?.region?.result==='change required'?'err':'ok');
+    (r?.manualReviewWords?.matches||[]).forEach(m=>{
+      const areas=Array.isArray(m?.matched_in)?m.matched_in:[];
+      if(areas.includes('name')) addName(m.pattern,'err');
+      if(areas.includes('description')) addDesc(m.pattern,'err');
+      if(!areas.length) addBoth(m.pattern,'err');
+    });
+    if(r?.final?.denomination?.recommended && denomChange && typeof r.final.denomination.recommended==='string' && r.final.denomination.recommended!=='not found'){
+      const recText=String(r.final.denomination.recommended);
+      const m=recText.match(/\d+(?:[.,]\d+)?/g)||[]; m.forEach(x=>addBoth(x,'ok'));
+      if(/month/i.test(recText)) addBoth('month','ok');
+      if(/year/i.test(recText)) addBoth('year','ok');
+      if(/day/i.test(recText)) addBoth('day','ok');
+      if(/gbp/i.test(recText)) addBoth('GBP','ok');
+      if(/usd/i.test(recText)) addBoth('USD','ok');
+      if(/eur/i.test(recText)) addBoth('EUR','ok');
+      if(/stars/i.test(recText)) addBoth('Stars','ok');
+      if(/boosts/i.test(recText)) addBoth('Boosts','ok');
+    }
+    if(denomError){
+      const errText=String(r?.final?.denomination?.text||'');
+      const errNumbers=errText.match(/\d+(?:[.,]\d+)?/g)||[];
+      errNumbers.forEach(x=>addBoth(x,'err'));
+      if(/gbp/i.test(errText)) addBoth('GBP','err');
+      if(/usd/i.test(errText)) addBoth('USD','err');
+      if(/eur/i.test(errText)) addBoth('EUR','err');
+      if(/month/i.test(errText)) addBoth('month','err');
+      if(/year/i.test(errText)) addBoth('year','err');
+      if(/day/i.test(errText)) addBoth('day','err');
+    }
+    return {nameMarkers, descMarkers};
+  }
+  function highlightTextHtml(text, markers){
+    const source=String(text||''); if(!source) return esc(source);
+    const candidates=(markers||[]).filter(x=>x&&x.text).sort((a,b)=>b.text.length-a.text.length);
+    const lower=source.toLowerCase(); const ranges=[];
+    candidates.forEach(m=>{ const needle=String(m.text||'').toLowerCase(); if(!needle) return; let idx=0; while((idx=lower.indexOf(needle, idx))!==-1){ const start=idx, end=idx+needle.length; if(!ranges.some(r=>!(end<=r.start||start>=r.end))){ ranges.push({start,end,tone:m.tone||'ok'}); } idx=end; } });
+    ranges.sort((a,b)=>a.start-b.start||b.end-a.end);
+    if(!ranges.length) return esc(source);
+    let out='', pos=0; ranges.forEach(r=>{ if(r.start>pos) out+=esc(source.slice(pos,r.start)); const raw=esc(source.slice(r.start,r.end)); const style=r.tone==='err' ? 'background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;' : 'background:#dcfce7;color:#166534;border:1px solid #86efac;'; out+='<span style="'+style+'border-radius:4px;padding:0 2px;font-weight:700;">'+raw+'</span>'; pos=r.end; }); if(pos<source.length) out+=esc(source.slice(pos)); return out; }
+  function renderFieldPreview(el, title, text, markers){ if(!el || !text) return; const html=highlightTextHtml(text, markers); if(html===esc(String(text||''))) return; const host=(el.closest('.field')||el.parentElement||el); const box=document.createElement('div'); box.dataset.bsvHighlightPreview='1'; box.style.cssText='margin-top:6px;padding:8px 10px;border-radius:8px;background:#f8fafc;border:1px solid #cbd5e1;color:#0f172a;font:14px/1.45 Arial,sans-serif;white-space:pre-wrap;max-width:'+availableFieldWidth(el)+'px;'; box.innerHTML='<div style="font-size:12px;font-weight:800;color:#475569;margin-bottom:4px;">'+esc(title)+'</div><div>'+html+'</div>'; host.insertAdjacentElement('afterend', box); }
+  function applyReadabilityEnhancements(r){ expandNameField(); expandDescriptionField(); scrollProductTypeToTop(); const markers=buildFieldMarkers(r); renderFieldPreview(nameInput,'Name highlights', nameInput?.value||'', markers.nameMarkers); renderFieldPreview(descInput,'Description highlights', descInput?.value||'', markers.descMarkers); }
+  function currentRegions(){ return [...document.querySelectorAll("#region-container .region-item")].map(el=>({ id:el.getAttribute("data-id")||"", name:(el.querySelector(".region-name")?.textContent||"").trim(), keyword:el.getAttribute("data-geo-keyword")||"" })); }
+  function specialPlusTokens(raw){ const s=String(raw||"").toLowerCase(); const out=[]; if(s.includes("disney+")) out.push("disneyplus"); if(s.includes("espn+")) out.push("espnplus"); if(s.includes("paramount+")) out.push("paramountplus"); if(s.includes("apple tv+")) out.push("appletvplus"); if(s.includes("tv+")) out.push("tvplus"); return out; }
+  function smartTokens(s){ const out=[...specialPlusTokens(s)]; words(s).forEach(t=>{ if(/^\d+$/.test(t)) return; if(PRODUCT_STOP.has(t)) return; if(t==="hongkong"){ out.push("hongkong","hong","kong"); return; } if(t.endsWith("s") && t.length>4) t=t.slice(0,-1); if(t==="disney+") out.push("disneyplus"); if(t==="espn+") out.push("espnplus"); if(t==="paramount+") out.push("paramountplus"); if(t==="tv+") out.push("tvplus","appletvplus"); if(t.length<2) return; out.push(t); }); return uniq(out); }
+  function optionTokens(txt){ const out=smartTokens(txt), n=normalize(txt); if(/playerunknown|battleground/.test(n)) out.push("pubg"); if(/new state/.test(n)) out.push("newstate","nc"); if(/\bpsn\b|playstation/.test(n)) out.push("psn","playstation"); if(/\bxbox\b/.test(n)) out.push("xbox"); if(/\broblox\b/.test(n)) out.push("roblox","robux"); if(/\bgoogle play\b/.test(n)) out.push("googleplay"); if(/\bitunes\b/.test(n)) out.push("itunes","apple"); if(/\bapple\b/.test(n)) out.push("apple"); if(/\bapple tv\+?\b/.test(n)) out.push("appletv","appletvplus"); if(/\bnintendo\b/.test(n)) out.push("nintendo"); if(/\beshop\b/.test(n)) out.push("eshop"); if(/\bsteam\b/.test(n)) out.push("steam"); if(/\bspotify\b/.test(n)) out.push("spotify"); if(/\bnetflix\b/.test(n)) out.push("netflix"); if(/\bamazon\b/.test(n)) out.push("amazon"); if(/\bepic\b/.test(n)) out.push("epic"); if(/\bgame(s)?\b/.test(n)) out.push("games"); if(/\bdiscord\b/.test(n)) out.push("discord"); if(/\bnitro\b/.test(n)) out.push("nitro"); if(/\bcrunchyroll\b/.test(n)) out.push("crunchyroll"); if(/\byoutube\b/.test(n)) out.push("youtube"); if(/\bea\b/.test(n)) out.push("ea"); if(/\bplay\b/.test(n)) out.push("play"); if(/\bdisney\+?\b/.test(n)) out.push("disney"); if(/\bdisney\+\b/.test(n)||n.includes("disney+")) out.push("disneyplus"); if(/\bespn\+\b/.test(n)||n.includes("espn+")) out.push("espnplus"); if(/\bparamount\+\b/.test(n)||n.includes("paramount+")) out.push("paramountplus"); return uniq(out); }
+  function productScore(name, txt){ const rawName=String(name||"").toLowerCase(), rawOpt=String(txt||"").toLowerCase(); const nameNorm=normalize(name), nameSet=new Set(smartTokens(name)), optNorm=normalize(txt), optTokens=optionTokens(txt); let score=0, unmatched=0; optTokens.forEach(t=>{ if(nameSet.has(t)) score+=12; else unmatched++; }); score-=unmatched*4; if(optNorm && nameNorm.includes(optNorm)) score+=30; if(optTokens.length && optTokens.every(t=>nameSet.has(t))) score+=16; [...String(txt||"").matchAll(/\(([^)]+)\)/g)].map(m=>normalize(m[1])).forEach(p=>{ if(p && nameSet.has(p)) score+=14; }); if(/\bpubg\b/.test(nameNorm)&&/\buc\b/.test(nameNorm)){ if(/playerunknown|battleground/.test(optNorm)) score+=28; if(/new state|\bnc\b/.test(optNorm)) score-=22; } if(/new state|\bnc\b/.test(nameNorm)){ if(/new state|\bnc\b/.test(optNorm)) score+=26; if(/playerunknown|battleground/.test(optNorm)) score-=18; } if(/\brobux\b/.test(nameNorm)&&/\broblox\b/.test(optNorm)) score+=18; if(/\bpsn\b/.test(nameNorm)&&/playstation/.test(optNorm)) score+=18; if(/\bnintendo\b/.test(nameNorm)&&/\bnintendo\b/.test(optNorm)) score+=12; if(/\beshop\b/.test(nameNorm)&&/\beshop\b/.test(optNorm)) score+=14; if(/\bsteam\b/.test(nameNorm)&&/\bsteam\b/.test(optNorm)) score+=12; if(/\bgoogle play\b/.test(nameNorm)&&/\bgoogle play\b/.test(optNorm)) score+=14; if((/\bapple\b|\bitunes\b/.test(nameNorm))&&(/\bapple\b|\bitunes\b/.test(optNorm))) score+=12; if(/\bepic\b/.test(nameNorm)&&/\bepic\b/.test(optNorm)) score+=16; if(/\bdiscord\b/.test(nameNorm)&&/\bdiscord\b/.test(optNorm)) score+=18; if(/\bnitro\b/.test(nameNorm)&&/\bnitro\b/.test(optNorm)) score+=10; if(/\bcrunchyroll\b/.test(nameNorm)&&/\bcrunchyroll\b/.test(optNorm)) score+=18; if(/\byoutube\b/.test(nameNorm)&&/\byoutube\b/.test(optNorm)) score+=18; if(/\bea\b/.test(nameNorm)&&/\bea\b/.test(optNorm)) score+=14; if(/\bplay\b/.test(nameNorm)&&/\bplay\b/.test(optNorm)) score+=8; if(optNorm==="other") score-=40; if(rawName.includes("disney+")){ if(rawOpt.includes("disney+")) score+=40; else if(/\bdisney\b/.test(optNorm)) score-=8; } if(rawName.includes("espn+")){ if(rawOpt.includes("espn+")) score+=40; else if(/\bespn\b/.test(optNorm)) score-=8; } if(rawName.includes("paramount+")){ if(rawOpt.includes("paramount+")) score+=40; else if(/\bparamount\b/.test(optNorm)) score-=8; } if(rawName.includes("apple tv+")){ if(rawOpt.includes("apple tv+")) score+=40; else if(/apple tv/.test(optNorm)) score-=8; } return score; }
+  function explainProductOption(name,opt){ if(!opt) return {matched:[],missing:[],score:null}; const nameSet=new Set(smartTokens(name)); const optT=optionTokens(opt.text||opt); return {matched: optT.filter(t=>nameSet.has(t)), missing: optT.filter(t=>!nameSet.has(t)), score: opt.score ?? productScore(name,opt.text||opt)}; }
+  function findBestProductType(name,currentValue){ const options=[...typeSelect.options].filter(o=>o.value&&!/\(deleted\)/i.test(o.textContent||"")).map(o=>({value:o.value,text:(o.textContent||"").trim(),score:productScore(name,o.textContent||"")})).sort((a,b)=>b.score-a.score); const best=options[0]||null, second=options[1]||null, current=options.find(x=>x.value===currentValue)||null; const maxScore=best?best.score:-9999; const leaders=options.filter(x=>x.score===maxScore); const currentIsLeader=!!(current&&current.score===maxScore); const chosen=currentIsLeader?current:best; const confident=!!chosen&&chosen.score>=20&&((leaders.length===1)||currentIsLeader||(!second||chosen.score-second.score>=6)); return {best:chosen,second,confident,top:options.slice(0,5),current,currentIsLeader,explainCurrent:explainProductOption(name,current),explainBest:explainProductOption(name,chosen)}; }
+  function canonicalRegion(v){ const n=normalize(v), set=new Set(words(v)); if(n==="global"||set.has("global")||set.has("ww")||n.includes("worldwide")) return "global"; if(set.has("latam")||n.includes("latin america")) return "latam"; if(set.has("mena")||n.includes("middle east and north africa")) return "mena"; if(n.includes("united states of america")||n.includes("united states")||set.has("usa")||set.has("us")) return "us"; if(n.includes("united kingdom")||set.has("uk")||n.includes("great britain")) return "uk"; if(set.has("eu")||n.includes("european union")) return "eu"; if(n.includes("hong kong")||set.has("hongkong")||set.has("hk")) return "hong kong"; if(set.has("japan")||set.has("jp")) return "japan"; if(set.has("turkey")||set.has("tr")) return "turkey"; if(set.has("mexico")||set.has("mx")) return "mexico"; if(set.has("norway")||set.has("no")) return "norway"; if(n.includes("united arab emirates")||n.includes("arab emirates")||set.has("uae")||set.has("ae")) return "uae"; if(n.includes("saudi arabia")||set.has("ksa")||set.has("sa")) return "saudi arabia"; if(set.has("germany")||set.has("de")) return "germany"; if(set.has("france")||set.has("fr")) return "france"; if(set.has("italy")||set.has("it")) return "italy"; if(set.has("spain")||set.has("es")) return "spain"; if(set.has("poland")||set.has("pl")) return "poland"; if(set.has("brazil")||set.has("br")) return "brazil"; return ""; }
+  function detectRegionFromText(text){ const n=normalize(text), set=new Set(words(text)); const hits=[]; REGION_RULES.forEach(r=>{ let score=0; r.aliases.forEach(a=>{ if(normalize(a)&&n.includes(normalize(a))) score+=4; }); r.tokens.forEach(t=>{ if(set.has(t)) score+=2; }); if(score) hits.push({key:r.key,score}); }); hits.sort((a,b)=>b.score-a.score); return hits[0]||null; }
+  function detectRegionEvidence(name,description){
+    const fromName=detectRegionFromText(name);
+    const fromDesc=detectRegionFromText(description);
+    if(fromName&&fromDesc){
+      if(fromName.key===fromDesc.key) return {detected:fromName,source:"Name + Description",conflict:false,nameRegion:fromName,descRegion:fromDesc};
+      if(!isGenericHeuristicRegionKey(fromName.key) && isGenericHeuristicRegionKey(fromDesc.key)) return {detected:fromName,source:"Name",conflict:false,nameRegion:fromName,descRegion:fromDesc};
+      if(isGenericHeuristicRegionKey(fromName.key) && !isGenericHeuristicRegionKey(fromDesc.key)) return {detected:fromDesc,source:"Description",conflict:false,nameRegion:fromName,descRegion:fromDesc};
+      return {detected:null,source:"Conflict",conflict:true,nameRegion:fromName,descRegion:fromDesc};
+    }
+    if(fromName) return {detected:fromName,source:"Name",conflict:false,nameRegion:fromName,descRegion:null};
+    if(fromDesc) return {detected:fromDesc,source:"Description",conflict:false,nameRegion:null,descRegion:fromDesc};
+    return {detected:null,source:"Not found",conflict:false,nameRegion:null,descRegion:null};
+  }
+  function getAvailableRegions(productTypeId){ try{ if(typeof window.getPossibleGeoRegions==="function"){ const x=window.getPossibleGeoRegions(productTypeId); if(Array.isArray(x)) return x; } }catch(e){} let regions=[]; if(window.jQuery){ window.jQuery.ajax({async:false,url:"/api/v1/system/getGeoRegionsByBrand",type:"GET",data:{id:productTypeId},success:r=>{ regions=Array.isArray(r)?r:[]; }}); } return regions; }
+  function findRegionMatch(evidence, productTypeId){ const desired=evidence.detected, available=getAvailableRegions(productTypeId); if(!desired) return {desired:null,best:null,available}; const best=available.find(r=>{ const vals=[r.name,r.keyword,r.kw].filter(Boolean).map(canonicalRegion).filter(Boolean); return vals.includes(desired.key); }) || null; return {desired,best,available}; }
+  function detectModifiers(text){ const n=normalize(text); const found=[]; PLAN_MODIFIERS.forEach(([key,aliases])=>{ if(aliases.some(a=>n.includes(normalize(a)))) found.push(key); }); return uniq(found); }
+  function measurementAliases(measurement){ const m=normalize(measurement||""); if(!m) return []; const out=[m]; if(m.endsWith("s")) out.push(m.slice(0,-1)); else out.push(m+"s"); if(m==="boosts"||m==="boost") out.push("server boost","server boosts"); return uniq(out.filter(Boolean)); }
+  function measurementEvidence(text){ const n=normalize(text); return { raw:n, has(alias){ return !!alias && n.includes(normalize(alias)); } }; }
+  function ruleMeasurementHit(rule, evidence){ const aliases=measurementAliases(rule&&rule.measurement||""); return aliases.some(a=>evidence.has(a)); }
+  function detectDurationFromText(text){ const n=normalize(text); let m=n.match(/(\d+)\s*(day|days|d)\b/); if(m) return {value:Number(m[1]),unit:"day",label:m[1]+" day"+(Number(m[1])===1?"":"s")}; m=n.match(/(\d+)\s*(month|months|mo|mos|mth|mths|mont|mnth)\b/); if(m) return {value:Number(m[1]),unit:"month",label:m[1]+" month"+(Number(m[1])===1?"":"s")}; m=n.match(/(\d+)\s*(year|years|yr|yrs)\b/); if(m) return {value:Number(m[1]),unit:"year",label:m[1]+" year"+(Number(m[1])===1?"":"s")}; if(/\bannual\b/.test(n)) return {value:1,unit:"year",label:"1 year"}; return null; }
+  function parseDenomOptionText(txt){ const parts=[...String(txt||"").matchAll(/\[([^\]]+)\]/g)].map(m=>m[1]); const amount=(parts.slice().reverse().find(p=>/^\d+(\.\d+)?$/.test(p))||""); const code=(parts[0]||""), mode=normalize(parts[1]||""), measurementRaw=(parts[2]||parts[1]||""), unit=measurementRaw.toUpperCase(); const codeParts=code.split("_").filter(Boolean).map(x=>x.toUpperCase()); const regionTok=codeParts.find(x=>["WW","LATAM","MENA","US","USA","UK","EU","HK","JP","MX","NO","TR","AE","UAE","KSA","DE","FR","IT","ES","PL","BR","GLOBAL"].includes(x))||""; const regionMap={WW:"global",GLOBAL:"global",LATAM:"latam",MENA:"mena",US:"us",USA:"us",UK:"uk",EU:"eu",HK:"hong kong",JP:"japan",MX:"mexico",NO:"norway",TR:"turkey",AE:"uae",UAE:"uae",KSA:"saudi arabia",DE:"germany",FR:"france",IT:"italy",ES:"spain",PL:"poland",BR:"brazil"}; const full=(txt||"").trim(); let duration=detectDurationFromText(full); if(!duration && (mode==="time_based" || mode==="time based")){ const valuePart=(parts[3]||parts[parts.length-1]||"").trim(); const measurement=normalize(measurementRaw); if(/^\d+$/.test(valuePart)){ if(measurement==="month"||measurement==="months") duration={value:Number(valuePart),unit:"month",label:Number(valuePart)+" month"+(Number(valuePart)===1?"":"s")}; else if(measurement==="year"||measurement==="years") duration={value:Number(valuePart),unit:"year",label:Number(valuePart)+" year"+(Number(valuePart)===1?"":"s")}; else if(measurement==="day"||measurement==="days") duration={value:Number(valuePart),unit:"day",label:Number(valuePart)+" day"+(Number(valuePart)===1?"":"s")}; } } return {text:full,value:null,parts,ruleKey:code,amount:amount?Number(amount):null,unit,regionCanon:regionMap[regionTok]||"",duration,modifiers:detectModifiers(full)}; }
+  function extractCandidateAmounts(name){ return uniq((String(name||"").match(/\d+(?:[.,]\d+)?/g)||[]).map(x=>Number(x.replace(",","."))).filter(x=>Number.isFinite(x))).sort((a,b)=>b-a); }
+  function detectDenomEvidence(name,description){ const nameDuration=detectDurationFromText(name); const descDuration=detectDurationFromText(description); const nameModifiers=detectModifiers(name); const descModifiers=detectModifiers(description); if(nameDuration) return {mode:"duration",source:"Name",duration:nameDuration,modifiers:nameModifiers.length?nameModifiers:descModifiers}; if(descDuration) return {mode:"duration",source:"Description",duration:descDuration,modifiers:descModifiers.length?descModifiers:nameModifiers}; return {mode:"numeric",source:"Name",amounts:extractCandidateAmounts(name),modifiers:nameModifiers}; }
+  function sameDuration(a,b){ return !!(a&&b&&a.value===b.value&&a.unit===b.unit); }
+
+  function getDenomOptionsFromDropdown(){
+    return [...denomSelect.options]
+      .filter(o=>o.value && o.value!=="0")
+      .map(o=>{
+        const parsed=parseDenomOptionText(o.textContent||"");
+        return {...parsed, value:o.value, text:(o.textContent||"").trim()};
+      });
+  }
+  function formatDurationLabel(d){
+    return d && d.label ? d.label : "not found";
+  }
+  function formatOptionDurationLabel(opt){
+    return opt && opt.duration ? opt.duration.label : "not found";
+  }
+  function currentDenomMatchesDurationRule(currentParsed, ruleKey, evidenceDuration){
+    return !!(currentParsed && currentParsed.ruleKey===ruleKey && sameDuration(currentParsed.duration, evidenceDuration));
+  }
+  function currentDenomMatchesNumericRule(currentParsed, ruleKey, evidenceAmount){
+    return !!(currentParsed && currentParsed.ruleKey===ruleKey && currentParsed.amount!==null && evidenceAmount!==null && Number(currentParsed.amount)===Number(evidenceAmount));
+  }
+  function optionMatchesDurationRule(option, ruleKey, evidenceDuration){
+    return !!(option && option.ruleKey===ruleKey && sameDuration(option.duration, evidenceDuration));
+  }
+  function optionMatchesNumericRule(option, ruleKey, evidenceAmount){
+    return !!(option && option.ruleKey===ruleKey && option.amount!==null && evidenceAmount!==null && Number(option.amount)===Number(evidenceAmount));
+  }
+  function getDeterministicDropdownOptions(ruleKey, mode, evidence){
+    const options=getDenomOptionsFromDropdown().filter(opt=>{
+      if(mode==="duration") return optionMatchesDurationRule(opt, ruleKey, evidence.duration);
+      return optionMatchesNumericRule(opt, ruleKey, evidence.amount);
+    });
+    return options;
+  }
+  function findDeterministicDropdownTarget(ruleKey, mode, evidence){
+    const options=getDeterministicDropdownOptions(ruleKey, mode, evidence);
+    return options.length===1 ? options[0] : null;
+  }
+  function filterRulesByAllEvidenceModifiers(ruleMatches, evidenceModifiers){
+    if(!evidenceModifiers || !evidenceModifiers.length) return ruleMatches;
+    const strict = ruleMatches.filter(x=>evidenceModifiers.every(m=>(x.rule.modifiers||[]).includes(m)));
+    return strict.length ? strict : ruleMatches;
+  }
+  function detectDesiredDenomination(name,description,targetRegionCanon){
+    const opts=getDenomOptionsFromDropdown();
+    const evidence=detectDenomEvidence(name,description);
+    const currentValue=denomSelect.value;
+    const currentOpt=opts.find(o=>o.value===currentValue)||null;
+    const currentParsed=currentOpt||null;
+    if(evidence.mode==="duration"){
+      const durationOptions=opts.filter(o=>o.duration);
+      const exactDurationOptions=durationOptions.filter(o=>sameDuration(o.duration,evidence.duration));
+      const ranked=durationOptions.map(o=>{
+        let s=0;
+        if(sameDuration(o.duration,evidence.duration)) s+=100;
+        else if(o.duration&&o.duration.unit===evidence.duration.unit) s+=10;
+        else s-=40;
+        if(targetRegionCanon&&o.regionCanon){
+          if(o.regionCanon===targetRegionCanon) s+=24;
+          else s-=14;
+        }
+        const evMods=evidence.modifiers||[];
+        const optMods=o.modifiers||[];
+        const matchedMods=evMods.filter(m=>optMods.includes(m));
+        if(evMods.length){
+          s+=matchedMods.length*20;
+          s-=(evMods.length-matchedMods.length)*12;
+        }
+        return {...o,score:s,matchedMods,missingMods:evMods.filter(m=>!optMods.includes(m))};
+      }).sort((a,b)=>b.score-a.score);
+      const best=ranked[0]||null;
+      const exactDurationMissing=!!evidence.duration&&!exactDurationOptions.length;
+      const confident=!!best&&best.score>=80&&!exactDurationMissing;
+      const currentExactMatch=!!(currentParsed && sameDuration(currentParsed.duration, evidence.duration));
+      return {
+        mode:"duration",
+        source:evidence.source,
+        currentValue,
+        currentOpt,
+        currentParsed,
+        currentExactMatch,
+        best,
+        confident,
+        top:ranked.slice(0,5),
+        exactDurationMissing,
+        availableDurations:durationOptions.map(o=>o.duration?o.duration.label:"").filter(Boolean),
+        evidenceDuration:evidence.duration,
+        evidenceModifiers:evidence.modifiers||[],
+        allAmounts:[],
+        amount:null,
+        availableAmounts:[],
+        options:opts
+      };
+    }
+    const optionAmounts=new Set(opts.map(o=>o.amount).filter(v=>v!==null));
+    const matchedAmounts=(evidence.amounts||[]).filter(a=>optionAmounts.has(a));
+    const missingAmounts=(evidence.amounts||[]).filter(a=>!optionAmounts.has(a));
+    const amount=matchedAmounts.length?matchedAmounts[0]:null;
+    const nameSet=new Set(words(name));
+    const exactAmountMissing=!matchedAmounts.length&&missingAmounts.length>0;
+    const ranked=amount===null?[]:opts.map(o=>{
+      let s=0;
+      if(o.amount===amount) s+=100;
+      else s-=40;
+      if(targetRegionCanon&&o.regionCanon){
+        if(o.regionCanon===targetRegionCanon) s+=24;
+        else s-=14;
+      }
+      if(o.unit&&nameSet.has(o.unit.toLowerCase())) s+=10;
+      return {...o,score:s};
+    }).sort((a,b)=>b.score-a.score);
+    const best=exactAmountMissing?null:(ranked[0]||null);
+    const confident=!!best&&best.score>=80;
+    const currentExactMatch=!!(currentParsed && currentParsed.amount!==null && amount!==null && Number(currentParsed.amount)===Number(amount));
+    return {
+      mode:"numeric",
+      source:"Name",
+      currentValue,
+      currentOpt,
+      currentParsed,
+      currentExactMatch,
+      best,
+      confident,
+      top:ranked.slice(0,5),
+      exactAmountMissing,
+      availableAmounts:[...optionAmounts].sort((a,b)=>a-b),
+      availableDurations:[],
+      evidenceDuration:null,
+      evidenceModifiers:evidence.modifiers||[],
+      allAmounts:evidence.amounts||[],
+      amount,
+      options:opts
+    };
+  }
+
+  function loadHeuristic(){ const name=(nameInput.value||"").trim(), description=(descInput.value||"").trim(), currentTypeValue=typeSelect.value, currentTypeText=(typeSelect.selectedOptions[0]?.textContent||"").trim(); const product=findBestProductType(name,currentTypeValue); const typeMismatch=!!(product.best&&product.best.value!==currentTypeValue); const effectiveTypeId=typeMismatch&&product.confident?product.best.value:currentTypeValue; const regionEvidence=detectRegionEvidence(name,description); const region=findRegionMatch(regionEvidence,effectiveTypeId); const currRegions=currentRegions(); const currentRegionCanons=currRegions.map(r=>canonicalRegion(r.name+" "+r.keyword)).filter(Boolean); const desiredRegionCanon=region.desired?region.desired.key:""; const regionMismatch=!!desiredRegionCanon&&!currentRegionCanons.includes(desiredRegionCanon); const effectiveRegionCanon=desiredRegionCanon||currentRegionCanons[0]||""; const denom=detectDesiredDenomination(name,description,effectiveRegionCanon); const denomMismatch=!!(denom.best&&denom.confident&&denom.best.value!==denom.currentValue); const denomMissing=denom.exactDurationMissing||denom.exactAmountMissing; const regionDecision = regionEvidence.conflict ? {tone:"warn",text:"manual review — Name and Description conflict",source:"Conflict"} : region.desired ? (regionMismatch ? {tone:"err",text:"change required",source:regionEvidence.source} : {tone:"ok",text:"ok",source:regionEvidence.source}) : {tone:"warn",text:"manual review — region not confirmed by Name/Description",source:"Not found"}; const log={ product:["Current score: "+(product.current?product.current.score:"n/a"),"Recommended score: "+(product.best?product.best.score:"n/a"),"Matched tokens (recommended): "+(product.explainBest.matched.join(", ")||"none"),"Missing tokens (recommended): "+(product.explainBest.missing.join(", ")||"none"), product.current ? "Matched tokens (current): "+(product.explainCurrent.matched.join(", ")||"none") : "Matched tokens (current): none"], region:["Name region: "+(regionEvidence.nameRegion?regionEvidence.nameRegion.key:"not found"),"Description region: "+(regionEvidence.descRegion?regionEvidence.descRegion.key:"not found"),"Decision source: "+regionEvidence.source], denomination: []}; if(denom.mode==="duration"){ log.denomination.push("Mode: duration-based","Source: "+denom.source,"Detected duration: "+(denom.evidenceDuration?denom.evidenceDuration.label:"not found"),"Detected modifiers: "+(denom.evidenceModifiers.join(", ")||"none"),"Available durations: "+(denom.availableDurations.join(", ")||"none")); if(denom.best){ log.denomination.push("Best option: "+denom.best.text,"Best option modifiers matched: "+(denom.best.matchedMods?denom.best.matchedMods.join(", "):"none"),"Best option score: "+denom.best.score); } } else { log.denomination.push("Mode: numeric-based","Detected amounts: "+((denom.allAmounts||[]).join(", ")||"none"),"Available amounts: "+(denom.availableAmounts.join(", ")||"none")); if(denom.best) log.denomination.push("Best option score: "+denom.best.score); }
+    return {name,description,currentTypeText,product,typeMismatch,productConfident:product.confident,currentRegions:currRegions,desiredRegion:region.desired,desiredRegionOption:region.best,regionMismatch,regionSource:regionEvidence.source,regionConflict:regionEvidence.conflict,regionEvidenceName:regionEvidence.nameRegion?regionEvidence.nameRegion.key:null,regionEvidenceDesc:regionEvidence.descRegion?regionEvidence.descRegion.key:null,denom,denomMismatch,denomMissing,regionDecision,log}; }
+
+  async function loadRules(){
+    let url=getRulesUrl();
+    if(!url) throw new Error("Rules URL was not provided.");
+    if(!String(safeStorageGet(CONFIG_KEY)||"").trim()){
+      safeStorageSet(CONFIG_KEY,url);
+    }
+    const cachedMetaRaw=safeStorageGet(CACHE_META_KEY), cachedRaw=safeStorageGet(CACHE_KEY);
+    if(cachedMetaRaw&&cachedRaw){
+      try{
+        const meta=JSON.parse(cachedMetaRaw);
+        if(Date.now()-meta.cached_at<CACHE_MAX_AGE_MS) return JSON.parse(cachedRaw);
+      }catch(e){}
+    }
+    const res=await fetch(url,{credentials:"omit",cache:"no-store"});
+    if(!res.ok) throw new Error("Failed to load rules: HTTP "+res.status);
+    const rules=await res.json();
+    safeStorageSet(CONFIG_KEY,url);
+    safeStorageSet(CACHE_KEY,JSON.stringify(rules));
+    safeStorageSet(CACHE_META_KEY,JSON.stringify({cached_at:Date.now(),catalogue_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}));
+    return rules;
+  }
+  function getRulesUrl(){
+    return String(safeStorageGet(CONFIG_KEY) || DEFAULT_RULES_URL || "").trim();
+  }
+  function deriveAllowedAliasesUrl(){
+    const rulesUrl=getRulesUrl();
+    if(!rulesUrl) return DEFAULT_ALLOWED_ALIASES_FILE;
+    try{
+      const u=new URL(rulesUrl, location.href);
+      const parts=u.pathname.split('/');
+      if(parts.length) parts[parts.length-1]=DEFAULT_ALLOWED_ALIASES_FILE;
+      u.pathname=parts.join('/');
+      u.search='';
+      u.hash='';
+      return u.toString();
+    } catch(e){
+      return DEFAULT_ALLOWED_ALIASES_FILE;
+    }
+  }
+  async function loadAllowedAliases(){
+    const url=deriveAllowedAliasesUrl();
+    try{
+      const res=await fetch(url,{credentials:"omit",cache:"no-store"});
+      if(!res.ok) throw new Error("Failed to load allowed aliases: HTTP "+res.status);
+      const text=await res.text();
+      const rows=parseAllowedAliasesTsv(text);
+      return {status:"loaded",url,error:null,rows};
+    } catch(e){
+      return {status:"failed",url,error:e&&e.message?e.message:String(e),rows:[]};
+    }
+  }
+  function loadManualReviewWordsJsonp(url){
+    return new Promise((resolve,reject)=>{
+      const callbackName='__BSV_MRW_JSONP_CB_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+      const script=document.createElement('script');
+      let finished=false;
+      const cleanup=()=>{
+        try{delete window[callbackName];}catch(_e){window[callbackName]=undefined;}
+        try{script.remove();}catch(_e){}
+      };
+      const doneSuccess=(data)=>{ if(finished) return; finished=true; cleanup(); resolve(data); };
+      const doneError=(err)=>{ if(finished) return; finished=true; cleanup(); reject(err instanceof Error?err:new Error(String(err||'JSONP load failed'))); };
+      window[callbackName]=(data)=>doneSuccess(data);
+      script.onerror=()=>doneError(new Error('JSONP script load error'));
+      const sep=url.includes('?')?'&':'?';
+      script.src=url+sep+'callback='+encodeURIComponent(callbackName)+'&ts='+Date.now();
+      script.async=true;
+      document.head.appendChild(script);
+      setTimeout(()=>doneError(new Error('JSONP timeout')),15000);
+    });
+  }
+  async function loadManualReviewWords(){
+    const url=String(MANUAL_REVIEW_WORDS_URL||"").trim();
+    if(!url) return {status:"disabled",url:"",error:null,count:0,items:[],service:"",matches:[],triggered:false,log:["Manual Review Words URL: not set"]};
+    try{
+      const data=await loadManualReviewWordsJsonp(url);
+      if(!data||data.ok!==true||!Array.isArray(data.items)) throw new Error("Manual review words service returned invalid payload");
+      return {status:"loaded",url,error:null,count:Number(data.count||data.items.length||0),items:data.items,service:String(data.service||""),matches:[],triggered:false,log:["Manual Review Words service: loaded","Manual Review Words URL: "+url,"Transport: jsonp","Active rules count: "+String(Number(data.count||data.items.length||0))]};
+    } catch(e){
+      const err=e&&e.message?e.message:String(e);
+      return {status:"failed",url,error:err,count:0,items:[],service:"",matches:[],triggered:false,log:["Manual Review Words service: failed","Manual Review Words URL: "+url,"Transport: jsonp","Error: "+err]};
+    }
+  }
+  function manualReviewPatternMatchesText(text, pattern, matchType){
+    const normalizedText=normalize(text);
+    const patternNorm=normalize(pattern);
+    if(!normalizedText||!patternNorm) return false;
+    const paddedText=" "+normalizedText+" ";
+    const paddedPattern=" "+patternNorm+" ";
+    const tokenSet=new Set(tokenize(text));
+    if(matchType==="phrase") return paddedText.includes(paddedPattern);
+    if(matchType==="token") return patternNorm.includes(" ") ? paddedText.includes(paddedPattern) : tokenSet.has(patternNorm);
+    return normalizedText.includes(patternNorm);
+  }
+  function detectManualReviewWords(name, description, info){
+    const base=info||{status:"disabled",url:"",error:null,count:0,items:[],service:"",log:[]};
+    const matches=[];
+    const items=Array.isArray(base.items)?base.items:[];
+    items.forEach((item)=>{
+      const scope=String(item&&item.scope||"both").toLowerCase();
+      const matchType=String(item&&item.match_type||"contains").toLowerCase();
+      const pattern=String(item&&item.pattern||"").trim();
+      if(!pattern) return;
+      const matchedIn=[];
+      if((scope==="both"||scope==="name") && manualReviewPatternMatchesText(name, pattern, matchType)) matchedIn.push("name");
+      if((scope==="both"||scope==="description") && manualReviewPatternMatchesText(description, pattern, matchType)) matchedIn.push("description");
+      if(!matchedIn.length) return;
+      matches.push({pattern,scope,match_type:matchType,decision:String(item&&item.decision||"manual_review"),matched_in:matchedIn});
+    });
+    const log=(base.log||[]).slice();
+    log.push("Matched manual review words: "+(matches.map(x=>x.pattern+" ["+x.matched_in.join(", ")+"]").join(" | ")||"none"));
+    log.push("Manual review words triggered: "+(matches.length?"yes":"no"));
+    return {status:base.status||"disabled",url:base.url||"",error:base.error||null,count:base.count||0,items:items,service:base.service||"",matches,triggered:matches.length>0,log};
+  }
+  function parseAllowedAliasesTsv(tsvText){
+    const lines=String(tsvText||"").split(/\r?\n/).map(x=>String(x||"").trim()).filter(Boolean);
+    if(!lines.length) return [];
+    const header=lines[0].split("	").map(x=>String(x||"").trim());
+    const idxProductKey=header.indexOf("product_key");
+    const idxAlias=header.indexOf("alias");
+    const idxStatus=header.indexOf("status");
+    const idxComment=header.indexOf("comment");
+    if(idxProductKey===-1||idxAlias===-1||idxStatus===-1||idxComment===-1) throw new Error("Allowed aliases TSV has invalid header");
+    const rows=[];
+    for(let i=1;i<lines.length;i++){
+      const cols=lines[i].split("	");
+      const product_key=String(cols[idxProductKey]||"").trim();
+      const alias=String(cols[idxAlias]||"").trim();
+      const status=String(cols[idxStatus]||"").trim().toLowerCase();
+      const comment=String(cols[idxComment]||"").trim();
+      if(!product_key||!alias) continue;
+      if(status!=="active") continue;
+      rows.push({product_key,alias,status,comment});
+    }
+    return rows;
+  }
+  function buildIndexes(rules, allowedAliasesInfo){ const regionAliasMap=new Map(); (rules.dictionaries?.regions||[]).forEach(r=>{ (r.aliases||[]).forEach(a=>{ const key=normalize(a); if(!key) return; if(!regionAliasMap.has(key)) regionAliasMap.set(key,new Set()); regionAliasMap.get(key).add(r.key); }); }); const productAliasMap=new Map(); const productAliasesByKey=new Map(); function addProductAlias(alias, productKey){ const key=normalize(alias); if(!key || !productKey) return; if(!productAliasMap.has(key)) productAliasMap.set(key,new Set()); productAliasMap.get(key).add(productKey); if(!productAliasesByKey.has(productKey)) productAliasesByKey.set(productKey,new Set()); productAliasesByKey.get(productKey).add(key); } (rules.dictionaries?.brand_aliases||[]).forEach(b=>{ addProductAlias(b.canonical_name,b.brand_key); addProductAlias(b.brand_key,b.brand_key); (b.aliases||[]).forEach(a=>addProductAlias(a,b.brand_key)); }); (rules.dictionaries?.product_keys||[]).forEach(p=>{ addProductAlias(p.name,p.key); addProductAlias(p.key,p.key); (p.aliases||[]).forEach(a=>addProductAlias(a,p.key)); }); const productsByKey=new Map(); (rules.catalogue?.products||[]).forEach(p=>{ productsByKey.set(p.product_type_key,p); addProductAlias(p.product_type_key,p.product_type_key); (p.brand_names||[]).forEach(a=>addProductAlias(a,p.product_type_key)); }); const denomRulesByKey=new Map(); const denomRulesByProduct=new Map(); (rules.catalogue?.denomination_rules||[]).forEach(r=>{ denomRulesByKey.set(r.rule_key,r); if(r.product_type_key){ if(!denomRulesByProduct.has(r.product_type_key)) denomRulesByProduct.set(r.product_type_key,[]); denomRulesByProduct.get(r.product_type_key).push(r); } }); const combosByProduct=new Map(); (rules.catalogue?.valid_combinations||[]).forEach(c=>{ if(!combosByProduct.has(c.product_type_key)) combosByProduct.set(c.product_type_key,[]); combosByProduct.get(c.product_type_key).push(c); }); const allowedAliasMap=new Map(); const allowedAliasesByKey=new Map(); function addAllowedAlias(alias, productKey){ const key=normalize(alias); if(!key || !productKey) return; if(!allowedAliasMap.has(key)) allowedAliasMap.set(key,new Set()); allowedAliasMap.get(key).add(productKey); if(!allowedAliasesByKey.has(productKey)) allowedAliasesByKey.set(productKey,new Set()); allowedAliasesByKey.get(productKey).add(key); } const allowedAliasRows=(allowedAliasesInfo?.rows||[]); allowedAliasRows.forEach(r=>{ addAllowedAlias(r.alias,r.product_key); }); return {regionAliasMap,productAliasMap,productAliasesByKey,productsByKey,denomRulesByKey,denomRulesByProduct,combosByProduct,allowedAliasMap,allowedAliasesByKey,allowedAliasesStatus:allowedAliasesInfo?.status||"not_loaded",allowedAliasesError:allowedAliasesInfo?.error||null,allowedAliasesUrl:allowedAliasesInfo?.url||deriveAllowedAliasesUrl(),allowedAliasesCount:allowedAliasRows.length}; }
+  function detectRegionFromTextCatalogue(text, idx){ const n=normalize(text); const tokens=new Set(words(text)); const hits=[]; for(const [alias,keys] of idx.regionAliasMap.entries()){ if(!alias) continue; const isTwoLetterCode=alias.length===2 && /^[a-z]{2}$/.test(alias); if(isTwoLetterCode) continue; const isThreeLetterCode=alias.length===3 && /^[a-z]{3}$/.test(alias); const matched=isThreeLetterCode ? tokens.has(alias) : n.includes(alias); if(matched) [...keys].forEach(key=>hits.push({key,alias,score:isThreeLetterCode?alias.length+2:alias.length})); } hits.sort((a,b)=>b.score-a.score); return hits[0]||null; }
+  function resolveCurrentProductTypeKey(idx){ const currentText=(typeSelect.selectedOptions[0]?.textContent||"").trim(); const currentNorm=normalize(currentText); if(!currentNorm) return null; if(idx.productAliasMap.has(currentNorm)){ const exactKeys=[...idx.productAliasMap.get(currentNorm)]; if(exactKeys.length===1) return exactKeys[0]; } const currentTokens=smartTokens(currentText); const scored=[]; for(const p of idx.productsByKey.values()){ const aliases=[...(idx.productAliasesByKey.get(p.product_type_key)||new Set()), normalize(p.product_type_key), ...((p.brand_names||[]).map(normalize))].filter(Boolean); let score=0; aliases.forEach(an=>{ if(!an) return; if(currentNorm===an) score+=140; else if(currentNorm.includes(an)||an.includes(currentNorm)) score+=60; const aliasTokens=smartTokens(an); const matched=aliasTokens.filter(t=>currentTokens.includes(t)); score+=matched.length*18; if(aliasTokens.length && matched.length===aliasTokens.length) score+=25; }); if(score) scored.push({key:p.product_type_key,score}); } scored.sort((a,b)=>b.score-a.score); if(scored.length && (!scored[1] || scored[0].score>=scored[1].score+20)) return scored[0].key; return scored[0]?.key || null; }
+  function detectProductCandidates(text, idx){
+    const normalizedText=normalize(text);
+    const tokenSet=new Set(tokenize(text));
+    const scored=new Map();
+    for(const [alias,keys] of idx.productAliasMap.entries()){
+      if(!alias||alias.length<3) continue;
+      const matched=aliasBoundaryMatch(alias, normalizedText, tokenSet, {minLongLen:5, allowShort:true, shortMin:3, shortMax:4, shortBlocklist:SHORT_ALIAS_BLOCKLIST});
+      if(!matched) continue;
+      for(const key of keys){
+        const prev=scored.get(key)||{textScore:0,totalScore:0,matchedAliases:new Set()};
+        prev.textScore += alias.length;
+        prev.totalScore += alias.length;
+        prev.matchedAliases.add(alias);
+        scored.set(key, prev);
+      }
+    }
+    return [...scored.entries()]
+      .map(([key,data])=>({key,score:data.totalScore,textScore:data.textScore,matchedAliases:[...data.matchedAliases],product:idx.productsByKey.get(key)}))
+      .sort((a,b)=>b.score-a.score);
+  }
+  function detectAllowedAliasCandidates(text, idx){
+    const normalizedText=normalize(text);
+    const tokenSet=new Set(tokenize(text));
+    const scored=new Map();
+    for(const [alias,keys] of idx.allowedAliasMap.entries()){
+      if(!alias||alias.length<3) continue;
+      const matched=aliasBoundaryMatch(alias, normalizedText, tokenSet, {minLongLen:5, allowShort:true, shortMin:3, shortMax:4, shortBlocklist:SHORT_ALIAS_BLOCKLIST});
+      if(!matched) continue;
+      for(const key of keys){
+        const prev=scored.get(key)||{score:0,matchedAliases:new Set()};
+        prev.score += alias.length;
+        prev.matchedAliases.add(alias);
+        scored.set(key, prev);
+      }
+    }
+    return [...scored.entries()]
+      .map(([key,data])=>({key,score:data.score,matchedAliases:[...data.matchedAliases],product:idx.productsByKey.get(key)}))
+      .sort((a,b)=>b.score-a.score);
+  }
+  function normalizeDurationRule(rule){ if(!rule) return []; const values=rule.allowed_values||[]; const measurement=normalize(rule.measurement||""); const out=[]; values.forEach(v=>{ if(v===null||v===undefined||v==="") return; let raw=String(v).trim(); let parsed=detectDurationFromText(raw); if(!parsed && /^\d+$/.test(raw)){ if(measurement==="month"||measurement==="months") parsed={value:Number(raw),unit:"month",label:Number(raw)+" month"+(Number(raw)===1?"":"s")}; else if(measurement==="year"||measurement==="years") parsed={value:Number(raw),unit:"year",label:Number(raw)+" year"+(Number(raw)===1?"":"s")}; else if(measurement==="day"||measurement==="days") parsed={value:Number(raw),unit:"day",label:Number(raw)+" day"+(Number(raw)===1?"":"s")}; } if(parsed) out.push(parsed); }); return out; }
+  function parseCurrentRegionKey(idx){ const currentRaw=currentRegions().map(r=>r.name).join(" "); const hit=detectRegionFromTextCatalogue(currentRaw,idx); return hit?.key || null; }
+  function catalogueFallback(rules, idx){
+    const name=(nameInput.value||"").trim(), description=(descInput.value||"").trim();
+    const currentTypeText=(typeSelect.selectedOptions[0]?.textContent||"").trim();
+    const currentProductTypeKey=resolveCurrentProductTypeKey(idx);
+    const currentProductIsActive=!!(currentProductTypeKey&&idx.productsByKey.has(currentProductTypeKey));
+    const DIRECT_ALIAS_MIN_LENGTH = 5;
+    const SHORT_DIRECT_ALIAS_MIN = 3;
+    const SHORT_DIRECT_ALIAS_MAX = 4;
+    const currentRawShortAliases=uniq([
+      ...extractRawShortAliases(currentTypeText),
+      ...extractRawShortAliases(currentProductTypeKey),
+      ...(currentProductTypeKey?[...(idx.productAliasesByKey.get(currentProductTypeKey)||new Set())].filter(a=>!String(a||"").includes(" ") && String(a||"").length<=SHORT_DIRECT_ALIAS_MAX):[])
+    ].filter(Boolean));
+    const currentNormalizedShortAliases=uniq(currentRawShortAliases.map(a=>normalize(a)).filter(Boolean));
+    const currentAliases=uniq([
+      ...(currentProductTypeKey?[...(idx.productAliasesByKey.get(currentProductTypeKey)||new Set())]:[]),
+      normalize(currentTypeText),
+      ...currentNormalizedShortAliases
+    ].filter(Boolean));
+
+    const allCandidates=detectProductCandidates(name,idx);
+    const activeCandidates=allCandidates.filter(x=>idx.productsByKey.has(x.key));
+    const inactiveCandidates=allCandidates.filter(x=>!idx.productsByKey.has(x.key));
+
+    const NAME_EVIDENCE_MIN_SCORE = 8;
+    const GENERIC_WEAK_TOKENS = new Set(["premium","gift","card","digital","subscription","individual","family","month","months","year","years"]);
+    const strongActiveCandidates=activeCandidates.filter(x=>(x.textScore||0)>=NAME_EVIDENCE_MIN_SCORE);
+    const strongInactiveCandidates=inactiveCandidates.filter(x=>(x.textScore||0)>=NAME_EVIDENCE_MIN_SCORE);
+    const bestStrongActiveCandidate=strongActiveCandidates[0]||null;
+    const nameTokens=tokenize(name);
+    const hasOnlyGenericWeakTokens=nameTokens.length>0 && nameTokens.every(t=>GENERIC_WEAK_TOKENS.has(t));
+    const currentTypeScore=productScore(name,currentTypeText);
+    const currentShortAliasAllowSet=new Set(currentAliases.filter(a=>!a.includes(" ") && a.length>=SHORT_DIRECT_ALIAS_MIN && a.length<=SHORT_DIRECT_ALIAS_MAX && !SHORT_ALIAS_BLOCKLIST.has(a) && !GENERIC_WEAK_TOKENS.has(a) && /[a-z]/.test(a) && currentTypeScore>=30));
+    const currentDirectAliasMatches=collectAliasBoundaryMatches(currentAliases, name, {minLongLen:DIRECT_ALIAS_MIN_LENGTH, allowShort:true, shortMin:SHORT_DIRECT_ALIAS_MIN, shortMax:SHORT_DIRECT_ALIAS_MAX, shortBlocklist:new Set([...SHORT_ALIAS_BLOCKLIST, ...GENERIC_WEAK_TOKENS].filter(x=>!currentShortAliasAllowSet.has(x))) });
+    const currentHasDirectNameEvidence=currentDirectAliasMatches.length>0;
+    const allowedAliasCandidates=detectAllowedAliasCandidates(name, idx);
+    const bestAllowedAliasCandidate=allowedAliasCandidates[0]||null;
+    const currentAllowedAliasMatches=currentProductTypeKey?(allowedAliasCandidates.find(x=>x.key===currentProductTypeKey)?.matchedAliases||[]):[];
+    const currentHasAllowedAliasEvidence=currentAllowedAliasMatches.length>0;
+
+    const productDecision={
+      result:"manual review",
+      recommended_product_type_key:currentProductIsActive?currentProductTypeKey:null,
+      recommended_product_type_text:currentTypeText,
+      reason:"Name does not confirm current ProductType.",
+      log:[
+        "Product evidence source: Name only",
+        "Product evidence from Description: ignored by design",
+        "Current ProductType text: "+currentTypeText,
+        "Current mapped key: "+(currentProductTypeKey||"not mapped"),
+        "Current ProductType active in catalogue: "+(currentProductIsActive?"yes":"no"),
+        "Current direct alias matches in Name: "+(currentDirectAliasMatches.join(", ")||"none"),
+        "Allowed alias table status: "+String(idx.allowedAliasesStatus||"not_loaded"),
+        "Allowed alias table rows active: "+String(idx.allowedAliasesCount||0),
+        "Allowed alias table error: "+(idx.allowedAliasesError||"none"),
+        "Current allowed alias matches in Name: "+(currentAllowedAliasMatches.join(", ")||"none"),
+        "Allowed alias matched keys: "+(allowedAliasCandidates.map(x=>x.key+" ["+x.matchedAliases.join(", ")+"]").join(" | ")||"none"),
+        "Raw short aliases before filter: "+(currentRawShortAliases.join(", ")||"none"),
+        "Normalized short aliases after filter: "+(currentNormalizedShortAliases.join(", ")||"none"),
+        "Short direct alias allowlist: "+([...(currentShortAliasAllowSet||new Set())].join(", ")||"none"),
+        "Direct alias minimum length: "+String(DIRECT_ALIAS_MIN_LENGTH),
+        "Short direct alias length range: "+String(SHORT_DIRECT_ALIAS_MIN)+"-"+String(SHORT_DIRECT_ALIAS_MAX),
+        "Current ProductType score from Name: "+String(currentTypeScore),
+        "Minimum Name evidence score: "+String(NAME_EVIDENCE_MIN_SCORE),
+        "Name tokens: "+(nameTokens.join(", ")||"none"),
+        "Weak token set only: "+(hasOnlyGenericWeakTokens?"yes":"no"),
+        "Top active catalogue candidates: "+(activeCandidates.slice(0,3).map(x=>x.key+" ["+x.score+"]").join(" | ")||"none"),
+        "Top strong active candidates: "+(strongActiveCandidates.slice(0,3).map(x=>x.key+" ["+x.textScore+"]").join(" | ")||"none"),
+        "Top inactive-only candidates: "+(inactiveCandidates.slice(0,3).map(x=>x.key+" ["+x.score+"]").join(" | ")||"none"),
+        "Top strong inactive-only candidates: "+(strongInactiveCandidates.slice(0,3).map(x=>x.key+" ["+x.textScore+"]").join(" | ")||"none")
+      ]
+    };
+
+    if(currentProductIsActive && currentHasDirectNameEvidence){
+      productDecision.result="ok";
+      productDecision.recommended_product_type_key=currentProductTypeKey;
+      productDecision.reason="Current ProductType is confirmed by direct alias match in Name against active catalogue.";
+    } else if(currentProductIsActive && currentHasAllowedAliasEvidence){
+      productDecision.result="ok";
+      productDecision.recommended_product_type_key=currentProductTypeKey;
+      productDecision.reason="Current ProductType is confirmed by allowed alias match in Name.";
+    } else if(bestAllowedAliasCandidate && allowedAliasCandidates.length===1){
+      productDecision.recommended_product_type_key=bestAllowedAliasCandidate.key;
+      productDecision.recommended_product_type_text=bestAllowedAliasCandidate.product?.brand_names?.[0]||bestAllowedAliasCandidate.key;
+      if(currentProductIsActive && bestAllowedAliasCandidate.key===currentProductTypeKey){
+        productDecision.result="ok";
+        productDecision.reason="Current ProductType is confirmed by allowed alias match in Name.";
+      } else {
+        productDecision.result="change required";
+        productDecision.reason="Name confirms exactly one ProductType by allowed alias match and it differs from current selection.";
+      }
+    } else if(allowedAliasCandidates.length>1){
+      productDecision.result="manual review";
+      productDecision.recommended_product_type_key=allowedAliasCandidates[0]?.key||currentProductTypeKey||null;
+      productDecision.recommended_product_type_text=allowedAliasCandidates[0]?.product?.brand_names?.[0]||allowedAliasCandidates[0]?.key||currentTypeText;
+      productDecision.reason="Name matches multiple ProductTypes by allowed alias table; manual review required.";
+    } else if(bestStrongActiveCandidate && currentProductIsActive && bestStrongActiveCandidate.key===currentProductTypeKey){
+      productDecision.result="ok";
+      productDecision.recommended_product_type_key=currentProductTypeKey;
+      productDecision.reason="Current ProductType is confirmed by Name against active catalogue.";
+    } else if(strongActiveCandidates.length===1){
+      const onlyCandidate=strongActiveCandidates[0];
+      productDecision.recommended_product_type_key=onlyCandidate.key;
+      productDecision.recommended_product_type_text=onlyCandidate.product?.brand_names?.[0]||onlyCandidate.key;
+      if(currentProductIsActive && onlyCandidate.key===currentProductTypeKey){
+        productDecision.result="ok";
+        productDecision.reason="Current ProductType is confirmed by Name against active catalogue.";
+      } else {
+        productDecision.result="change required";
+        productDecision.reason="Name confirms exactly one active catalogue ProductType and it differs from current selection.";
+      }
+    } else if(currentProductIsActive && strongActiveCandidates.length===0){
+      productDecision.result="manual review";
+      productDecision.recommended_product_type_key=currentProductTypeKey;
+      productDecision.recommended_product_type_text=currentTypeText;
+      productDecision.reason="Current ProductType exists in active catalogue, but Name does not confirm it.";
+    } else if(strongActiveCandidates.length>1){
+      productDecision.result="manual review";
+      productDecision.recommended_product_type_key=strongActiveCandidates[0]?.key||null;
+      productDecision.recommended_product_type_text=strongActiveCandidates[0]?.product?.brand_names?.[0]||strongActiveCandidates[0]?.key||currentTypeText;
+      productDecision.reason="Name matches multiple active catalogue ProductTypes; manual review required.";
+    } else if(!currentProductIsActive && activeCandidates.length>0){
+      productDecision.result="manual review";
+      productDecision.recommended_product_type_key=activeCandidates[0]?.key||null;
+      productDecision.recommended_product_type_text=activeCandidates[0]?.product?.brand_names?.[0]||activeCandidates[0]?.key||currentTypeText;
+      productDecision.reason="Weak Name evidence found, but not enough to confirm ProductType.";
+    } else {
+      productDecision.result="manual review";
+      productDecision.reason="No strong active catalogue ProductType evidence found in Name.";
+    }
+
+    const legacyDenyTriggered = !currentProductIsActive && strongActiveCandidates.length===0 && inactiveCandidates.length>0 && (activeCandidates.length===0 || hasOnlyGenericWeakTokens || (activeCandidates[0]?.textScore||0) <= (inactiveCandidates[0]?.textScore||0));
+    if(legacyDenyTriggered){
+      productDecision.result="denied";
+      productDecision.recommended_product_type_key=null;
+      productDecision.recommended_product_type_text=currentTypeText||"not found";
+      productDecision.reason="Inactive / legacy product detected; weak active matches are ignored.";
+      productDecision.log.push("Legacy deny precedence: applied");
+      productDecision.log.push("Legacy deny reason: current ProductType is not active, no strong active Name evidence, and inactive-only evidence is present.");
+    } else {
+      productDecision.log.push("Legacy deny precedence: not applied");
+    }
+
+    let activeCatalogueResult="failed", activeCatalogueStatus="Denied", activeCatalogueText="Not found in active catalogue", activeCatalogueNote="Legacy / inactive product";
+    let activeMatchedKey=null;
+    if(productDecision.result==="ok" || productDecision.result==="change required"){
+      activeCatalogueResult="passed";
+      activeCatalogueStatus="Active";
+      activeMatchedKey=productDecision.recommended_product_type_key||bestStrongActiveCandidate?.key||null;
+      activeCatalogueText=productDecision.result==="ok"
+        ? "Active product confirmed by Name against active catalogue."
+        : "Name confirms an active catalogue product, but ProductType must be changed.";
+      activeCatalogueNote="";
+    } else if(!legacyDenyTriggered && (currentProductIsActive || activeCandidates.length>0)){
+      activeCatalogueResult="review";
+      activeCatalogueStatus="Unconfirmed";
+      activeMatchedKey=currentProductTypeKey||productDecision.recommended_product_type_key||activeCandidates[0]?.key||null;
+      if(currentProductIsActive && strongActiveCandidates.length===0 && !currentHasDirectNameEvidence){
+        activeCatalogueText="Current ProductType exists in active catalogue, but Name does not confirm active product identity.";
+      } else if(strongActiveCandidates.length>1){
+        activeCatalogueText="Name matches multiple active catalogue products; manual review required.";
+      } else if(activeCandidates.length>0){
+        activeCatalogueText="Only weak active catalogue evidence found in Name; manual review required.";
+      } else {
+        activeCatalogueText="Active catalogue match is not confirmed; manual review required.";
+      }
+      activeCatalogueNote="Manual review required";
+    }
+    const activeCatalogue={
+      result:activeCatalogueResult,
+      status:activeCatalogueStatus,
+      text:activeCatalogueText,
+      note:activeCatalogueNote,
+      active_product_key:activeMatchedKey||null,
+      log:[
+        "Active catalogue check: "+activeCatalogueResult,
+        "Current mapped key: "+(currentProductTypeKey||"not mapped"),
+        "Current ProductType active in catalogue: "+(currentProductIsActive?"yes":"no"),
+        "Active candidates from Name: "+(activeCandidates.map(x=>x.key).join(", ")||"none"),
+        "Allowed alias candidates from Name: "+(allowedAliasCandidates.map(x=>x.key).join(", ")||"none"),
+        "Strong active candidates from Name: "+(strongActiveCandidates.map(x=>x.key).join(", ")||"none"),
+        "Inactive-only candidates from Name: "+(inactiveCandidates.map(x=>x.key).join(", ")||"none"),
+        "Legacy deny precedence: "+(legacyDenyTriggered?"applied":"not applied"),
+        "Resolved active product key: "+(activeMatchedKey||"not found")
+      ]
+    };
+    const activeCatalogueFailed=activeCatalogue.result==="failed";
+
+    const regionFromName=detectRegionFromTextCatalogue(name,idx), regionFromDesc=detectRegionFromTextCatalogue(description,idx), currentRegionKey=parseCurrentRegionKey(idx);
+    let desiredRegionKey=null, regionSource="Not found", regionConflict=false;
+    if(regionFromName&&regionFromDesc){
+      if(regionFromName.key===regionFromDesc.key){ desiredRegionKey=regionFromName.key; regionSource="Name + Description"; }
+      else if(!isGenericCatalogueRegionKey(regionFromName.key) && isGenericCatalogueRegionKey(regionFromDesc.key)){ desiredRegionKey=regionFromName.key; regionSource="Name"; }
+      else if(isGenericCatalogueRegionKey(regionFromName.key) && !isGenericCatalogueRegionKey(regionFromDesc.key)){ desiredRegionKey=regionFromDesc.key; regionSource="Description"; }
+      else { regionConflict=true; regionSource="Conflict"; }
+    } else if(regionFromName){ desiredRegionKey=regionFromName.key; regionSource="Name"; }
+    else if(regionFromDesc){ desiredRegionKey=regionFromDesc.key; regionSource="Description"; }
+
+    const evidenceDuration=detectDurationFromText(name)||detectDurationFromText(description);
+    const evidenceModifiers=uniq([...detectModifiers(name),...detectModifiers(description)]);
+    const evidenceAmounts=extractCandidateAmounts(name);
+
+    if(activeCatalogueFailed){
+      const regionDecision={current_region_key:currentRegionKey,desired_region_key:null,source:regionSource,result:"skipped",reason:"skipped — inactive product",blocked_by_product:false,log:["Current mapped region key: "+(currentRegionKey||"not mapped"),"Region from Name: "+(regionFromName?.key||"not found"),"Region from Description: "+(regionFromDesc?.key||"not found"),"Region evidence source: "+regionSource,"Catalogue Region flow skipped because inactive product."]};
+      const denominationDecision={mode:evidenceDuration?"duration":"numeric",result:"skipped",reason:"skipped — inactive product",blocked_by_product:false,current_text:(denomSelect.selectedOptions[0]?.textContent||"none").trim(),recommended_text:null,log:["Current denomination: "+((denomSelect.selectedOptions[0]?.textContent||"none").trim()),"Detected duration: "+(evidenceDuration?evidenceDuration.label:"not found"),"Detected modifiers: "+(evidenceModifiers.join(", ")||"none"),"Detected numeric amounts: "+(evidenceAmounts.join(", ")||"none"),"Catalogue Denomination flow skipped because inactive product."]};
+      return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+    }
+
+    const productConfirmedForRules = productDecision.result==="ok" || productDecision.result==="change required";
+    const productKeyForRules = productConfirmedForRules ? productDecision.recommended_product_type_key : null;
+
+    if(!productKeyForRules){
+      const regionDecision={current_region_key:currentRegionKey,desired_region_key:null,source:regionSource,result:"manual review",reason:"Region check blocked until ProductType is confirmed by Name.",blocked_by_product:true,log:["Current mapped region key: "+(currentRegionKey||"not mapped"),"Region from Name: "+(regionFromName?.key||"not found"),"Region from Description: "+(regionFromDesc?.key||"not found"),"Region evidence source: "+regionSource,"Catalogue Region flow blocked because ProductType is not confirmed by Name."]};
+      const denominationDecision={mode:evidenceDuration?"duration":"numeric",result:"manual review",reason:"Denomination check blocked until ProductType is confirmed by Name.",blocked_by_product:true,current_text:(denomSelect.selectedOptions[0]?.textContent||"none").trim(),recommended_text:null,log:["Current denomination: "+((denomSelect.selectedOptions[0]?.textContent||"none").trim()),"Detected duration: "+(evidenceDuration?evidenceDuration.label:"not found"),"Detected modifiers: "+(evidenceModifiers.join(", ")||"none"),"Detected numeric amounts: "+(evidenceAmounts.join(", ")||"none"),"Catalogue Denomination flow blocked because ProductType is not confirmed by Name."]};
+      return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+    }
+
+    const activeProduct=productKeyForRules?idx.productsByKey.get(productKeyForRules):null;
+    const allowedRegions=activeProduct?.allowed_regions||[];
+    const tableAllowsRegion = key => !!(key && (allowedRegions.includes(key) || allowedRegions.includes("WW")));
+    const regionDecision={current_region_key:currentRegionKey,desired_region_key:desiredRegionKey,source:regionSource,result:"manual review",reason:"Region was not confirmed by catalogue table.",blocked_by_product:false,log:["Current mapped region key: "+(currentRegionKey||"not mapped"),"Region from Name: "+(regionFromName?.key||"not found"),"Region from Description: "+(regionFromDesc?.key||"not found"),"Region evidence source: "+regionSource,"Allowed regions from catalogue product: "+(allowedRegions.join(", ")||"none")]};
+    if(regionConflict){
+      regionDecision.reason="Name and Description point to different regions.";
+    } else if(currentRegionKey && !tableAllowsRegion(currentRegionKey) && allowedRegions.length){
+      regionDecision.result="change required";
+      regionDecision.reason="Region "+currentRegionKey+" is not present in the catalogue table for this product.";
+      regionDecision.desired_region_key=null;
+      regionDecision.source="Catalogue table";
+    } else if(desiredRegionKey && !tableAllowsRegion(desiredRegionKey) && allowedRegions.length){
+      regionDecision.result="change required";
+      regionDecision.reason="Detected region "+desiredRegionKey+" is not present in the catalogue table for this product.";
+      regionDecision.desired_region_key=null;
+      regionDecision.source="Catalogue table";
+    } else if(desiredRegionKey){
+      if(currentRegionKey===desiredRegionKey){
+        regionDecision.result="ok";
+        regionDecision.reason="Current region matches detected region and is present in the catalogue table.";
+      } else {
+        regionDecision.result="change required";
+        regionDecision.reason="Current region "+currentRegionKey+" differs from detected region "+desiredRegionKey+" found in "+regionSource+".";
+      }
+    } else if(currentRegionKey && allowedRegions.length){
+      if(tableAllowsRegion(currentRegionKey)){
+        regionDecision.result="ok";
+        regionDecision.reason="Current region is allowed by catalogue table for this product.";
+        regionDecision.desired_region_key=currentRegionKey;
+        regionDecision.source="Catalogue table";
+      } else if(allowedRegions.length===1){
+        regionDecision.result="change required";
+        regionDecision.reason="Current region is not allowed by catalogue table for this product; only "+allowedRegions[0]+" is allowed.";
+        regionDecision.desired_region_key=allowedRegions[0];
+        regionDecision.source="Catalogue table";
+      } else {
+        regionDecision.result="change required";
+        regionDecision.reason="Current region is not allowed by catalogue table for this product.";
+        regionDecision.source="Catalogue table";
+      }
+    } else if(allowedRegions.length===1 && currentRegionKey===allowedRegions[0]){
+      regionDecision.result="ok";
+      regionDecision.reason="Catalogue table allows exactly one region and current region matches it.";
+      regionDecision.desired_region_key=allowedRegions[0];
+      regionDecision.source="Catalogue table";
+    }
+
+    if(regionDecision.result==="change required" || regionDecision.result==="manual review"){
+      const denominationDecision={mode:evidenceDuration?"duration":"numeric",result:regionDecision.result==="change required"?"change required":"manual review",reason:"Denomination check blocked until Region is resolved.",blocked_by_product:false,blocked_by_region:true,current_text:(denomSelect.selectedOptions[0]?.textContent||"none").trim(),recommended_text:null,log:["Current denomination: "+((denomSelect.selectedOptions[0]?.textContent||"none").trim()),"Detected duration: "+(evidenceDuration?evidenceDuration.label:"not found"),"Detected modifiers: "+(evidenceModifiers.join(", ")||"none"),"Detected numeric amounts: "+(evidenceAmounts.join(", ")||"none"),"Catalogue Denomination flow blocked because Region is unresolved.","Region status: "+regionDecision.result,"Region reason: "+regionDecision.reason]};
+      return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+    }
+
+
+    const combos=productKeyForRules?(idx.combosByProduct.get(productKeyForRules)||[]):[];
+    const comboRules=combos.filter(c=>{
+      if(regionDecision.desired_region_key) return c.region_key===regionDecision.desired_region_key;
+      if(currentRegionKey) return c.region_key===currentRegionKey;
+      return true;
+    }).map(c=>idx.denomRulesByKey.get(c.denomination_rule_key)).filter(Boolean);
+    const directRules=(productKeyForRules?(idx.denomRulesByProduct.get(productKeyForRules)||[]):[]).filter(rule=>{
+      if(regionDecision.desired_region_key) return rule.region_key===regionDecision.desired_region_key || rule.region_key==="WW";
+      if(currentRegionKey) return rule.region_key===currentRegionKey || rule.region_key==="WW";
+      return true;
+    });
+    const matchedComboRules=uniq([...comboRules,...directRules]);
+    const currentText=(denomSelect.selectedOptions[0]?.textContent||"none").trim();
+    const currentParsed=parseDenomOptionText(currentText);
+    const evidenceMode=evidenceDuration?"duration":"numeric";
+    const baseLog=[
+      "Evidence mode: "+evidenceMode,
+      "Current denomination: "+currentText,
+      "Parsed current ruleKey: "+(currentParsed?.ruleKey||"not found"),
+      "Parsed current amount: "+(currentParsed&&currentParsed.amount!==null?String(currentParsed.amount):"not found"),
+      "Parsed current duration: "+(currentParsed?.duration?.label||"not found"),
+      "Detected duration: "+(evidenceDuration?evidenceDuration.label:"not found"),
+      "Detected modifiers: "+(evidenceModifiers.join(", ")||"none"),
+      "Detected numeric amounts: "+(evidenceAmounts.join(", ")||"none"),
+      "Candidate denomination rules: "+(matchedComboRules.map(r=>r.rule_key).slice(0,12).join(", ")||"none"),
+      "Matched candidate rules count: "+String(matchedComboRules.length),
+      "Product key used for denomination rules: "+(productKeyForRules||"not resolved")
+    ];
+    const denominationDecision={
+      mode:evidenceMode,
+      result:"manual review",
+      reason:"Требуется ручная проверка denomination.",
+      blocked_by_product:false,
+      blocked_by_region:false,
+      current_text:currentText,
+      recommended_text:"manual review",
+      recommended_rule_key:null,
+      target_value:null,
+      target_text:null,
+      target_rule_key:null,
+      classification:"ambiguous target / manual review",
+      current_rule_key:currentParsed?.ruleKey||null,
+      current_amount:currentParsed&&currentParsed.amount!==null?currentParsed.amount:null,
+      current_duration:currentParsed?.duration||null,
+      evidence_amount:evidenceAmounts.length?evidenceAmounts[0]:null,
+      evidence_duration:evidenceDuration||null,
+      candidate_rules_count:matchedComboRules.length,
+      exact_current_match:false,
+      deterministic_target_found:false,
+      log:baseLog.slice()
+    };
+
+    if(!matchedComboRules.length){
+      denominationDecision.result="manual review";
+      denominationDecision.reason="Требуется ручная проверка denomination: для этой связки ProductType и Region не найдено правил.";
+      denominationDecision.classification="table/rules mismatch";
+      denominationDecision.recommended_text="manual review";
+      denominationDecision.log.push("Exact current match: no","Deterministic target found: no","Reason category: table/rules mismatch");
+      return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+    }
+
+    if(evidenceDuration){
+      const exactRuleMatchesRaw=matchedComboRules.map(rule=>{
+        const ruleDurations=normalizeDurationRule(rule);
+        const exactDuration=ruleDurations.find(d=>sameDuration(d,evidenceDuration))||null;
+        return {
+          rule,
+          ruleDurations,
+          exactDuration,
+          hasExactDuration:!!exactDuration,
+          modifierStrict: evidenceModifiers.every(m=>(rule.modifiers||[]).includes(m))
+        };
+      }).filter(x=>x.hasExactDuration);
+
+      denominationDecision.log.push("Exact duration rule matches: "+(exactRuleMatchesRaw.map(x=>x.rule.rule_key).join(", ")||"none"));
+
+      if(!exactRuleMatchesRaw.length){
+        denominationDecision.result="error";
+        denominationDecision.reason="Срок "+evidenceDuration.label+" отсутствует в таблице для данного товара и региона.";
+        denominationDecision.classification="correct fail because amount/duration really absent in table";
+        denominationDecision.recommended_text="not found";
+        denominationDecision.log.push("Exact current match: no","Deterministic target found: no","Reason category: correct fail because amount/duration really absent in table");
+        return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+      }
+
+      const exactRuleMatches=filterRulesByAllEvidenceModifiers(exactRuleMatchesRaw, evidenceModifiers);
+      denominationDecision.log.push("Duration candidates after modifier filter: "+(exactRuleMatches.map(x=>x.rule.rule_key).join(", ")||"none"));
+
+      const currentExactMatches=exactRuleMatches.filter(x=>currentDenomMatchesDurationRule(currentParsed, x.rule.rule_key, evidenceDuration));
+      denominationDecision.exact_current_match=currentExactMatches.length===1;
+      denominationDecision.log.push("Exact current match: "+(denominationDecision.exact_current_match?"yes":"no"));
+
+      if(denominationDecision.exact_current_match && exactRuleMatches.length===1){
+        denominationDecision.result="ok";
+        denominationDecision.reason="Текущая denomination подтверждена по точному duration-правилу из таблицы.";
+        denominationDecision.classification="exact current match";
+        denominationDecision.recommended_rule_key=currentExactMatches[0].rule.rule_key;
+        denominationDecision.recommended_text=currentText;
+        denominationDecision.log.push("Deterministic target found: no","Reason category: exact current match");
+        return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+      }
+
+      if(exactRuleMatches.length===1){
+        const targetRule=exactRuleMatches[0].rule;
+        const targetOption=findDeterministicDropdownTarget(targetRule.rule_key, "duration", {duration:evidenceDuration});
+        denominationDecision.recommended_rule_key=targetRule.rule_key;
+        denominationDecision.target_rule_key=targetRule.rule_key;
+        if(currentDenomMatchesDurationRule(currentParsed, targetRule.rule_key, evidenceDuration)){
+          denominationDecision.result="ok";
+          denominationDecision.reason="Текущая denomination подтверждена по точному duration-правилу из таблицы.";
+          denominationDecision.classification="exact current match";
+          denominationDecision.recommended_text=currentText;
+          denominationDecision.exact_current_match=true;
+          denominationDecision.log.push("Deterministic target found: no","Reason category: exact current match");
+        } else if(targetOption){
+          denominationDecision.result="change required";
+          denominationDecision.reason="В таблице найден единственный точный вариант denomination. Нужно изменить denomination.";
+          denominationDecision.classification="binding / precedence issue";
+          denominationDecision.recommended_text=targetOption.text;
+          denominationDecision.target_value=targetOption.value;
+          denominationDecision.target_text=targetOption.text;
+          denominationDecision.deterministic_target_found=true;
+          denominationDecision.log.push("Deterministic target found: yes","Target ruleKey: "+targetRule.rule_key,"Target option: "+targetOption.text,"Reason category: binding / precedence issue");
+        } else {
+          denominationDecision.result="manual review";
+          denominationDecision.reason="В таблице найден точный duration-вариант, но не удалось однозначно сопоставить его с dropdown denomination.";
+          denominationDecision.classification="table/rules mismatch";
+          denominationDecision.recommended_text="manual review";
+          denominationDecision.log.push("Deterministic target found: no","Target ruleKey: "+targetRule.rule_key,"Reason category: table/rules mismatch");
+        }
+        return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+      }
+
+      denominationDecision.result="manual review";
+      denominationDecision.reason="Найдено несколько точных duration-вариантов denomination. Требуется ручная проверка.";
+      denominationDecision.classification="ambiguous target / manual review";
+      denominationDecision.recommended_text="manual review";
+      denominationDecision.log.push("Deterministic target found: no","Reason category: ambiguous target / manual review");
+      return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+    }
+
+    if(!evidenceAmounts.length){
+      denominationDecision.result="manual review";
+      denominationDecision.reason="Не удалось извлечь точную сумму denomination из названия или описания.";
+      denominationDecision.classification="parsing issue";
+      denominationDecision.recommended_text="manual review";
+      denominationDecision.log.push("Exact current match: no","Deterministic target found: no","Reason category: parsing issue");
+      return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+    }
+
+    const evidenceAmount=evidenceAmounts[0];
+    denominationDecision.evidence_amount=evidenceAmount;
+
+    const exactNumericRuleMatchesRaw=matchedComboRules.map(rule=>{
+      const numericValues=(rule.allowed_values||[]).filter(v=>typeof v==="number");
+      return {
+        rule,
+        numericValues,
+        hasExactAmount:numericValues.some(v=>Number(v)===Number(evidenceAmount)),
+        measurementMatch:ruleMeasurementHit(rule, measurementEvidence(name+" "+description+" "+currentText)),
+        modifierStrict:evidenceModifiers.every(m=>(rule.modifiers||[]).includes(m))
+      };
+    }).filter(x=>x.hasExactAmount);
+
+    denominationDecision.log.push("Exact numeric rule matches: "+(exactNumericRuleMatchesRaw.map(x=>x.rule.rule_key).join(", ")||"none"));
+
+    if(!exactNumericRuleMatchesRaw.length){
+      denominationDecision.result="error";
+      denominationDecision.reason="Суммы "+evidenceAmount+" нет в таблице для данного товара и региона.";
+      denominationDecision.classification="correct fail because amount/duration really absent in table";
+      denominationDecision.recommended_text="not found";
+      denominationDecision.log.push("Exact current match: no","Deterministic target found: no","Reason category: correct fail because amount/duration really absent in table");
+      return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+    }
+
+    let exactNumericRuleMatches=filterRulesByAllEvidenceModifiers(exactNumericRuleMatchesRaw, evidenceModifiers);
+    const strictMeasurement=exactNumericRuleMatches.filter(x=>x.measurementMatch);
+    if(strictMeasurement.length){
+      exactNumericRuleMatches=strictMeasurement;
+    }
+    denominationDecision.log.push("Numeric candidates after filters: "+(exactNumericRuleMatches.map(x=>x.rule.rule_key).join(", ")||"none"));
+
+    const currentExactMatches=exactNumericRuleMatches.filter(x=>currentDenomMatchesNumericRule(currentParsed, x.rule.rule_key, evidenceAmount));
+    denominationDecision.exact_current_match=currentExactMatches.length===1;
+    denominationDecision.log.push("Exact current match: "+(denominationDecision.exact_current_match?"yes":"no"));
+
+    if(denominationDecision.exact_current_match && exactNumericRuleMatches.length===1){
+      denominationDecision.result="ok";
+      denominationDecision.reason="Текущая denomination подтверждена по точному numeric-правилу из таблицы.";
+      denominationDecision.classification="exact current match";
+      denominationDecision.recommended_rule_key=currentExactMatches[0].rule.rule_key;
+      denominationDecision.recommended_text=currentText;
+      denominationDecision.log.push("Deterministic target found: no","Reason category: exact current match");
+      return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+    }
+
+    if(exactNumericRuleMatches.length===1){
+      const targetRule=exactNumericRuleMatches[0].rule;
+      const targetOption=findDeterministicDropdownTarget(targetRule.rule_key, "numeric", {amount:evidenceAmount});
+      denominationDecision.recommended_rule_key=targetRule.rule_key;
+      denominationDecision.target_rule_key=targetRule.rule_key;
+      if(currentDenomMatchesNumericRule(currentParsed, targetRule.rule_key, evidenceAmount)){
+        denominationDecision.result="ok";
+        denominationDecision.reason="Текущая denomination подтверждена по точному numeric-правилу из таблицы.";
+        denominationDecision.classification="exact current match";
+        denominationDecision.recommended_text=currentText;
+        denominationDecision.exact_current_match=true;
+        denominationDecision.log.push("Deterministic target found: no","Reason category: exact current match");
+      } else if(targetOption){
+        denominationDecision.result="change required";
+        denominationDecision.reason="В таблице найден единственный точный вариант denomination. Нужно изменить denomination.";
+        denominationDecision.classification="binding / precedence issue";
+        denominationDecision.recommended_text=targetOption.text;
+        denominationDecision.target_value=targetOption.value;
+        denominationDecision.target_text=targetOption.text;
+        denominationDecision.deterministic_target_found=true;
+        denominationDecision.log.push("Deterministic target found: yes","Target ruleKey: "+targetRule.rule_key,"Target option: "+targetOption.text,"Reason category: binding / precedence issue");
+      } else {
+        denominationDecision.result="manual review";
+        denominationDecision.reason="В таблице найден точный numeric-вариант, но не удалось однозначно сопоставить его с dropdown denomination.";
+        denominationDecision.classification="table/rules mismatch";
+        denominationDecision.recommended_text="manual review";
+        denominationDecision.log.push("Deterministic target found: no","Target ruleKey: "+targetRule.rule_key,"Reason category: table/rules mismatch");
+      }
+      return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+    }
+
+    denominationDecision.result="manual review";
+    denominationDecision.reason="Найдено несколько точных numeric-вариантов denomination. Требуется ручная проверка.";
+    denominationDecision.classification="ambiguous target / manual review";
+    denominationDecision.recommended_text="manual review";
+    denominationDecision.log.push("Deterministic target found: no","Reason category: ambiguous target / manual review");
+    return {productDecision,activeCatalogue,regionDecision,denominationDecision,meta:{rules_version:rules?.meta?.catalogue_version||"unknown",generated_at:rules?.meta?.generated_at||null}};
+  }
+
+
+
+  function combineDecision(heur, cat, mr){
+    const out={heuristic:heur,catalogue:cat,manualReviewWords:mr};
+    out.final={};
+    out.final.activeCatalogue = cat && cat.activeCatalogue ? {result:cat.activeCatalogue.result,status:cat.activeCatalogue.status,text:cat.activeCatalogue.text,note:cat.activeCatalogue.note||"",key:cat.activeCatalogue.active_product_key||null} : {result:"unknown",status:"Unknown",text:"Catalogue status unavailable.",note:"",key:null};
+    const mrMatches=mr&&Array.isArray(mr.matches)?mr.matches:[];
+    const mrAreas=Array.from(new Set(mrMatches.flatMap(x=>Array.isArray(x.matched_in)?x.matched_in:[])));
+    const mrText=mrMatches.length?('Найдено стоп-слово: '+mrMatches.map(x=>x.pattern).join(', ')+'. Требуется ручная проверка саппортом.'+(mrAreas.length?' Поля: '+mrAreas.join(', ')+'.':'')):(mr&&mr.status==="failed"?('Сервис стоп-слов недоступен: '+String(mr.error||'unknown error')):'Стоп-слова не найдены.');
+    out.final.manualReviewWords = mrMatches.length
+      ? {result:"manual review",text:mrText,recommended:"manual review",source:"manual_review_words",matches:mrMatches}
+      : (mr&&mr.status==="failed"
+          ? {result:"skipped",text:mrText,recommended:"not available",source:"manual_review_words",matches:[]}
+          : {result:"ok",text:mrText,recommended:"not found",source:"manual_review_words",matches:[]});
+
+    if(cat && cat.error){
+      out.final.product = {result:"skipped", text:"ProductType check skipped due to catalogue error.", recommended:"not available", source:"catalogue"};
+      out.final.region = {result:"skipped",text:"Region check skipped due to catalogue error.",recommended:"not available",source:"catalogue"};
+      out.final.denomination = {result:"skipped",text:"Denomination check skipped due to catalogue error.",recommended:"not available",source:"catalogue",mode:heur.denom.mode,target_value:null,target_text:null,target_rule_key:null,classification:"table/rules mismatch",exact_current_match:false,deterministic_target_found:false};
+      return out;
+    }
+
+    if(cat && cat.activeCatalogue && cat.activeCatalogue.result==="failed"){
+      out.final.product = {result:"denied", text:"Denied — Not found in active catalogue", recommended:heur.currentTypeText||cat.productDecision?.recommended_product_type_text||"not found", source:"catalogue"};
+      out.final.region = {result:"skipped", text:(cat.regionDecision&&cat.regionDecision.reason)||"skipped — inactive product", recommended:"not applicable", source:"catalogue",blocked_by_product:!!(cat.regionDecision&&cat.regionDecision.blocked_by_product),blocked_by_region:!!(cat.regionDecision&&cat.regionDecision.blocked_by_region)};
+      out.final.denomination = {
+        result:"skipped",
+        text:(cat.denominationDecision&&cat.denominationDecision.reason)||"skipped — inactive product",
+        recommended:"not applicable",
+        source:"catalogue",
+        mode:(cat.denominationDecision&&cat.denominationDecision.mode)||heur.denom.mode,
+        target_value:cat?.denominationDecision?.target_value||null,
+        target_text:cat?.denominationDecision?.target_text||null,
+        target_rule_key:cat?.denominationDecision?.target_rule_key||null,
+        classification:cat?.denominationDecision?.classification||"table/rules mismatch",
+        exact_current_match:!!cat?.denominationDecision?.exact_current_match,
+        deterministic_target_found:!!cat?.denominationDecision?.deterministic_target_found,
+        blocked_by_product:!!cat?.denominationDecision?.blocked_by_product,
+        blocked_by_region:!!cat?.denominationDecision?.blocked_by_region
+      };
+      return out;
+    }
+
+    const productAction = cat ? cat.productDecision : null;
+    if(productAction){
+      out.final.product = {result:productAction.result, text:productAction.reason, recommended:productAction.recommended_product_type_text||heur.product.best?.text||heur.currentTypeText, source:"catalogue"};
+    } else {
+      out.final.product = {result: heur.typeMismatch ? (heur.productConfident?"change required":"manual review") : "ok", text: heur.typeMismatch ? (heur.productConfident?"change required":"manual review") : "ok", recommended: heur.product.best?heur.product.best.text:heur.currentTypeText, source:"heuristic"};
+    }
+
+    const productConfirmedInCatalogue = !!(cat && cat.productDecision && (cat.productDecision.result==="ok" || cat.productDecision.result==="change required"));
+    const regionNeedFallback = !!(cat && cat.regionDecision && (productConfirmedInCatalogue || heur.regionDecision.tone !== "ok" || cat.regionDecision?.blocked_by_product));
+    if(regionNeedFallback){
+      out.final.region = {result:cat.regionDecision.result,text:cat.regionDecision.reason,recommended:cat.regionDecision.desired_region_key||"not found",source:"catalogue",blocked_by_product:!!cat.regionDecision.blocked_by_product,blocked_by_region:!!cat.regionDecision.blocked_by_region};
+    } else {
+      out.final.region = {result:heur.regionDecision.tone==="ok"?"ok":heur.regionDecision.tone==="err"?"change required":"manual review",text:heur.regionDecision.text,recommended:heur.desiredRegion?heur.desiredRegion.key:"not found",source:"heuristic",blocked_by_product:false,blocked_by_region:false};
+    }
+
+    const denomNeedFallback = !!(cat && cat.denominationDecision && (productConfirmedInCatalogue || heur.denomMismatch || heur.denomMissing || !heur.denom.best || cat.denominationDecision?.blocked_by_product || cat.denominationDecision?.blocked_by_region));
+    if(denomNeedFallback){
+      out.final.denomination = {
+        result:cat.denominationDecision.result,
+        text:cat.denominationDecision.reason,
+        recommended:cat.denominationDecision.recommended_text||"not found",
+        source:"catalogue",
+        mode:cat.denominationDecision.mode,
+        target_value:cat.denominationDecision.target_value||null,
+        target_text:cat.denominationDecision.target_text||null,
+        target_rule_key:cat.denominationDecision.target_rule_key||null,
+        recommended_rule_key:cat.denominationDecision.recommended_rule_key||null,
+        classification:cat.denominationDecision.classification||"ambiguous target / manual review",
+        exact_current_match:!!cat.denominationDecision.exact_current_match,
+        deterministic_target_found:!!cat.denominationDecision.deterministic_target_found,
+        current_rule_key:cat.denominationDecision.current_rule_key||null,
+        current_amount:cat.denominationDecision.current_amount??null,
+        current_duration:cat.denominationDecision.current_duration||null,
+        evidence_amount:cat.denominationDecision.evidence_amount??null,
+        evidence_duration:cat.denominationDecision.evidence_duration||null,
+        candidate_rules_count:cat.denominationDecision.candidate_rules_count||0,
+        blocked_by_product:!!cat.denominationDecision.blocked_by_product,
+        blocked_by_region:!!cat.denominationDecision.blocked_by_region
+      };
+    } else {
+      out.final.denomination = {
+        result:heur.denomMissing?"error":heur.denomMismatch?"change required":heur.denom.best?"ok":"manual review",
+        text:heur.denomMissing?"not found in dropdown":heur.denomMismatch?"change required":heur.denom.best?"ok":"manual review",
+        recommended:heur.denom.best?heur.denom.best.text:"not found",
+        source:"heuristic",
+        mode:heur.denom.mode,
+        target_value:null,
+        target_text:null,
+        target_rule_key:null,
+        recommended_rule_key:null,
+        classification:heur.denomMissing?"parsing issue":"ambiguous target / manual review",
+        exact_current_match:!!heur.denom.currentExactMatch,
+        deterministic_target_found:false,
+        current_rule_key:heur.denom.currentParsed?.ruleKey||null,
+        current_amount:heur.denom.currentParsed?.amount??null,
+        current_duration:heur.denom.currentParsed?.duration||null,
+        evidence_amount:heur.denom.amount??null,
+        evidence_duration:heur.denom.evidenceDuration||null,
+        candidate_rules_count:(heur.denom.top||[]).length,
+        blocked_by_product:false,
+        blocked_by_region:false
+      };
+    }
+    return out;
+  }
+
+  async function analyzeIntegrated(){ const heuristic=loadHeuristic(); let catalogue=null; const manualReviewWordsService=await loadManualReviewWords(); const manualReviewWords=detectManualReviewWords(heuristic.name, heuristic.description, manualReviewWordsService); try{ const rules=await loadRules(); const allowedAliasesInfo=await loadAllowedAliases(); const idx=buildIndexes(rules, allowedAliasesInfo); catalogue=catalogueFallback(rules,idx); } catch(e){ const msg=e && e.message ? e.message : String(e); catalogue={error:msg,activeCatalogue:{result:"error",status:"Error",text:"Catalogue processing error: "+msg,note:"Runtime error inside catalogue layer.",active_product_key:null},productDecision:null,regionDecision:null,denominationDecision:null}; } return combineDecision(heuristic,catalogue,manualReviewWords); }
+
+  function renderIntegrated(r){ clearMarks(); mark(nameInput,"#93c5fd","#eff6ff"); if(r.heuristic.regionSource==="Description"||r.heuristic.regionConflict) mark(descInput,r.heuristic.regionConflict?"#fbbf24":"#93c5fd",r.heuristic.regionConflict?"#fffbeb":"#eff6ff"); const mTone=uiToneForDecision(r.final.manualReviewWords); const pTone=uiToneForDecision(r.final.product); const rTone=uiToneForDecision(r.final.region); const dTone=uiToneForDecision(r.final.denomination); const aTone=r.final.activeCatalogue.result==="passed"?"ok":"err"; const toneMark={ok:["#22c55e","#f0fdf4"],err:["#ef4444","#fef2f2"],warn:["#facc15","#fffbeb"],blocked:["#9ca3af","#f3f4f6"]}; if(r.final.manualReviewWords && r.final.manualReviewWords.result==="manual review"){ const areas=Array.from(new Set((r.final.manualReviewWords.matches||[]).flatMap(x=>Array.isArray(x.matched_in)?x.matched_in:[]))); if(areas.includes("name")) mark(nameInput,"#facc15","#fffbeb"); if(areas.includes("description")) mark(descInput,"#facc15","#fffbeb"); } mark(typeSelect,...(toneMark[pTone]||toneMark.warn)); mark(regionContainer,...(toneMark[rTone]||toneMark.warn)); mark(denomSelect,...(toneMark[dTone]||toneMark.warn));
+    const overall=uiOverallStatus(r);
+    const summaryBody = uiField("Название", r.heuristic.name || "—") + uiField("Итоговый статус", overall.text, {tone:overall.tone}) + uiField("Главная причина", uiMainReason(r), {tone:overall.tone}) + uiField("Необходимо", uiRequiredAction(r), {tone:overall.tone});
+    const manualReviewBody = uiBadge(uiBadgeTextForDecision(r.final.manualReviewWords), mTone) + uiField("Статус", r.final.manualReviewWords.text, {tone:mTone}) + uiField("Источник", r.final.manualReviewWords.source || "manual_review_words") + uiField("Совпадения", (r.final.manualReviewWords.matches||[]).map(x=>x.pattern+((x.matched_in&&x.matched_in.length)?" ["+x.matched_in.join(", ")+"]":"")).join(" | ") || "не найдено");
+    const productBody = uiBadge(uiBadgeTextForDecision(r.final.product), pTone) + uiField("Текущий", r.heuristic.currentTypeText || "—") + uiField("Рекомендованный", r.final.product.recommended || "not found") + uiField("Действие", r.final.product.text, {tone:pTone}) + uiField("Источник", r.final.product.source || "catalogue");
+    const regionBody = uiBadge(uiBadgeTextForDecision(r.final.region), rTone) + uiField("Текущий", r.heuristic.currentRegions.map(x=>x.name).join(", ") || "—") + uiField("Рекомендованный", r.final.region.recommended || "not found") + uiField("Действие", r.final.region.text, {tone:rTone}) + uiField("Источник", r.final.region.source || "catalogue");
+    const denomBody = uiBadge(uiBadgeTextForDecision(r.final.denomination), dTone) + uiField("Текущий", r.heuristic.denom.currentOpt ? r.heuristic.denom.currentOpt.text : "none") + uiField("Режим", r.final.denomination.mode || r.heuristic.denom.mode) + uiField("Рекомендованный", r.final.denomination.recommended || "not found") + uiField("Действие", r.final.denomination.text, {tone:dTone}) + uiField("Источник", r.final.denomination.source || "catalogue");
+    let diagnostics = "";
+    diagnostics += uiDetailsBlock("Manual Review Words", (r.manualReviewWords&&r.manualReviewWords.log)||["Manual Review Words: no data"]);
+    diagnostics += uiDetailsBlock("Эвристика ProductType", r.heuristic.log.product);
+    diagnostics += uiDetailsBlock("Эвристика Region", r.heuristic.log.region);
+    diagnostics += uiDetailsBlock("Эвристика Denomination", r.heuristic.log.denomination);
+    if(r.catalogue && !r.catalogue.error){
+      diagnostics += uiDetailsBlock("Активный каталог", r.catalogue.activeCatalogue.log.concat(["Decision: "+r.catalogue.activeCatalogue.text+(r.catalogue.activeCatalogue.note?" / "+r.catalogue.activeCatalogue.note:"")]));
+      diagnostics += uiDetailsBlock("Catalogue ProductType", r.catalogue.productDecision.log.concat(["Decision: "+r.catalogue.productDecision.reason]));
+      diagnostics += uiDetailsBlock("Catalogue Region", r.catalogue.regionDecision.log.concat(["Decision: "+r.catalogue.regionDecision.reason]));
+      diagnostics += uiDetailsBlock("Catalogue Denomination", r.catalogue.denominationDecision.log.concat(["Decision: "+r.catalogue.denominationDecision.reason]));
+      diagnostics += uiField("Версия catalogue rules", r.catalogue.meta.rules_version || "unknown");
+    } else if(r.catalogue && r.catalogue.error){
+      diagnostics += uiField("Catalogue fallback", "Unavailable: "+r.catalogue.error, {tone:"warn"});
+    }
+    let html = "";
+    html += uiSection("1. Итоговый результат", summaryBody, {tone:overall.tone});
+    html += uiSection("2. Manual Review Words", manualReviewBody, {tone:mTone});
+    html += uiSection("3. ProductType", productBody, {tone:pTone});
+    html += '<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;align-items:start;">' + uiSection("4. Регион", regionBody, {tone:rTone}) + uiSection("5. Denomination", denomBody, {tone:dTone}) + '</div>';
+    html += uiSection("6. Диагностика", diagnostics, {tone:"info"});
+    status.innerHTML=html; state.lastAnalysis=r; if(window[NS]) window[NS].lastAnalysis=r; applyReadabilityEnhancements(r);
+  }
+
+
+  function normalizeProductTypeOptionText(s){
+    return normalize(String(s||"").replace(/\(deleted\)/ig,"").trim());
+  }
+
+  function resolveProductTypeOptionFromRecommendedText(targetText){
+    const targetNorm=normalizeProductTypeOptionText(targetText);
+    if(!targetNorm || targetNorm==="not found" || targetNorm==="not available") return null;
+    const options=[...typeSelect.options]
+      .filter(o=>o.value && !/\(deleted\)/i.test(o.textContent||""))
+      .map(o=>({value:o.value,text:(o.textContent||"").trim(),norm:normalizeProductTypeOptionText(o.textContent||"")}));
+    const exact=options.filter(o=>o.norm===targetNorm);
+    if(exact.length===1) return exact[0];
+    const contains=options.filter(o=>o.norm.includes(targetNorm) || targetNorm.includes(o.norm));
+    if(contains.length===1) return contains[0];
+    return null;
+  }
+
+  function getFinalProductTypeTarget(r){
+    if(!r || !r.final || !r.final.product) return null;
+    const p=r.final.product;
+    if(p.result!=="change required") return null;
+
+    if(r.heuristic && r.heuristic.product && r.heuristic.product.best){
+      const hb=r.heuristic.product.best;
+      const hbText=String(hb.text||"").trim();
+      if(hb.value && hbText){
+        if(p.source==="heuristic") return {value:hb.value,text:hbText,source:"heuristic"};
+        if(normalize(hbText)===normalize(p.recommended||"")) return {value:hb.value,text:hbText,source:"heuristic-match"};
+      }
+    }
+
+    const mapped=resolveProductTypeOptionFromRecommendedText(p.recommended||"");
+    if(mapped) return {value:mapped.value,text:mapped.text,source:"catalogue-text"};
+    return null;
+  }
+
+  function getFinalDenominationTarget(r){
+    if(!r || !r.final || !r.final.denomination) return null;
+    const d=r.final.denomination;
+    if(d.source!=="catalogue") return null;
+    if(d.result!=="change required") return null;
+    if(!d.deterministic_target_found) return null;
+    if(!d.target_value || !d.target_text) return null;
+    return {value:d.target_value,text:d.target_text,ruleKey:d.target_rule_key||null};
+  }
+
+  async function applyIntegrated(){
+    const r = state.lastAnalysis || await analyzeIntegrated();
+    if(!state.lastAnalysis) renderIntegrated(r);
+
+    if(r.final.manualReviewWords && r.final.manualReviewWords.result==="manual review"){
+      alert("Автоприменение отключено: найдено стоп-слово. Требуется ручная проверка саппортом.");
+      return;
+    }
+
+    const finalProductTarget=getFinalProductTypeTarget(r);
+    if(finalProductTarget){
+      if(!confirm("Применить изменение ProductType?\n\nТекущий: "+r.heuristic.currentTypeText+"\nНовый: "+finalProductTarget.text+"\n\nИзменение будет внесено в форму без автосохранения.")) return;
+      typeSelect.value=finalProductTarget.value;
+      localStorage.setItem(NOTE_KEY,"ProductType подготовлен к сохранению: "+finalProductTarget.text+".");
+      alert("ProductType изменён в форме, но не сохранён. Саппорт может сохранить вручную.");
+      return;
+    }
+
+    if(r.final.product && r.final.product.result==="change required"){
+      alert("Для этого кейса автоматическое применение ProductType не настроено: не удалось однозначно сопоставить рекомендованный ProductType со значением в выпадающем списке. Проверьте блок диагностики.");
+      return;
+    }
+
+    const canAutoApplyRegion = r.final.region.result==="change required" && r.heuristic.desiredRegion && r.heuristic.desiredRegionOption && r.final.region.recommended && r.final.region.recommended!=="not found" && r.final.region.recommended===r.heuristic.desiredRegion.key;
+    if(canAutoApplyRegion){
+      alert("Автоприменение региона без сохранения пока отключено. Регион нужно изменить вручную, чтобы саппорт затем сохранил карточку.");
+      return;
+    }
+
+    const finalDenomTarget=getFinalDenominationTarget(r);
+    if(finalDenomTarget){
+      if(!confirm("Применить изменение denomination?\n\nТекущая: "+(r.heuristic.denom.currentOpt?r.heuristic.denom.currentOpt.text:"none")+"\nНовая: "+finalDenomTarget.text+"\n\nИзменение будет внесено в форму без автосохранения.")) return;
+      denomSelect.value=finalDenomTarget.value;
+      try{
+        denomSelect.dispatchEvent(new Event("input",{bubbles:true}));
+        denomSelect.dispatchEvent(new Event("change",{bubbles:true}));
+      }catch(_e){}
+      localStorage.setItem(NOTE_KEY,"Denomination подготовлена к сохранению: "+finalDenomTarget.text+".");
+      alert("Denomination изменена в форме, но не сохранена. Саппорт может сохранить вручную.");
+      return;
+    }
+
+    alert("Для этого кейса автоматическое применение denomination не настроено: нет детерминированного target. Проверьте блок диагностики.");
+  }
+
+
+  
+  // This section will be inserted before the panel building
+  // It replaces the namespace and adds AI V2 functions
+  
+  // AI V2 Constants and Service
+  const AI_SERVICE_URL = "https://script.google.com/a/macros/buysellvouchers.com/s/AKfycbyd1_1TJ0-VT91nNtckB-PKnyVXaTEvitwu1B7lN7u7ZMQuPeUio3OamINAtxUC4BIv/exec";
+  const AI_CONFIDENCE_HIGH = 85;
+  const AI_CONFIDENCE_MEDIUM = 60;
+  
+  // A. Deterministic Denomination Math Parser
+  function parseDenominationMathExpression(text) {
+    if (!text) return null;
+    const s = String(text || "").trim().toLowerCase();
+    if (!s) return null;
+    
+    // Handle patterns like: "500 + 100", "300x2", "2 * 300", "100 + 100 + 400"
+    let cleanedExpr = s.replace(/\s+/g, " ").trim();
+    
+    // Replace 'x' with '*' for multiplication
+    cleanedExpr = cleanedExpr.replace(/\bx\b/g, "*").replace(/\bx\s*(\d)/g, "*$1").replace(/(\d)\s*x\b/g, "$1*");
+    
+    // Check if it looks like a math expression
+    const expr = cleanedExpr.match(/^\s*([\d+*\-\s]+)\s*$/);
+    if (!expr) return null;
+    
+    // Parse and evaluate safely without eval()
+    try {
+      const tokens = expr[1].split(/\s+/).filter(t => t !== "");
+      let result = null;
+      let op = "+";
+      
+      for (const token of tokens) {
+        if (token === "+" || token === "-" || token === "*" || token === "/") {
+          op = token;
+        } else {
+          const num = parseFloat(token);
+          if (!isFinite(num)) return null;
+          
+          if (result === null) {
+            result = num;
+          } else {
+            if (op === "+") result += num;
+            else if (op === "-") result -= num;
+            else if (op === "*") result *= num;
+            else if (op === "/") result /= num;
+          }
+        }
+      }
+      
+      if (result !== null && result > 0) {
+        return Math.round(result);
+      }
+    } catch (_e) {}
+    
+    return null;
+  }
+  
+  function tryDenominationMathMatch(name, allowedOptions) {
+    const total = parseDenominationMathExpression(name);
+    if (total === null) {
+      return { matched: false, total: null, matchedOption: null };
+    }
+    
+    // Check if total matches any allowed denomination option amount
+    const matched = allowedOptions.find(opt => {
+      return opt.amount !== null && Number(opt.amount) === total;
+    });
+    
+    return { matched: !!matched, total, matchedOption: matched || null };
+  }
+  
+  // B. qualifiesForAI function
+  function qualifiesForAI(checkerResult, name, description, correspondenceText) {
+    if (!checkerResult) return false;
+    
+    // 1. Denomination result is not "ok" AND math parser didn't resolve it
+    const denomResult = checkerResult.final && checkerResult.final.denomination;
+    if (denomResult && denomResult.result !== "ok") {
+      // Check if math parsing could help
+      const denom = checkerResult.heuristic && checkerResult.heuristic.denom;
+      if (denom && denom.options) {
+        const mathMatch = tryDenominationMathMatch(name, denom.options);
+        if (!mathMatch.matched) {
+          return true;
+        }
+      }
+    }
+    
+    // 2. Correspondence text is non-empty
+    if (correspondenceText && String(correspondenceText).trim().length > 0) {
+      return true;
+    }
+    
+    // 3. Manual review words triggered (suspicious wording)
+    const mrwResult = checkerResult.final && checkerResult.final.manualReviewWords;
+    if (mrwResult && mrwResult.triggered) {
+      return true;
+    }
+    
+    // 4. Possible semantic mismatch (description mentions account/login/password while product is gift card)
+    const combined = (name + " " + description).toLowerCase();
+    if (/(account|login|access|password|credentials)/i.test(combined)) {
+      if (/(gift card|code|voucher|digital|subscription)/i.test(combined)) {
+        return true;
+      }
+    }
+    
+    return false;
+  }
+  
+  // C. buildAIPayload function
+  function buildAIPayload(checkerResult, name, description, correspondenceText) {
+    if (!checkerResult) return null;
+    
+    const heur = checkerResult.heuristic || {};
+    const finalRes = checkerResult.final || {};
+    const cat = checkerResult.catalogue || {};
+    
+    const payload = {
+      name: String(name || ""),
+      description: String(description || ""),
+      combined_text: String(name || "") + " " + String(description || ""),
+      current_product_type: heur.currentTypeText || "",
+      current_region: (heur.currentRegions || []).map(r => r.name).join(", ") || "",
+      current_denomination: heur.denom && heur.denom.currentOpt ? heur.denom.currentOpt.text : "",
+      allowed_denomination_options: (heur.denom && heur.denom.options) ? heur.denom.options.map(o => ({ text: o.text, amount: o.amount, duration: o.duration })) : [],
+      checker_result: {
+        product_result: finalRes.product && finalRes.product.result || "",
+        region_result: finalRes.region && finalRes.region.result || "",
+        denomination_result: finalRes.denomination && finalRes.denomination.result || "",
+        manual_review_words_triggered: (finalRes.manualReviewWords && finalRes.manualReviewWords.triggered) || false
+      },
+      correspondence_text: String(correspondenceText || ""),
+      policy_mode: "assist_v2",
+      source_flow: "card",
+      product_id: ""
+    };
+    
+    return payload;
+  }
+  
+  // D. callAIService async function
+  async function callAIService(payload) {
+    if (!AI_SERVICE_URL || !String(AI_SERVICE_URL).trim()) {
+      return { ok: false, error: "AI_SERVICE_URL not configured", verdict: "unavailable" };
+    }
+    
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      
+      const response = await fetch(AI_SERVICE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        return { ok: false, error: "HTTP " + response.status, verdict: "error" };
+      }
+      
+      const data = await response.json();
+      return { ok: true, data: data, verdict: data.verdict || "unknown" };
+    } catch (err) {
+      return { ok: false, error: err && err.message ? err.message : String(err), verdict: "error" };
+    }
+  }
+  
+  // E. mergeAIResult function
+  function mergeAIResult(checkerResult, aiResult, config) {
+    if (!checkerResult || !aiResult || !aiResult.data) {
+      return checkerResult;
+    }
+    
+    const merged = JSON.parse(JSON.stringify(checkerResult)); // deep copy
+    const ai = aiResult.data;
+    
+    // Hard deterministic wins: if ProductType, Region, or activeCatalogue has hard fail → AI does NOT override
+    const productHardFail = checkerResult.catalogue && checkerResult.catalogue.productDecision && 
+                           checkerResult.catalogue.productDecision.result === "change required";
+    const regionHardFail = checkerResult.catalogue && checkerResult.catalogue.regionDecision && 
+                          checkerResult.catalogue.regionDecision.result === "change required";
+    
+    // Denomination fallback: if denomination unresolved, AI denomination_ai with high confidence AND matched option in allowed
+    if (ai.denomination_ai && ai.denomination_ai.status === "match" && ai.denomination_ai.confidence >= AI_CONFIDENCE_HIGH) {
+      if (checkerResult.final.denomination.result !== "ok") {
+        const heur = checkerResult.heuristic;
+        if (heur.denom && heur.denom.options && ai.denomination_ai.matched_option) {
+          const isAllowed = heur.denom.options.some(opt => 
+            (opt.text === ai.denomination_ai.matched_option.text || opt.amount === ai.denomination_ai.matched_option.amount)
+          );
+          if (isAllowed) {
+            merged.final.denomination = {
+              result: "ok",
+              text: "matched by AI",
+              recommended: ai.denomination_ai.matched_option.text,
+              source: "ai_assist_v2",
+              mode: checkerResult.final.denomination.mode,
+              target_value: ai.denomination_ai.matched_option.amount,
+              target_text: ai.denomination_ai.matched_option.text,
+              ai_verified: true
+            };
+          }
+        }
+      }
+    }
+    
+    // Contact policy
+    if (ai.contact_policy && ai.contact_policy.contact_found) {
+      if (ai.contact_policy.confidence >= AI_CONFIDENCE_HIGH) {
+        merged.ai_contact_verdict = "reject";
+        merged.ai_contact_reason = "High confidence contact information detected";
+      } else if (ai.contact_policy.confidence >= AI_CONFIDENCE_MEDIUM) {
+        merged.ai_contact_verdict = "review";
+        merged.ai_contact_reason = "Uncertain contact information";
+      }
+    }
+    
+    // Description consistency
+    if (ai.description_match) {
+      if (ai.description_match.status === "mismatch" && ai.description_match.confidence >= AI_CONFIDENCE_HIGH) {
+        merged.ai_desc_verdict = "reject";
+        merged.ai_desc_reason = "Clear description mismatch detected";
+      } else if (ai.description_match.status === "suspicious" && ai.description_match.confidence >= AI_CONFIDENCE_MEDIUM) {
+        merged.ai_desc_verdict = "review";
+        merged.ai_desc_reason = "Suspicious description pattern";
+      }
+    }
+    
+    // Store AI result
+    merged.ai_result = {
+      verdict: ai.verdict,
+      confidence: ai.confidence,
+      reason: ai.reason,
+      denomination_ai: ai.denomination_ai,
+      description_match: ai.description_match,
+      contact_policy: ai.contact_policy,
+      risk_flags: ai.risk_flags || []
+    };
+    
+    return merged;
+  }
+  
+  // F & G. Panel rendering with AI section
+  function renderAISection(aiResult) {
+    if (!aiResult) {
+      return uiSection("AI Assist V2", uiField("Статус", "AI проверка не запущена", {tone:"info"}), {tone:"info",bgColor:"#f3f0ff"});
+    }
+    
+    const data = aiResult.data || {};
+    const confidence = data.confidence || 0;
+    const verdictTone = data.verdict === "approve" ? "ok" : data.verdict === "reject" ? "err" : "warn";
+    
+    let body = uiBadge("AI " + String(data.verdict || "unknown").toUpperCase(), verdictTone);
+    body += uiField("Уверенность", Math.round(confidence) + "%", {tone: confidence >= AI_CONFIDENCE_HIGH ? "ok" : "warn"});
+    body += uiField("Причина", data.reason || "N/A");
+    
+    if (data.denomination_ai) {
+      const denomTone = data.denomination_ai.status === "match" ? "ok" : "warn";
+      body += uiField("Denomination AI", data.denomination_ai.status || "unknown", {tone: denomTone});
+      if (data.denomination_ai.matched_option) {
+        body += uiField("  Matched", data.denomination_ai.matched_option.text);
+      }
+    }
+    
+    if (data.description_match) {
+      const descTone = data.description_match.status === "match" ? "ok" : "warn";
+      body += uiField("Description Match", data.description_match.status || "unknown", {tone: descTone});
+    }
+    
+    if (data.contact_policy) {
+      const contactTone = data.contact_policy.contact_found ? "err" : "ok";
+      body += uiField("Contact Policy", data.contact_policy.contact_found ? "FOUND" : "not found", {tone: contactTone});
+    }
+    
+    if (data.risk_flags && Array.isArray(data.risk_flags)) {
+      body += uiField("Risk Flags", data.risk_flags.join(", ") || "none");
+    }
+    
+    return uiSection("AI Assist V2", body, {tone:verdictTone, bgColor:"#f3f0ff"});
+  }
+  
+  // H. Correspondence text UI helpers
+  function addCorrespondenceTextUI(panel, onCheckClick) {
+    const section = document.createElement("div");
+    section.style.cssText = "margin-top:12px;padding:10px;border-radius:10px;background:rgba(147,97,253,.08);border:1px solid rgba(147,97,253,.20);";
+    
+    const label = document.createElement("label");
+    label.textContent = "Текст переписки (paste here):";
+    label.style.cssText = "display:block;font-weight:700;font-size:13px;margin-bottom:6px;color:#e5e7eb;";
+    
+    const textarea = document.createElement("textarea");
+    textarea.id = "bsv-correspondence-text";
+    textarea.placeholder = "Paste correspondence / письмо от клиента...";
+    textarea.style.cssText = "width:100%;min-height:60px;border:1px solid rgba(147,97,253,.30);border-radius:6px;padding:8px;background:#0f172a;color:#e5e7eb;font-family:Arial,sans-serif;font-size:12px;resize:vertical;box-sizing:border-box;";
+    
+    const checkBtn = document.createElement("button");
+    checkBtn.type = "button";
+    checkBtn.textContent = "Проверить переписку";
+    checkBtn.style.cssText = "margin-top:6px;border:none;border-radius:8px;padding:6px 12px;cursor:pointer;font-weight:700;font-size:13px;color:#fff;background:#a78bfa;";
+    
+    checkBtn.addEventListener("click", () => {
+      const text = textarea.value;
+      onCheckClick(text);
+    });
+    
+    section.appendChild(label);
+    section.appendChild(textarea);
+    section.appendChild(checkBtn);
+    
+    return section;
+  }
+  
+  
+
+  if(window[NS] && typeof window[NS].cleanup==="function"){ try{ window[NS].cleanup(); } catch(_){} }
+  delete window[NS];
+  const panel=document.createElement("div"); panel.style.cssText="position:fixed;top:6px;right:12px;z-index:2147483647;background:linear-gradient(180deg,#081733,#09142b);color:#fff;border-radius:16px;padding:14px 16px;min-width:420px;max-width:760px;box-shadow:0 16px 40px rgba(0,0,0,.40);font:14px/1.4 Arial,sans-serif;border:1px solid rgba(191,219,254,.14);";
+  const title=document.createElement("div"); title.textContent="BSV Integrated Checker Support v53-RP1-MR4"; title.style.cssText="font-weight:800;font-size:16px;margin-bottom:10px;letter-spacing:.01em;";
+  const row=document.createElement("div"); row.style.cssText="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;";
+  function btn(label,bg){ const b=document.createElement("button"); b.type="button"; b.textContent=label; b.style.cssText="border:none;border-radius:11px;padding:8px 14px;cursor:pointer;font-weight:700;font-size:15px;color:#fff;background:"+bg+";"; return b; }
+  const applyBtn=btn("Применить", "#059669"), refreshBtn=btn("Проверить", "#2563eb"), resetBtn=btn("Тех. кнопка — не нажимать","#475569"), closeBtn=btn("×", "#6b7280"); closeBtn.style.padding="8px 12px"; resetBtn.style.cssText="border:1px solid rgba(148,163,184,.22);border-radius:9px;padding:4px 8px;cursor:pointer;font-weight:600;font-size:11px;color:rgba(226,232,240,.72);background:rgba(15,23,42,.45);opacity:.58;";
+  const status=document.createElement("div"); status.style.cssText="white-space:normal;color:#e5e7eb;font-size:14px;max-height:72vh;overflow:auto;padding-right:2px;";
+  const footerRow=document.createElement("div"); footerRow.style.cssText="display:flex;justify-content:flex-end;align-items:center;margin-top:8px;padding-top:6px;border-top:1px solid rgba(148,163,184,.10);";
+  const state={panel,lastAnalysis:null,cleanup:()=>{ try{ panel.remove(); } catch(_){} clearMarks(); }};
+  const note=localStorage.getItem(NOTE_KEY); if(note){ const noteBox=document.createElement("div"); noteBox.style.cssText="margin-bottom:8px;padding:8px 10px;border-radius:10px;background:#0b2447;color:#bfdbfe;font-size:14px;"; noteBox.textContent=note; panel.appendChild(noteBox); localStorage.removeItem(NOTE_KEY); }
+  applyBtn.onclick=null; applyBtn.addEventListener("click", async (ev)=>{ ev.preventDefault(); ev.stopPropagation(); await applyIntegrated(); }, true); refreshBtn.onclick=async()=>renderIntegrated(await analyzeIntegrated()); resetBtn.onclick=()=>{ clearLegacyRuleCaches(); alert("URL правил и кэш были сброшены. При следующей проверке автоматически будет использован стандартный support rules URL."); }; closeBtn.onclick=()=>{ state.cleanup(); if(window[NS]===state) delete window[NS]; };
+  row.appendChild(applyBtn); row.appendChild(refreshBtn); row.appendChild(closeBtn); footerRow.appendChild(resetBtn); panel.appendChild(title); panel.appendChild(row); panel.appendChild(status); panel.appendChild(footerRow); document.body.appendChild(panel);
+  window[NS]=state;
+  status.innerHTML=uiSection("Итоговый результат", uiField("Статус", "Выполняется интегрированная проверка...", {tone:"info"}), {tone:"info"});
+  try{ renderIntegrated(await analyzeIntegrated()); } catch(e){ status.innerHTML=uiSection("Ошибка", uiField("Сообщение", e && e.message ? e.message : String(e), {tone:"err"}), {tone:"err"}); }
+})();
