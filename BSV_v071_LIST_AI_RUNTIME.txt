@@ -1514,6 +1514,28 @@
       return;
     }
 
+    const freshAiContext = {
+      productId: productId,
+      name: c.name || (r.heuristic ? String(r.heuristic.name || "") : ""),
+      description: r.heuristic ? String(r.heuristic.description || "") : "",
+      correspondenceText: correspondenceTextByProductId.get(productId) || ""
+    };
+    const freshAiQual = qualifiesForAI(r, freshAiContext);
+    if (freshAiQual.needed && (!c.ai || !c.ai.needed)) {
+      c.ai = {
+        state: "loading",
+        needed: true,
+        review: null,
+        merge: null,
+        reason: "AI gating пересчитывается..."
+      };
+      c.status = c.deterministicStatus || deriveOverall(r);
+      cache.set(productId, c);
+      setTimeout(function() {
+        rerunAIForProduct(productId).catch(function(){});
+      }, 0);
+    }
+
     const overall = c.status;
     const oTone = overall === "OK" ? "ok" : overall === "REVIEW" ? "warn" : "err";
     const pTone = toneFromResult(r.final.product ? r.final.product.result : "");
