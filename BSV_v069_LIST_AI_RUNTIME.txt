@@ -1,0 +1,1621 @@
+(async () => {
+  "use strict";
+
+  /* ═══════════════════════════════════════════════════════════════
+     BSV List Review AI Assist Runtime — v069
+     Branch: Popup Worker Window — rebased on v52/v56 checker pair
+     Depends on: BSV_v052_CHECKER_RUNTIME_REGION_PRIORITY_MANUAL_REVIEW_v3.txt
+     ═══════════════════════════════════════════════════════════════
+     Carries forward from v061/v062:
+     - Navigation sentinel (__bsv_nav_seq__) for popup reuse
+     - Strict sequential CONCURRENCY = 1
+     - Explicit error handling for every phase
+     REBASE v063:
+     - CHECKER_NS → v52 namespace (REGION_PRIORITY_MANUAL_REVIEW_V3)
+     - CHECKER_URL → v52 runtime on GitHub Pages
+     - manualReviewWords support in deriveOverall, mainReason,
+       actionNeeded, blockingModule, renderDetail
+     - Staging rules localStorage setup before checker execution
+       (same as BSV_Loader_v56 does)
+
+     Clean candidate policy for v069:
+     - rebased from LIST-STABLE-01 via audited v067 AI overlay only
+     - keeps deterministic list UX and worker model intact
+     - uses postMessage form transport with payload_json
+     - does NOT use payload_b64 transport from v068
+     ═══════════════════════════════════════════════════════════════ */
+
+  const NS            = "__BSV_LIST_REVIEW_AI_V069__";
+  const CHECKER_NS    = "__BSV_QC_INTEGRATED_CATALOGUE_REGION_PRIORITY_MANUAL_REVIEW_V3__";
+  const CHECKER_URL   = "https://vitalijsf-dev.github.io/bsv-catalogue-rules/BSV_v052_CHECKER_RUNTIME_REGION_PRIORITY_MANUAL_REVIEW_v3.txt";
+  const STAGING_RULES_URL = "https://vitalijsf-dev.github.io/bsv-catalogue-rules/compiled-rules-prototype-v1_AUTOPUBLISH_PREVIEW_MIN_v1.json";
+  const PREVIEW_META_URL  = "https://script.google.com/macros/s/AKfycbwCDG672o-mu6_lzry1oKoCfCwHd9oXpzx3DM-ukmAamzW2EKPn0pE-x0jzKOO-xybS/exec?action=preview_meta";
+  const AI_SERVICE_URL    = "https://script.google.com/a/macros/buysellvouchers.com/s/AKfycbyd1_1TJ0-VT91nNtckB-PKnyVXaTEvitwu1B7lN7u7ZMQuPeUio3OamINAtxUC4BIv/exec";
+  const AI_POSTMESSAGE_SOURCE = "BSV_AI_REVIEW_SERVICE_V1";
+  const AI_POLICY_MODE    = "assist_v2";
+  const AI_CONFIDENCE_HIGH = 85;
+  const AI_CONFIDENCE_MEDIUM = 60;
+  const CONCURRENCY        = 1;   /* HARD: never > 1 for popup mode */
+  const CHECKER_POLL_MS    = 35000;
+  const PAGE_LOAD_TIMEOUT  = 25000;
+  const NAV_DETECT_TIMEOUT = 10000;
+  const POLL_INTERVAL_MS   = 400;
+
+  /* localStorage keys used by v52 checker / v56 loader for staging rules */
+  const LS_CONFIG_KEY     = "BSV_QC_RULES_URL_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const LS_CACHE_KEY      = "BSV_QC_RULES_CACHE_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const LS_CACHE_META_KEY = "BSV_QC_RULES_CACHE_META_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const LS_NOTE_KEY       = "BSV_QC_NOTE_REGION_PRIORITY_MANUAL_REVIEW_V3";
+  const LS_HASH_KEY       = "BSV_QC_STAGING_PREVIEW_MIN_HASH_V1";
+
+  /* ── Guard: must be on list page ── */
+  if (!document.querySelector("table.items")) {
+    alert("BSV List Review AI Assist: \u0442\u0430\u0431\u043B\u0438\u0446\u0430 \u0442\u043E\u0432\u0430\u0440\u043E\u0432 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430.\n\u041E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0441\u0442\u0440\u0430\u043D\u0438\u0446\u0443 Product List (/xdm/product/admin).");
+    return;
+  }
+
+  /* ── Cleanup previous instance ── */
+  if (window[NS] && typeof window[NS].cleanup === "function") {
+    try { window[NS].cleanup(); } catch (_) {}
+  }
+  delete window[NS];
+
+  /* ── Helpers ── */
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const norm = v => String(v == null ? "" : v).replace(/\s+/g, " ").trim();
+  const esc  = s => String(s ?? "").replace(/[&<>"]/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m]));
+  const BASE = location.origin;
+  let navSeq = 0;  /* navigation sequence counter */
+
+  /* ═══════════════════════════════════════════════════════════════
+     1. SCAN LIST PAGE ROWS — only Under Review
+     ═══════════════════════════════════════════════════════════════ */
+
+  function scanUnderReviewRows() {
+    const rows = [...document.querySelectorAll("table.items tr.odd, table.items tr.even")];
+    return rows.map((tr, idx) => {
+      const tds = tr.querySelectorAll("td");
+      if (tds.length < 3) return null;
+
+      const modSelect = tr.querySelector("select.mod-status-dropdown");
+      if (!modSelect || modSelect.value !== "under_review") return null;
+
+      const updLink = tr.querySelector('a.upd[href*="/product/update?id="]');
+      if (!updLink) return null;
+
+      const productId   = norm(tds[0].textContent);
+      const productName = norm(tds[1].textContent);
+      const productType = norm(tds[2].textContent);
+      const updateUrl   = updLink.getAttribute("href");
+
+      if (!productId || !/^\d+$/.test(productId)) return null;
+      return { tr, productId, productName, productType, updateUrl, subsetIndex: idx };
+    }).filter(Boolean);
+  }
+
+  function showStartupModal(totalCount) {
+    return new Promise(resolve => {
+      const overlay = document.createElement("div");
+      overlay.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;font:14px/1.4 Arial,sans-serif;";
+
+      const box = document.createElement("div");
+      box.style.cssText = "background:linear-gradient(180deg,#0f1d3d,#0a1428);border:1px solid rgba(191,219,254,.18);border-radius:16px;padding:28px 32px;min-width:360px;max-width:480px;box-shadow:0 24px 48px rgba(0,0,0,.5);color:#e5e7eb;text-align:center;";
+
+      box.innerHTML = '<div style="font-weight:800;font-size:18px;color:#f8d26a;margin-bottom:16px;">BSV List Review AI Assist</div>'
+        + '<div style="font-size:15px;margin-bottom:6px;">\u041D\u0430\u0439\u0434\u0435\u043D\u043E \u0442\u043E\u0432\u0430\u0440\u043E\u0432 <b style="color:#93c5fd;">Under Review</b> \u043D\u0430 \u0442\u0435\u043A\u0443\u0449\u0435\u0439 \u0441\u0442\u0440\u0430\u043D\u0438\u0446\u0435:</div>'
+        + '<div style="font-size:36px;font-weight:800;color:#60a5fa;margin:10px 0 20px;">' + totalCount + '</div>'
+        + '<div style="font-size:13px;color:#94a3b8;margin-bottom:4px;">\u041C\u0435\u0442\u043E\u0434 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0438: <b style="color:#a78bfa;">popup worker window</b></div>'
+        + '<div style="font-size:13px;color:#94a3b8;margin-bottom:18px;">\u0421\u043A\u043E\u043B\u044C\u043A\u043E \u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C? (\u0441\u0432\u0435\u0440\u0445\u0443 \u0432\u043D\u0438\u0437)</div>';
+
+      const btnRow = document.createElement("div");
+      btnRow.style.cssText = "display:flex;gap:10px;justify-content:center;flex-wrap:wrap;";
+
+      function makeBtn(label, value, bg) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = label;
+        btn.style.cssText = "border:none;border-radius:10px;padding:10px 22px;cursor:pointer;font-weight:700;font-size:15px;color:#fff;background:" + bg + ";min-width:70px;";
+        btn.onmouseenter = () => { btn.style.opacity = "0.85"; };
+        btn.onmouseleave = () => { btn.style.opacity = "1"; };
+        btn.onclick = () => { overlay.remove(); resolve(value); };
+        return btn;
+      }
+
+      if (totalCount >= 5)  btnRow.appendChild(makeBtn("5", 5, "#2563eb"));
+      if (totalCount >= 10) btnRow.appendChild(makeBtn("10", 10, "#2563eb"));
+      if (totalCount > 0)   btnRow.appendChild(makeBtn("ALL (" + totalCount + ")", totalCount, "#059669"));
+      btnRow.appendChild(makeBtn("Cancel", 0, "#6b7280"));
+
+      box.appendChild(btnRow);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+    });
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     2. CHECKER CODE LOADER (fetched once, reused in every popup page)
+     ═══════════════════════════════════════════════════════════════ */
+
+  let checkerCode = null;
+
+  async function loadCheckerCode() {
+    if (checkerCode) return checkerCode;
+    const r = await fetch(CHECKER_URL + "?ts=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) throw new Error("Checker load failed: HTTP " + r.status);
+    checkerCode = await r.text();
+    return checkerCode;
+  }
+
+  /**
+   * Sets up staging rules localStorage keys in a target window,
+   * mirroring what BSV_Loader_v56 does before launching checker v52.
+   * This ensures the checker uses the correct staging minified rules JSON
+   * with hash-check and cache invalidation.
+   */
+  async function setupStagingRulesInWindow(win) {
+    try {
+      const ls = win.localStorage;
+      if (!ls) return;
+      const getItem = k => { try { return String(ls.getItem(k) || "").trim(); } catch (_) { return ""; } };
+      const setItem = (k, v) => { try { ls.setItem(k, String(v)); } catch (_) {} };
+      const removeItem = k => { try { ls.removeItem(k); } catch (_) {} };
+
+      const prevUrl = getItem(LS_CONFIG_KEY);
+      const prevHash = getItem(LS_HASH_KEY);
+      const hasCache = !!getItem(LS_CACHE_KEY) && !!getItem(LS_CACHE_META_KEY);
+
+      /* Try to fetch preview meta for hash-check */
+      let remoteHash = "";
+      try {
+        const metaResp = await fetch(PREVIEW_META_URL + "&ts=" + Date.now(), { cache: "no-store" });
+        if (metaResp.ok) {
+          const meta = await metaResp.json();
+          remoteHash = String((meta && meta.preview_min_body_hash) || (meta && meta.preview_body_hash) || "").trim();
+        }
+      } catch (_) {}
+
+      const sameUrl = prevUrl === STAGING_RULES_URL;
+      const sameHash = !!remoteHash && prevHash === remoteHash;
+
+      if (!sameUrl || !hasCache || (remoteHash && !sameHash)) {
+        removeItem(LS_CACHE_KEY);
+        removeItem(LS_CACHE_META_KEY);
+        if (remoteHash) setItem(LS_HASH_KEY, remoteHash);
+      }
+      setItem(LS_CONFIG_KEY, STAGING_RULES_URL);
+    } catch (_) {
+      /* localStorage not available in this context — checker will use DEFAULT_RULES_URL */
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     3. POPUP / WORKER WINDOW EVALUATOR (v061 — fixed lifecycle)
+     ═══════════════════════════════════════════════════════════════
+
+     Critical fix: navigation sentinel mechanism.
+     Before navigating the reused popup:
+       1. Stamp win.__bsv_nav_seq__ = ++navSeq
+       2. Set win.location.href = newUrl
+       3. Poll until win.__bsv_nav_seq__ is undefined
+          (proves the old JS context was destroyed by navigation)
+       4. THEN poll for new page's #product-form
+     This prevents detecting the OLD page's #product-form.
+     ═══════════════════════════════════════════════════════════════ */
+
+  let workerWin = null;
+
+  /**
+   * Opens a NEW popup window to url.
+   * Used for the first card only.
+   */
+  function openWorkerWindow(url) {
+    if (workerWin && !workerWin.closed) {
+      try { workerWin.close(); } catch (_) {}
+    }
+    const w = window.open(url, "__bsv_worker_v063__",
+      "width=1100,height=760,left=80,top=80,scrollbars=yes,resizable=yes");
+    if (!w) {
+      throw new Error(
+        "POPUP_BLOCKED: \u0411\u0440\u0430\u0443\u0437\u0435\u0440 \u0437\u0430\u0431\u043B\u043E\u043A\u0438\u0440\u043E\u0432\u0430\u043B popup-\u043E\u043A\u043D\u043E.\n\n"
+        + "\u0420\u0435\u0448\u0435\u043D\u0438\u0435: \u0440\u0430\u0437\u0440\u0435\u0448\u0438\u0442\u0435 popup \u0434\u043B\u044F \u044D\u0442\u043E\u0433\u043E \u0441\u0430\u0439\u0442\u0430.\n"
+        + "Chrome \u2192 \u0430\u0434\u0440\u0435\u0441\u043D\u0430\u044F \u0441\u0442\u0440\u043E\u043A\u0430 \u2192 \u0438\u043A\u043E\u043D\u043A\u0430 \u26D4 popup \u2192 \u0420\u0430\u0437\u0440\u0435\u0448\u0438\u0442\u044C \u2192 \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u044C \u0431\u0443\u043A\u043C\u0430\u0440\u043A\u043B\u0435\u0442."
+      );
+    }
+    workerWin = w;
+    return w;
+  }
+
+  /**
+   * Navigates an EXISTING worker popup to a new URL, with sentinel.
+   * Returns only after the old page context is confirmed destroyed.
+   */
+  async function navigateWorkerWindow(win, url) {
+    /* Step 1: stamp sentinel on OLD page */
+    const seq = ++navSeq;
+    try { win.__bsv_nav_seq__ = seq; } catch (_) {}
+
+    /* Step 2: trigger navigation */
+    win.location.href = url;
+
+    /* Step 3: wait until sentinel is gone (old context destroyed) */
+    const navDeadline = Date.now() + NAV_DETECT_TIMEOUT;
+    while (Date.now() < navDeadline) {
+      if (win.closed) throw new Error("WORKER_CLOSED: Worker window was closed during navigation");
+      try {
+        /* When the browser navigates, the old JS context is torn down.
+           Accessing win.__bsv_nav_seq__ on the NEW page will return undefined. */
+        if (win.__bsv_nav_seq__ !== seq) break;
+      } catch (_) {
+        /* Access error = context changed, navigation happened */
+        break;
+      }
+      await wait(100);
+    }
+    /* Extra small pause for navigation settle */
+    await wait(200);
+  }
+
+  /**
+   * Waits until the worker window's NEW page has #product-form.
+   */
+  async function waitForWorkerPageReady(win, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (win.closed) throw new Error("WORKER_CLOSED: Worker window was closed during page load");
+      try {
+        const doc = win.document;
+        if (doc && doc.readyState !== "loading" && doc.querySelector("#product-form")) return;
+      } catch (_) {
+        /* Not ready yet */
+      }
+      await wait(POLL_INTERVAL_MS);
+    }
+    throw new Error("WORKER_PAGE_TIMEOUT: Product page did not load within " + Math.round(timeoutMs / 1000) + "s");
+  }
+
+  /**
+   * Fully cleans checker state in the worker window before a new run.
+   */
+  function cleanCheckerState(win) {
+    try {
+      if (win[CHECKER_NS] && typeof win[CHECKER_NS].cleanup === "function") {
+        win[CHECKER_NS].cleanup();
+      }
+    } catch (_) {}
+    try { delete win[CHECKER_NS]; } catch (_) {}
+  }
+
+  /**
+   * Executes checker code in the worker window and polls for lastAnalysis.
+   */
+  async function runCheckerInWorker(win) {
+    const code = await loadCheckerCode();
+
+    /* Suppress UI noise */
+    try { win.alert = () => {}; } catch (_) {}
+    try { win.confirm = () => false; } catch (_) {}
+    try { win.prompt = () => null; } catch (_) {}
+
+    /* Clean any leftover checker state */
+    cleanCheckerState(win);
+
+    /* Verify form exists */
+    try {
+      if (!win.document.querySelector("#product-form")) {
+        throw new Error("PRODUCT_FORM_NOT_FOUND after page load");
+      }
+    } catch (e) {
+      if (e.message && e.message.includes("PRODUCT_FORM")) throw e;
+      throw new Error("WORKER_ACCESS_ERROR: " + (e.message || String(e)));
+    }
+
+    /* Execute checker */
+    try {
+      const WinFunction = win.Function;
+      new WinFunction(code)();
+    } catch (e) {
+      throw new Error("CHECKER_EVAL_ERROR: " + (e.message || String(e)));
+    }
+
+    /* Poll for lastAnalysis */
+    const deadline = Date.now() + CHECKER_POLL_MS;
+    while (Date.now() < deadline) {
+      if (win.closed) throw new Error("WORKER_CLOSED: Worker window was closed during checker execution");
+      try {
+        const ns = win[CHECKER_NS];
+        if (ns && ns.lastAnalysis) {
+          /* Deep clone to safely detach */
+          return JSON.parse(JSON.stringify(ns.lastAnalysis));
+        }
+      } catch (_) {}
+      await wait(POLL_INTERVAL_MS);
+    }
+    throw new Error("CHECKER_RESULT_TIMEOUT: lastAnalysis did not appear within " + Math.round(CHECKER_POLL_MS / 1000) + "s");
+  }
+
+  /**
+   * Full pipeline for ONE product — strict sequential lifecycle:
+   *   1. Open or navigate worker to product URL
+   *   2. Wait for OLD page context to be destroyed (sentinel)
+   *   3. Wait for NEW page #product-form
+   *   4. Inject checker, poll for result
+   *   5. Return result
+   * Every phase has explicit timeout + closed-window check.
+   */
+  let isFirstProduct = true;
+
+  async function evaluateProductInWorker(updateUrl) {
+    const fullUrl = /^https?:\/\//i.test(updateUrl) ? updateUrl : (BASE + updateUrl);
+
+    if (isFirstProduct || !workerWin || workerWin.closed) {
+      /* First product or window was closed — open fresh */
+      openWorkerWindow(fullUrl);
+      isFirstProduct = false;
+    } else {
+      /* Reuse existing window — navigate with sentinel */
+      await navigateWorkerWindow(workerWin, fullUrl);
+    }
+
+    const win = workerWin;
+    if (!win || win.closed) throw new Error("WORKER_CLOSED: Worker window not available");
+
+    await waitForWorkerPageReady(win, PAGE_LOAD_TIMEOUT);
+    await setupStagingRulesInWindow(win);
+    return await runCheckerInWorker(win);
+  }
+
+  function closeWorkerWindow() {
+    if (workerWin && !workerWin.closed) {
+      try { workerWin.close(); } catch (_) {}
+    }
+    workerWin = null;
+  }
+
+
+  /* ═══════════════════════════════════════════════════════════════
+     3.6 AI ASSIST HELPERS — patch only over LIST-STABLE-01
+     ═══════════════════════════════════════════════════════════════ */
+
+  function getCombinedText(name, description) {
+    return [String(name || "").trim(), String(description || "").trim()].filter(Boolean).join(" \n");
+  }
+
+  function extractAllowedDenominationOptions(result) {
+    const out = [];
+    const opts = result && result.heuristic && result.heuristic.denom && Array.isArray(result.heuristic.denom.options)
+      ? result.heuristic.denom.options
+      : [];
+    opts.forEach(opt => {
+      const text = String((opt && (opt.text || opt.label || "")) || "").trim();
+      if (!text) return;
+      out.push(text);
+    });
+    return Array.from(new Set(out));
+  }
+
+  function parseDenominationMathExpression(text) {
+    const src = String(text || "");
+    const match = src.match(/(\d+(?:\s*[\+\*xX]\s*\d+)+)/);
+    if (!match) return null;
+    const expr = match[1].replace(/[xX]/g, "*").replace(/\s+/g, "");
+    if (!/^[0-9+\-*\/.]+$/.test(expr)) return null;
+
+    const tokens = expr.match(/\d+(?:\.\d+)?|[+\-*/]/g);
+    if (!tokens || !tokens.length) return null;
+
+    let result = Number(tokens[0]);
+    if (!isFinite(result)) return null;
+    for (let i = 1; i < tokens.length; i += 2) {
+      const op = tokens[i];
+      const num = Number(tokens[i + 1]);
+      if (!isFinite(num)) return null;
+      if (op === "+") result += num;
+      else if (op === "-") result -= num;
+      else if (op === "*") result *= num;
+      else if (op === "/") result = num === 0 ? NaN : result / num;
+    }
+    return isFinite(result) && result > 0 ? Math.round(result * 100) / 100 : null;
+  }
+
+  function tryDenominationMathMatch(name, description, allowedOptions) {
+    const total = parseDenominationMathExpression(getCombinedText(name, description));
+    if (total == null) return { matched: false, total: null, matched_option: "" };
+
+    const options = Array.isArray(allowedOptions) ? allowedOptions : [];
+    const matched = options.find(opt => {
+      const nums = String(opt || "").match(/\d+(?:[.,]\d+)?/g) || [];
+      return nums.some(n => Math.abs(Number(String(n).replace(",", ".")) - total) < 0.01);
+    }) || "";
+
+    return { matched: !!matched, total, matched_option: matched || "" };
+  }
+
+  function hasHardDeterministicFail(result) {
+    const f = result && result.final ? result.final : null;
+    if (!f) return false;
+    if (f.activeCatalogue && f.activeCatalogue.result && f.activeCatalogue.result !== "passed") return true;
+    if (f.product && (f.product.result === "change required" || f.product.result === "denied")) return true;
+    if (f.region && f.region.result === "change required") return true;
+    return false;
+  }
+
+  function onlyDenominationUnresolved(result) {
+    const f = result && result.final ? result.final : null;
+    if (!f) return false;
+    const acOk = !f.activeCatalogue || f.activeCatalogue.result === "passed";
+    const pOk = !f.product || f.product.result === "ok";
+    const rOk = !f.region || f.region.result === "ok";
+    const dBad = !!(f.denomination && f.denomination.result !== "ok");
+    const noManualReview = !(f.manualReviewWords && f.manualReviewWords.result === "manual review");
+    return acOk && pOk && rOk && dBad && noManualReview;
+  }
+
+  function onlyBroadManualReview(result) {
+    const f = result && result.final ? result.final : null;
+    if (!f) return false;
+    const acOk = !f.activeCatalogue || f.activeCatalogue.result === "passed";
+    const pOk = !f.product || f.product.result === "ok";
+    const rOk = !f.region || f.region.result === "ok";
+    const dOk = !f.denomination || f.denomination.result === "ok";
+    const mr = f.manualReviewWords && f.manualReviewWords.result === "manual review";
+    return acOk && pOk && rOk && dOk && mr;
+  }
+
+  function detectBroadSuspicion(name, description, correspondenceText) {
+    const combined = getCombinedText(name, description) + " " + String(correspondenceText || "");
+    const lower = combined.toLowerCase();
+    const patterns = [
+      "account", "login", "access", "password", "telegram", "whatsapp", "email", "e-mail",
+      "@gmail", "@outlook", "@yahoo", "contact me", "write me", "dm me", "phone", "number"
+    ];
+    return patterns.filter(p => lower.includes(p));
+  }
+
+  function qualifiesForAI(result, context) {
+    if (!result) return { needed: false, reasons: [], matchedTriggerWords: [], mathMatch: null };
+    if (hasHardDeterministicFail(result)) return { needed: false, reasons: [], matchedTriggerWords: [], mathMatch: null };
+
+    const name = context && context.name ? context.name : "";
+    const description = context && context.description ? context.description : "";
+    const correspondenceText = context && context.correspondenceText ? context.correspondenceText : "";
+    const allowedOptions = extractAllowedDenominationOptions(result);
+    const mathMatch = tryDenominationMathMatch(name, description, allowedOptions);
+    const triggerWords = detectBroadSuspicion(name, description, correspondenceText);
+    const reasons = [];
+
+    if (onlyDenominationUnresolved(result) && !mathMatch.matched) reasons.push("denomination_unresolved");
+    if (result.final && result.final.manualReviewWords && result.final.manualReviewWords.result === "manual review") reasons.push("manual_review_words");
+    if (triggerWords.length) reasons.push("broad_wording");
+    if (String(correspondenceText || "").trim()) reasons.push("correspondence_present");
+
+    return {
+      needed: reasons.length > 0,
+      reasons,
+      matchedTriggerWords: triggerWords,
+      mathMatch
+    };
+  }
+
+  function buildAIRequestPayload(result, context, aiQual) {
+    const name = context && context.name ? context.name : "";
+    const description = context && context.description ? context.description : "";
+    const correspondenceText = context && context.correspondenceText ? context.correspondenceText : "";
+    return {
+      name: name,
+      description: description,
+      combined_text: getCombinedText(name, description),
+      current_product_type: result && result.heuristic ? String(result.heuristic.currentTypeText || "") : "",
+      current_region: result && result.heuristic && Array.isArray(result.heuristic.currentRegions) ? result.heuristic.currentRegions.map(x => x.name).join(", ") : "",
+      current_denomination: result && result.heuristic && result.heuristic.denom && result.heuristic.denom.currentOpt ? String(result.heuristic.denom.currentOpt.text || "") : "none",
+      allowed_denomination_options: extractAllowedDenominationOptions(result),
+      checker_result: result && result.final ? result.final : {},
+      matched_trigger_words: aiQual && Array.isArray(aiQual.matchedTriggerWords) ? aiQual.matchedTriggerWords : [],
+      correspondence_text: correspondenceText,
+      policy_mode: AI_POLICY_MODE,
+      source_flow: "list",
+      product_id: context && context.productId ? String(context.productId) : ""
+    };
+  }
+
+  async function callAIReviewService(payload) {
+    if (!AI_SERVICE_URL) return { ok: false, error: "AI service URL is not configured" };
+    return new Promise((resolve) => {
+      const iframeName = "bsv_ai_review_iframe_" + Date.now();
+      const clientRequestId = "ai_" + Date.now() + "_" + Math.random().toString(36).slice(2);
+      const iframe = document.createElement("iframe");
+      iframe.name = iframeName;
+      iframe.style.display = "none";
+
+      const form = document.createElement("form");
+      form.method = "POST";
+      form.action = AI_SERVICE_URL;
+      form.target = iframeName;
+      form.style.display = "none";
+
+      function addInput(name, value) {
+        const input = document.createElement("input");
+        input.type = "hidden";
+        input.name = name;
+        input.value = value == null ? "" : String(value);
+        form.appendChild(input);
+      }
+
+      addInput("transport", "postmessage");
+      addInput("client_request_id", clientRequestId);
+      addInput("payload_json", JSON.stringify(payload || {}));
+
+      let settled = false;
+      const timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({ ok: false, error: "Timeout while waiting for AI service response" });
+      }, 45000);
+
+      function cleanup() {
+        window.removeEventListener("message", onMessage);
+        clearTimeout(timeoutId);
+        setTimeout(() => {
+          try { form.remove(); } catch (_) {}
+          try { iframe.remove(); } catch (_) {}
+        }, 800);
+      }
+
+      function onMessage(event) {
+        const data = event && event.data;
+        if (!data || typeof data !== "object") return;
+        if (data.source !== AI_POSTMESSAGE_SOURCE) return;
+        if (String(data.client_request_id || "") !== clientRequestId) return;
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (data && data.ok === false && !data.error) {
+          data.error = data.reason || "AI service returned review/error";
+        }
+        resolve(data);
+      }
+
+      window.addEventListener("message", onMessage);
+      document.body.appendChild(iframe);
+      document.body.appendChild(form);
+
+      try {
+        form.submit();
+      } catch (e) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({ ok: false, error: e && e.message ? e.message : String(e) });
+      }
+    });
+  }
+
+  function mergeDeterministicAndAI(detStatus, result, aiReview, aiQual) {
+    const merged = {
+      status: detStatus,
+      aiApplied: false,
+      reason: "AI not used",
+      impact: "none"
+    };
+
+    if (!aiQual || !aiQual.needed) {
+      merged.reason = "AI проверка не требуется (детерминированный результат)";
+      return merged;
+    }
+
+    if (!aiReview || !aiReview.ok) {
+      merged.aiApplied = true;
+      merged.reason = "AI недоступен: " + String((aiReview && aiReview.error) || "unknown error");
+      merged.impact = "ai_error";
+      return merged;
+    }
+
+    merged.aiApplied = true;
+    merged.reason = aiReview.reason || "AI review completed";
+    merged.impact = "ai_review";
+
+    if (hasHardDeterministicFail(result)) {
+      merged.reason = "Жёсткий детерминированный результат имеет приоритет";
+      merged.impact = "hard_deterministic_wins";
+      return merged;
+    }
+
+    if (aiReview.contact_policy && aiReview.contact_policy.status === "contact_found" && Number(aiReview.confidence || 0) >= AI_CONFIDENCE_HIGH) {
+      merged.status = "FAIL";
+      merged.impact = "contact_reject";
+      return merged;
+    }
+
+    if (aiReview.verdict === "reject" && Number(aiReview.confidence || 0) >= AI_CONFIDENCE_HIGH) {
+      merged.status = "FAIL";
+      merged.impact = "ai_reject";
+      return merged;
+    }
+
+    if (onlyDenominationUnresolved(result)
+        && aiReview.denomination_ai
+        && aiReview.denomination_ai.status === "match"
+        && aiReview.denomination_ai.matched_option
+        && extractAllowedDenominationOptions(result).includes(aiReview.denomination_ai.matched_option)
+        && Number(aiReview.confidence || 0) >= AI_CONFIDENCE_HIGH) {
+      merged.status = "OK";
+      merged.impact = "denomination_pass";
+      return merged;
+    }
+
+    if (onlyBroadManualReview(result)
+        && aiReview.verdict === "approve"
+        && Number(aiReview.confidence || 0) >= AI_CONFIDENCE_HIGH
+        && (!aiReview.contact_policy || aiReview.contact_policy.status !== "contact_found")
+        && (!aiReview.description_match || aiReview.description_match.status !== "mismatch")) {
+      merged.status = "OK";
+      merged.impact = "broad_review_cleared";
+      return merged;
+    }
+
+    if (aiReview.verdict === "review" || Number(aiReview.confidence || 0) >= AI_CONFIDENCE_MEDIUM) {
+      merged.status = detStatus === "FAIL" ? "FAIL" : "REVIEW";
+      merged.impact = "ai_review";
+      return merged;
+    }
+
+    return merged;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     4. RESULT CACHE & STATUS HELPERS
+     ═══════════════════════════════════════════════════════════════ */
+
+  const cache = new Map();
+  const correspondenceTextByProductId = new Map();
+
+  function deriveOverall(r) {
+    if (!r || !r.final) return "REVIEW";
+    const mr = r.final.manualReviewWords;
+    if (mr && mr.result === "manual review") return "REVIEW";
+    const ac = r.final.activeCatalogue;
+    if (ac && ac.result !== "passed") return ac.result === "review" ? "REVIEW" : "FAIL";
+    const p = r.final.product;
+    if (p && p.result !== "ok") return p.result === "change required" || p.result === "denied" ? "FAIL" : "REVIEW";
+    const rg = r.final.region;
+    if (rg && rg.result !== "ok") return rg.result === "change required" ? "FAIL" : "REVIEW";
+    const d = r.final.denomination;
+    if (d && d.result !== "ok") return d.result === "error" || d.result === "change required" ? "FAIL" : "REVIEW";
+    return "OK";
+  }
+
+  function statusLabel(s) {
+    return { OK: "\u041F\u041E\u0414\u0422\u0412\u0415\u0420\u0416\u0414\u0401\u041D", REVIEW: "\u0422\u0420\u0415\u0411\u0423\u0415\u0422\u0421\u042F \u041F\u0420\u041E\u0412\u0415\u0420\u041A\u0410", FAIL: "\u041D\u0415 \u041F\u041E\u0414\u0422\u0412\u0415\u0420\u0416\u0414\u0401\u041D", ERROR: "\u041E\u0428\u0418\u0411\u041A\u0410", loading: "\u0417\u0410\u0413\u0420\u0423\u0417\u041A\u0410..." }[s] || s;
+  }
+
+  function statusColors(s) {
+    const map = {
+      OK:      { bg: "#dcfce7", border: "#22c55e", text: "#166534", rowBg: "rgba(34,197,94,0.10)" },
+      REVIEW:  { bg: "#fef9c3", border: "#eab308", text: "#854d0e", rowBg: "rgba(234,179,8,0.10)" },
+      FAIL:    { bg: "#fee2e2", border: "#ef4444", text: "#991b1b", rowBg: "rgba(239,68,68,0.10)" },
+      ERROR:   { bg: "#f3f4f6", border: "#6b7280", text: "#374151", rowBg: "rgba(107,114,128,0.08)" },
+      loading: { bg: "#eff6ff", border: "#3b82f6", text: "#1e40af", rowBg: "rgba(59,130,246,0.06)" }
+    };
+    return map[s] || map.ERROR;
+  }
+
+  function mainReason(r) {
+    if (!r || !r.final) return "\u041D\u0435\u0442 \u0434\u0430\u043D\u043D\u044B\u0445";
+    const f = r.final;
+    if (f.manualReviewWords && f.manualReviewWords.result === "manual review") return norm(f.manualReviewWords.text);
+    if (f.activeCatalogue && f.activeCatalogue.result !== "passed") return norm(f.activeCatalogue.text || f.activeCatalogue.note || "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0430");
+    if (f.product && f.product.result !== "ok") return norm(f.product.text);
+    if (f.region && f.region.result !== "ok") return norm(f.region.text);
+    if (f.denomination && f.denomination.result !== "ok") return norm(f.denomination.text);
+    return "\u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u043F\u0440\u043E\u0439\u0434\u0435\u043D\u0430";
+  }
+
+  function actionNeeded(r) {
+    if (!r || !r.final) return "\u043F\u0440\u043E\u0432\u0435\u0441\u0442\u0438 \u0440\u0443\u0447\u043D\u0443\u044E \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0443";
+    const f = r.final;
+    if (f.manualReviewWords && f.manualReviewWords.result === "manual review") return "\u043F\u0435\u0440\u0435\u0434\u0430\u0442\u044C \u043D\u0430 \u0440\u0443\u0447\u043D\u0443\u044E \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0443";
+    if (f.activeCatalogue && f.activeCatalogue.result !== "passed") return "\u043F\u0440\u043E\u0432\u0435\u0441\u0442\u0438 \u0440\u0443\u0447\u043D\u0443\u044E \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0443";
+    if (f.product && f.product.result !== "ok") return "\u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C ProductType";
+    if (f.region && f.region.result !== "ok") return "\u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C \u0440\u0435\u0433\u0438\u043E\u043D";
+    if (f.denomination && f.denomination.result !== "ok") return "\u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C denomination";
+    return "\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0439 \u043D\u0435 \u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F";
+  }
+
+  function blockingModule(r) {
+    if (!r || !r.final) return "Unknown";
+    const f = r.final;
+    if (f.manualReviewWords && f.manualReviewWords.result === "manual review") return "ManualReviewWords";
+    if (f.activeCatalogue && f.activeCatalogue.result !== "passed") return "ActiveCatalogue";
+    if (f.product && f.product.result !== "ok") return "ProductType";
+    if (f.region && f.region.result !== "ok") return "Region";
+    if (f.denomination && f.denomination.result !== "ok") return "Denomination";
+    return "None";
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     5. BATCH PRELOAD ENGINE — strict sequential, single worker
+     ═══════════════════════════════════════════════════════════════ */
+
+  let preloadAbort = false;
+  let popupBlocked = false;
+  let popupBlockerText = "";
+
+
+  async function preloadOne(item) {
+    if (cache.has(item.productId)) return;
+    cache.set(item.productId, {
+      status: "loading",
+      deterministicStatus: "loading",
+      result: null,
+      error: null,
+      name: item.productName,
+      productType: item.productType,
+      updateUrl: item.updateUrl,
+      ai: { state: "idle", needed: false, review: null, merge: null, reason: "" }
+    });
+    markRow(item.tr, "loading");
+    refreshPanelRow(item.productId);
+
+    try {
+      const result = await evaluateProductInWorker(item.updateUrl);
+      const deterministicStatus = deriveOverall(result);
+      const context = {
+        productId: item.productId,
+        name: item.productName,
+        description: result && result.heuristic ? String(result.heuristic.description || "") : "",
+        correspondenceText: correspondenceTextByProductId.get(item.productId) || ""
+      };
+
+      const aiQual = qualifiesForAI(result, context);
+      let aiState = { state: "idle", needed: !!aiQual.needed, review: null, merge: null, reason: aiQual.needed ? "AI проверка требуется" : "AI проверка не требуется (детерминированный результат)" };
+      let mergedStatus = deterministicStatus;
+
+      if (aiQual.mathMatch && aiQual.mathMatch.matched && onlyDenominationUnresolved(result)) {
+        aiState = {
+          state: "done",
+          needed: true,
+          review: {
+            ok: true,
+            verdict: "approve",
+            confidence: 100,
+            reason: "Deterministic denomination math parser matched allowed option.",
+            denomination_ai: { status: "match", matched_option: aiQual.mathMatch.matched_option, reason: "math_parser" },
+            description_match: { status: "uncertain", reason: "" },
+            contact_policy: { status: "clean", reason: "" },
+            risk_flags: ["math_parser_match"]
+          },
+          merge: {
+            status: "OK",
+            aiApplied: true,
+            impact: "math_parser_pass",
+            reason: "Denomination подтверждена через deterministic math parser"
+          },
+          reason: "Denomination подтверждена через deterministic math parser"
+        };
+        mergedStatus = "OK";
+      } else if (aiQual.needed) {
+        cache.set(item.productId, {
+          status: deterministicStatus,
+          deterministicStatus,
+          result,
+          error: null,
+          name: item.productName,
+          productType: item.productType,
+          updateUrl: item.updateUrl,
+          ai: { state: "loading", needed: true, review: null, merge: null, reason: "AI проверка выполняется..." }
+        });
+        refreshPanelRow(item.productId);
+        if (selectedProductId === item.productId) renderDetail(item.productId);
+
+        const aiPayload = buildAIRequestPayload(result, context, aiQual);
+        const aiReview = await callAIReviewService(aiPayload);
+        const merge = mergeDeterministicAndAI(deterministicStatus, result, aiReview, aiQual);
+        aiState = {
+          state: aiReview && aiReview.ok ? "done" : "error",
+          needed: true,
+          review: aiReview,
+          merge: merge,
+          reason: merge.reason || (aiReview && aiReview.reason) || ""
+        };
+        mergedStatus = merge.status || deterministicStatus;
+      }
+
+      cache.set(item.productId, {
+        status: mergedStatus,
+        deterministicStatus,
+        result,
+        error: null,
+        name: item.productName,
+        productType: item.productType,
+        updateUrl: item.updateUrl,
+        ai: aiState
+      });
+      markRow(item.tr, mergedStatus);
+    } catch (e) {
+      const msg = e.message || String(e);
+      if (msg.includes("POPUP_BLOCKED")) {
+        popupBlocked = true;
+        popupBlockerText = msg;
+      }
+      cache.set(item.productId, {
+        status: "ERROR",
+        deterministicStatus: "ERROR",
+        result: null,
+        error: msg,
+        name: item.productName,
+        productType: item.productType,
+        updateUrl: item.updateUrl,
+        ai: { state: "error", needed: false, review: null, merge: null, reason: msg }
+      });
+      markRow(item.tr, "ERROR");
+    }
+    refreshPanelRow(item.productId);
+    if (selectedProductId === item.productId) renderDetail(item.productId);
+  }
+
+  async function batchPreload(items) {
+    preloadAbort = false;
+    popupBlocked = false;
+    isFirstProduct = true;
+    let done = 0;
+    updateProgress(0, items.length);
+
+    /* STRICT SEQUENTIAL — one item at a time, no parallelism */
+    for (let i = 0; i < items.length; i++) {
+      if (preloadAbort || popupBlocked) break;
+      await preloadOne(items[i]);
+      done++;
+      updateProgress(done, items.length);
+    }
+
+    if (popupBlocked) {
+      showBlockerWarning();
+    } else {
+      /* All done — close worker window automatically */
+      closeWorkerWindow();
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     5.5 OPEN REAL CARD + AUTO-LAUNCH CARD CHECKER
+     ═══════════════════════════════════════════════════════════════ */
+
+  async function waitForProductPageReadyCard(win, timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 20000);
+    while (Date.now() < deadline) {
+      try {
+        if (win.closed) return;
+        const doc = win.document;
+        if (doc && doc.readyState !== "loading" && doc.querySelector("#product-form")) return;
+      } catch (_) {}
+      await wait(250);
+    }
+    throw new Error("Opened product page did not become ready in time");
+  }
+
+  /**
+   * Launches checker v052 directly in the opened product window.
+   * Sets up staging rules (mirroring BSV_Loader_v56 flow) before execution.
+   * Uses the same checkerCode that batch worker uses (already fetched).
+   * No dependency on BSV_v054_UNIFIED_LOADER.txt.
+   */
+  async function launchCheckerInWindow(win) {
+    const code = await loadCheckerCode();
+    /* Set up staging rules in the card window before checker runs */
+    await setupStagingRulesInWindow(win);
+    /* Suppress alert/confirm/prompt to avoid noise */
+    try { win.alert = () => {}; } catch (_) {}
+    try { win.confirm = () => false; } catch (_) {}
+    try { win.prompt = () => null; } catch (_) {}
+    /* Clean previous checker instance if any */
+    try {
+      if (win[CHECKER_NS] && typeof win[CHECKER_NS].cleanup === "function") {
+        win[CHECKER_NS].cleanup();
+      }
+      delete win[CHECKER_NS];
+    } catch (_) {}
+    /* Execute checker runtime in the card window's JS context */
+    const WinFunction = win.Function;
+    new WinFunction(code)();
+    /* Restore alert so user can see checker panel alerts if needed */
+    try {
+      const origAlert = win.__origAlert || window.alert.bind(window);
+      win.alert = origAlert;
+    } catch (_) {}
+  }
+
+  async function openProductWindowAndLaunchChecker(updateUrl) {
+    const fullUrl = /^https?:\/\//i.test(updateUrl) ? updateUrl : (BASE + updateUrl);
+    const win = window.open(fullUrl, "_blank");
+    if (!win) {
+      alert("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043E\u0442\u043A\u0440\u044B\u0442\u044C \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0443 \u0442\u043E\u0432\u0430\u0440\u0430.\n\u0411\u0440\u0430\u0443\u0437\u0435\u0440 \u0437\u0430\u0431\u043B\u043E\u043A\u0438\u0440\u043E\u0432\u0430\u043B popup.\n\n\u0420\u0430\u0437\u0440\u0435\u0448\u0438\u0442\u0435 popup \u0434\u043B\u044F \u044D\u0442\u043E\u0433\u043E \u0441\u0430\u0439\u0442\u0430 \u0438 \u043F\u043E\u043F\u0440\u043E\u0431\u0443\u0439\u0442\u0435 \u0435\u0449\u0451 \u0440\u0430\u0437.");
+      return;
+    }
+    try {
+      await waitForProductPageReadyCard(win, 20000);
+      await launchCheckerInWindow(win);
+      try { win.focus(); } catch (_) {}
+    } catch (e) {
+      alert("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438 \u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u044C checker \u0432 \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0435 \u0442\u043E\u0432\u0430\u0440\u0430:\n" + (e && e.message ? e.message : String(e)));
+    }
+  }
+
+  function handleUpdClick(ev) {
+    if (ev.defaultPrevented) return;
+    if (ev.button !== 0) return;
+    if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+    const link = ev.target && ev.target.closest ? ev.target.closest('a.upd[href*="/product/update?id="]') : null;
+    if (!link) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    openProductWindowAndLaunchChecker(link.getAttribute("href"));
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     6. LIST ROW MARKING
+     ═══════════════════════════════════════════════════════════════ */
+
+  function markRow(tr, status) {
+    if (!tr) return;
+    const c = statusColors(status);
+    tr.style.background = c.rowBg;
+    tr.style.outline = "2px solid " + c.border;
+    tr.style.outlineOffset = "-1px";
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     7. UI PANEL / MODAL
+     ═══════════════════════════════════════════════════════════════ */
+
+  let panel, panelBody, panelList, panelDetail, progressBar, progressText, blockerBox, summaryRow, collapsedWidget;
+  let listItems = [];
+  let selectedProductId = null;
+  let sortMode = "default";
+  let panelCollapsed = false;
+
+  function countByStatus(status) {
+    return [...cache.values()].filter(c => c.status === status).length;
+  }
+
+  function statusPriority(status, mode) {
+    const maps = {
+      default: { loading: 0, OK: 1, REVIEW: 2, FAIL: 3, ERROR: 4 },
+      okFirst: { OK: 0, REVIEW: 1, FAIL: 2, ERROR: 3, loading: 4 },
+      reviewFirst: { REVIEW: 0, OK: 1, FAIL: 2, ERROR: 3, loading: 4 },
+      failFirst: { FAIL: 0, REVIEW: 1, OK: 2, ERROR: 3, loading: 4 }
+    };
+    const m = maps[mode] || maps.default;
+    return Object.prototype.hasOwnProperty.call(m, status) ? m[status] : 99;
+  }
+
+  function orderedItems() {
+    if (sortMode === "default") return listItems.slice();
+    return listItems.slice().sort((a, b) => {
+      const sa = cache.get(a.productId)?.status || "loading";
+      const sb = cache.get(b.productId)?.status || "loading";
+      const pa = statusPriority(sa, sortMode);
+      const pb = statusPriority(sb, sortMode);
+      if (pa !== pb) return pa - pb;
+      return (a.subsetIndex || 0) - (b.subsetIndex || 0);
+    });
+  }
+
+  function setSortMode(mode) {
+    sortMode = mode || "default";
+    buildPanelList();
+    if (selectedProductId) selectProduct(selectedProductId);
+    updateProgress(lastProgressDone, lastProgressTotal);
+  }
+
+  function makeSummaryChip(label, mode, count, active) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = label + " " + count;
+    btn.style.cssText = "border:none;background:" + (active ? "rgba(255,255,255,.16)" : "transparent") + ";color:#e5e7eb;padding:0 4px;cursor:pointer;font:inherit;font-weight:700;";
+    btn.onclick = () => setSortMode(mode);
+    return btn;
+  }
+
+  let lastProgressDone = 0;
+  let lastProgressTotal = 0;
+
+  function renderSummaryControls(done, total) {
+    if (!summaryRow) return;
+    summaryRow.innerHTML = "";
+    const totalBtn = document.createElement("button");
+    totalBtn.type = "button";
+    totalBtn.textContent = done + " / " + total + " \u043F\u0440\u043E\u0432\u0435\u0440\u0435\u043D\u043E";
+    totalBtn.style.cssText = "border:none;background:" + (sortMode === "default" ? "rgba(255,255,255,.16)" : "transparent") + ";color:#e5e7eb;padding:0 4px;cursor:pointer;font:inherit;font-weight:700;";
+    totalBtn.onclick = () => setSortMode("default");
+    summaryRow.appendChild(totalBtn);
+
+    const pieces = [
+      ["\u2705", "okFirst", countByStatus("OK")],
+      ["\u26A0\uFE0F", "reviewFirst", countByStatus("REVIEW")],
+      ["\u274C", "failFirst", countByStatus("FAIL")]
+    ];
+    pieces.forEach(([label, mode, count]) => {
+      const sep = document.createElement("span");
+      sep.textContent = " \u00B7 ";
+      sep.style.color = "#94a3b8";
+      summaryRow.appendChild(sep);
+      summaryRow.appendChild(makeSummaryChip(label, mode, count, sortMode === mode));
+    });
+  }
+
+  function renderCollapsedWidget() {
+    if (!collapsedWidget) return;
+    const ok = countByStatus("OK");
+    const review = countByStatus("REVIEW");
+    const fail = countByStatus("FAIL");
+    collapsedWidget.innerHTML = '<div style="display:flex;align-items:center;gap:12px;padding:10px 12px;background:linear-gradient(180deg,#081733,#09142b);border:1px solid rgba(191,219,254,.16);border-radius:14px;box-shadow:0 12px 28px rgba(0,0,0,.32);">'
+      + '<div style="font-weight:800;color:#e5e7eb;white-space:nowrap;">\u2705 ' + ok + ' \u00B7 \u26A0\uFE0F ' + review + ' \u00B7 \u274C ' + fail + '</div>'
+      + '<button type="button" data-expand="1" style="border:none;background:#2563eb;color:#fff;border-radius:8px;padding:6px 12px;cursor:pointer;font-weight:700;">\u0420\u0430\u0437\u0432\u0435\u0440\u043D\u0443\u0442\u044C</button>'
+      + '</div>';
+    const btn = collapsedWidget.querySelector('[data-expand="1"]');
+    if (btn) btn.onclick = () => setCollapsed(false);
+  }
+
+  function setCollapsed(nextState) {
+    panelCollapsed = !!nextState;
+    if (panel) panel.style.display = panelCollapsed ? "none" : "flex";
+    if (collapsedWidget) collapsedWidget.style.display = panelCollapsed ? "block" : "none";
+    renderCollapsedWidget();
+  }
+
+  function buildPanel() {
+    panel = document.createElement("div");
+    panel.id = "bsv-list-review-panel";
+    panel.style.cssText = "position:fixed;top:0;right:0;bottom:0;width:620px;z-index:2147483647;background:linear-gradient(180deg,#081733,#09142b);color:#e5e7eb;font:14px/1.4 Arial,sans-serif;display:flex;flex-direction:column;box-shadow:-8px 0 32px rgba(0,0,0,.45);border-left:1px solid rgba(191,219,254,.14);";
+
+    /* Header */
+    const header = document.createElement("div");
+    header.style.cssText = "padding:12px 16px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(191,219,254,.12);flex-shrink:0;";
+    header.innerHTML = '<div style="font-weight:800;font-size:16px;color:#f8d26a;letter-spacing:.01em;">BSV List Review AI Assist <span style="font-size:11px;color:#a78bfa;font-weight:600;">popup worker v067</span></div>';
+    const headerBtns = document.createElement("div");
+    headerBtns.style.cssText = "display:flex;gap:8px;align-items:center;";
+    const collapseBtn = document.createElement("button");
+    collapseBtn.textContent = "\u0421\u0432\u0435\u0440\u043D\u0443\u0442\u044C";
+    collapseBtn.style.cssText = "border:none;background:rgba(37,99,235,.22);color:#93c5fd;border-radius:8px;padding:6px 10px;cursor:pointer;font-size:13px;font-weight:700;";
+    collapseBtn.onclick = () => setCollapsed(true);
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "\u2715";
+    closeBtn.style.cssText = "border:none;background:rgba(239,68,68,.2);color:#fca5a5;border-radius:8px;padding:6px 10px;cursor:pointer;font-size:14px;font-weight:700;";
+    closeBtn.onclick = () => { state.cleanup(); };
+    headerBtns.appendChild(collapseBtn);
+    headerBtns.appendChild(closeBtn);
+    header.appendChild(headerBtns);
+    panel.appendChild(header);
+
+    /* Progress */
+    const progressWrap = document.createElement("div");
+    progressWrap.style.cssText = "padding:8px 16px;flex-shrink:0;border-bottom:1px solid rgba(191,219,254,.08);";
+    progressBar = document.createElement("div");
+    progressBar.style.cssText = "height:6px;border-radius:3px;background:rgba(191,219,254,.12);overflow:hidden;";
+    const progressFill = document.createElement("div");
+    progressFill.style.cssText = "height:100%;width:0%;background:linear-gradient(90deg,#3b82f6,#22c55e);border-radius:3px;transition:width .3s;";
+    progressBar._fill = progressFill;
+    progressBar.appendChild(progressFill);
+    progressText = document.createElement("div");
+    progressText.style.cssText = "font-size:12px;color:#94a3b8;margin-top:4px;";
+    progressText.textContent = "\u041F\u043E\u0434\u0433\u043E\u0442\u043E\u0432\u043A\u0430...";
+    summaryRow = document.createElement("div");
+    summaryRow.style.cssText = "display:flex;align-items:center;flex-wrap:wrap;gap:2px;font-size:12px;color:#e5e7eb;margin-top:4px;";
+    progressWrap.appendChild(progressBar);
+    progressWrap.appendChild(progressText);
+    progressWrap.appendChild(summaryRow);
+    panel.appendChild(progressWrap);
+
+    /* Blocker box (hidden by default) */
+    blockerBox = document.createElement("div");
+    blockerBox.style.cssText = "display:none;padding:10px 16px;background:rgba(127,29,29,.9);border-bottom:1px solid #fca5a5;color:#fee2e2;font-size:13px;flex-shrink:0;";
+    panel.appendChild(blockerBox);
+
+    /* Split: list (top) + detail (bottom) */
+    panelBody = document.createElement("div");
+    panelBody.style.cssText = "flex:1;display:flex;flex-direction:column;overflow:hidden;";
+
+    /* Product list */
+    panelList = document.createElement("div");
+    panelList.style.cssText = "max-height:220px;overflow-y:auto;border-bottom:1px solid rgba(191,219,254,.10);flex-shrink:0;padding:6px 0;";
+
+    /* Navigation */
+    const nav = document.createElement("div");
+    nav.style.cssText = "display:flex;gap:8px;padding:8px 16px;align-items:center;border-bottom:1px solid rgba(191,219,254,.08);flex-shrink:0;";
+    const prevBtn = document.createElement("button");
+    prevBtn.textContent = "\u25C0 \u041F\u0440\u0435\u0434.";
+    prevBtn.style.cssText = "border:1px solid rgba(191,219,254,.2);background:rgba(30,64,175,.3);color:#93c5fd;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px;font-weight:600;";
+    prevBtn.onclick = () => navigateProduct(-1);
+    const nextBtn = document.createElement("button");
+    nextBtn.textContent = "\u0421\u043B\u0435\u0434. \u25B6";
+    nextBtn.style.cssText = prevBtn.style.cssText;
+    nextBtn.onclick = () => navigateProduct(1);
+    const openBtn = document.createElement("button");
+    openBtn.textContent = "\u041E\u0442\u043A\u0440\u044B\u0442\u044C \u0440\u0435\u0430\u043B\u044C\u043D\u0443\u044E \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0443";
+    openBtn.style.cssText = "border:none;background:#7c3aed;color:#fff;border-radius:8px;padding:5px 14px;cursor:pointer;font-size:13px;font-weight:700;margin-left:auto;";
+    openBtn.onclick = () => {
+      if (!selectedProductId) return;
+      const c = cache.get(selectedProductId);
+      if (c && c.updateUrl) openProductWindowAndLaunchChecker(c.updateUrl);
+    };
+    nav.appendChild(prevBtn);
+    nav.appendChild(nextBtn);
+    nav.appendChild(openBtn);
+
+    /* Detail area */
+    panelDetail = document.createElement("div");
+    panelDetail.style.cssText = "flex:1;overflow-y:auto;padding:12px 16px;";
+    panelDetail.innerHTML = '<div style="color:#94a3b8;text-align:center;padding-top:40px;">\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0442\u043E\u0432\u0430\u0440 \u0438\u0437 \u0441\u043F\u0438\u0441\u043A\u0430 \u0432\u044B\u0448\u0435</div>';
+
+    panelBody.appendChild(panelList);
+    panelBody.appendChild(nav);
+    panelBody.appendChild(panelDetail);
+    panel.appendChild(panelBody);
+    document.body.appendChild(panel);
+
+    collapsedWidget = document.createElement("div");
+    collapsedWidget.style.cssText = "display:none;position:fixed;top:16px;right:16px;z-index:2147483647;";
+    document.body.appendChild(collapsedWidget);
+  }
+
+  function updateProgress(done, total) {
+    if (!progressBar || !progressText) return;
+    lastProgressDone = done;
+    lastProgressTotal = total;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    progressBar._fill.style.width = pct + "%";
+    progressText.textContent = done + " / " + total + " \u043F\u0440\u043E\u0432\u0435\u0440\u0435\u043D\u043E";
+    renderSummaryControls(done, total);
+    renderCollapsedWidget();
+  }
+
+  function showBlockerWarning() {
+    if (!blockerBox) return;
+    blockerBox.style.display = "block";
+    blockerBox.innerHTML = "<b>\u26D4 Popup \u0437\u0430\u0431\u043B\u043E\u043A\u0438\u0440\u043E\u0432\u0430\u043D</b><br>" + esc(popupBlockerText)
+      + "<br><br><b>\u0420\u0435\u0448\u0435\u043D\u0438\u0435:</b> \u0420\u0430\u0437\u0440\u0435\u0448\u0438\u0442\u0435 popup \u0434\u043B\u044F \u044D\u0442\u043E\u0433\u043E \u0441\u0430\u0439\u0442\u0430 \u0432 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u0445 Chrome \u0438 \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u0435 \u0431\u0443\u043A\u043C\u0430\u0440\u043A\u043B\u0435\u0442.";
+    preloadAbort = true;
+  }
+
+  /* ── Panel list rows ── */
+
+  function buildPanelList() {
+    panelList.innerHTML = "";
+    orderedItems().forEach(item => {
+      const row = document.createElement("div");
+      row.dataset.pid = item.productId;
+      row.style.cssText = "display:flex;align-items:center;gap:8px;padding:5px 16px;cursor:pointer;transition:background .15s;font-size:13px;";
+      row.onmouseenter = () => { row.style.background = "rgba(191,219,254,.08)"; };
+      row.onmouseleave = () => { if (selectedProductId !== item.productId) row.style.background = ""; else row.style.background = "rgba(191,219,254,.12)"; };
+      row.onclick = () => selectProduct(item.productId);
+
+      const bdg = document.createElement("span");
+      bdg.className = "bsv-lr-badge";
+      bdg.style.cssText = "display:inline-block;width:10px;height:10px;border-radius:50%;flex-shrink:0;background:#475569;";
+      const idSpan = document.createElement("span");
+      idSpan.style.cssText = "color:#94a3b8;min-width:56px;";
+      idSpan.textContent = item.productId;
+      const nameSpan = document.createElement("span");
+      nameSpan.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e5e7eb;";
+      nameSpan.textContent = item.productName;
+
+      row.appendChild(bdg);
+      row.appendChild(idSpan);
+      row.appendChild(nameSpan);
+      panelList.appendChild(row);
+    });
+  }
+
+  function refreshPanelRow(productId) {
+    const row = panelList.querySelector('[data-pid="' + productId + '"]');
+    if (!row) return;
+    const bdg = row.querySelector(".bsv-lr-badge");
+    if (!bdg) return;
+    const c = cache.get(productId);
+    if (!c) return;
+    const sc = statusColors(c.status);
+    bdg.style.background = sc.border;
+  }
+
+  /* ── Navigation ── */
+
+  function selectProduct(productId) {
+    selectedProductId = productId;
+    panelList.querySelectorAll("[data-pid]").forEach(r => {
+      r.style.background = r.dataset.pid === productId ? "rgba(191,219,254,.12)" : "";
+    });
+    renderDetail(productId);
+    const item = listItems.find(x => x.productId === productId);
+    if (item && item.tr) item.tr.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+
+  function navigateProduct(dir) {
+    const items = orderedItems();
+    if (!items.length) return;
+    const curIdx = items.findIndex(x => x.productId === selectedProductId);
+    let next = curIdx + dir;
+    if (next < 0) next = items.length - 1;
+    if (next >= items.length) next = 0;
+    selectProduct(items[next].productId);
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     8. DETAIL RENDERER
+     ═══════════════════════════════════════════════════════════════ */
+
+  function field(label, value, tone) {
+    const colors = { ok: "#86efac", warn: "#fcd34d", err: "#fca5a5", info: "#e5e7eb" };
+    const color = colors[tone] || colors.info;
+    return '<div style="margin:3px 0;font-size:14px;line-height:1.4;color:' + color + ';"><span style="font-weight:700;color:#f8d26a;">' + esc(label) + ':</span> ' + esc(value || "\u2014") + '</div>';
+  }
+
+  function badge(text, tone) {
+    const bg   = { ok: "#0f3d2e", warn: "#4a3207", err: "#5f1d1d", info: "#172554" };
+    const fg   = { ok: "#86efac", warn: "#fcd34d", err: "#fca5a5", info: "#bfdbfe" };
+    return '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:' + (bg[tone] || bg.info) + ';color:' + (fg[tone] || fg.info) + ';font-weight:700;font-size:12px;">' + esc(text) + '</span>';
+  }
+
+  function section(title, body, tone) {
+    const borders = { ok: "rgba(34,197,94,.98)", warn: "rgba(250,204,21,.98)", err: "rgba(239,68,68,.98)", info: "rgba(191,219,254,.22)" };
+    const headerBg = {
+      ok:   "linear-gradient(90deg,rgba(34,197,94,.95),rgba(187,247,208,.9),rgba(220,252,231,.88))",
+      warn: "linear-gradient(90deg,rgba(250,204,21,.96),rgba(253,224,71,.9),rgba(254,240,138,.88))",
+      err:  "linear-gradient(90deg,rgba(239,68,68,.95),rgba(252,165,165,.9),rgba(254,202,202,.88))",
+      info: "linear-gradient(90deg,rgba(254,240,138,.88),rgba(191,219,254,.35),rgba(165,243,252,.28))"
+    };
+    return '<div style="margin-bottom:10px;border:2px solid ' + (borders[tone] || borders.info)
+      + ';border-radius:14px;overflow:hidden;background:linear-gradient(180deg,rgba(10,25,58,.96),rgba(8,18,44,.95));box-shadow:inset 0 1px 0 rgba(255,255,255,.03),0 10px 24px rgba(0,0,0,.18);">'
+      + '<div style="padding:8px 12px;background:' + (headerBg[tone] || headerBg.info) + ';color:#101828;font-size:15px;font-weight:800;">' + esc(title) + '</div>'
+      + '<div style="padding:10px 12px;">' + body + '</div></div>';
+  }
+
+  function detailsBlock(title, lines) {
+    if (!lines || !lines.length) return "";
+    return '<details style="margin:6px 0;border-radius:10px;background:rgba(11,36,71,.7);border:1px solid rgba(191,219,254,.12);overflow:hidden;">'
+      + '<summary style="cursor:pointer;list-style:none;padding:8px 12px;color:#e5e7eb;font-weight:700;font-size:13px;">' + esc(title) + '</summary>'
+      + '<div style="padding:0 12px 10px 12px;">' + lines.map(x => '<div style="font-size:12px;line-height:1.4;color:#cbd5e1;margin:3px 0;">\u2022 ' + esc(x) + '</div>').join("") + '</div></details>';
+  }
+
+  function toneFromResult(result) {
+    if (result === "ok" || result === "passed") return "ok";
+    if (result === "change required" || result === "error" || result === "failed" || result === "denied") return "err";
+    return "warn";
+  }
+
+
+  function aiTone(aiState) {
+    if (!aiState || !aiState.needed) return "info";
+    if (aiState.state === "loading") return "info";
+    if (aiState.state === "error") return "err";
+    if (aiState.merge && aiState.merge.status === "FAIL") return "err";
+    if (aiState.merge && aiState.merge.status === "REVIEW") return "warn";
+    if (aiState.merge && aiState.merge.status === "OK") return "ok";
+    return "info";
+  }
+
+  function buildAiSectionBody(c, productId) {
+    const ai = (c && c.ai) || { state: "idle", needed: false, review: null, merge: null, reason: "" };
+    const corr = correspondenceTextByProductId.get(productId) || "";
+    let body = "";
+
+    if (!ai.needed) {
+      body += field("Статус", "AI проверка не требуется (детерминированный результат)", "info");
+    } else if (ai.state === "loading") {
+      body += field("Статус", "AI проверка выполняется...", "info");
+    } else if (ai.state === "error") {
+      body += field("Статус", ai.reason || "AI ошибка", "err");
+    } else {
+      const review = ai.review || {};
+      body += field("AI verdict", review.verdict || "review", aiTone(ai));
+      body += field("Confidence", String(review.confidence != null ? review.confidence : 0), aiTone(ai));
+      body += field("Reason", review.reason || ai.reason || "—", aiTone(ai));
+      if (review.denomination_ai) {
+        body += field("Denomination AI", (review.denomination_ai.status || "uncertain") + (review.denomination_ai.matched_option ? " -> " + review.denomination_ai.matched_option : ""), aiTone(ai));
+      }
+      if (review.description_match) {
+        body += field("Description match", review.description_match.status || "uncertain", aiTone(ai));
+      }
+      if (review.contact_policy) {
+        body += field("Contact policy", review.contact_policy.status || "uncertain", aiTone(ai));
+      }
+      if (Array.isArray(review.risk_flags) && review.risk_flags.length) {
+        body += field("Risk flags", review.risk_flags.join(", "), aiTone(ai));
+      }
+      if (ai.merge) {
+        body += field("Merged status", statusLabel(ai.merge.status || c.status), aiTone(ai));
+      }
+    }
+
+    body += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(191,219,254,.12);">'
+      + '<div style="font-size:12px;color:#cbd5e1;font-weight:700;margin-bottom:6px;">Correspondence text (optional)</div>'
+      + '<textarea data-ai-corr="1" style="width:100%;min-height:80px;box-sizing:border-box;border-radius:8px;border:1px solid rgba(191,219,254,.18);background:rgba(11,36,71,.55);color:#e5e7eb;padding:8px;font:13px/1.4 Arial,sans-serif;resize:vertical;">' + esc(corr) + '</textarea>'
+      + '<div style="display:flex;gap:8px;margin-top:8px;justify-content:flex-end;">'
+      + '<button type="button" data-ai-save="1" style="border:none;background:#475569;color:#fff;border-radius:8px;padding:6px 12px;cursor:pointer;font-weight:700;">Сохранить текст</button>'
+      + '<button type="button" data-ai-run="1" style="border:none;background:#7c3aed;color:#fff;border-radius:8px;padding:6px 12px;cursor:pointer;font-weight:700;">Run AI review</button>'
+      + '</div></div>';
+
+    return body;
+  }
+
+  async function rerunAIForProduct(productId) {
+    const c = cache.get(productId);
+    if (!c || !c.result) return;
+    const context = {
+      productId: productId,
+      name: c.name || (c.result.heuristic ? String(c.result.heuristic.name || "") : ""),
+      description: c.result.heuristic ? String(c.result.heuristic.description || "") : "",
+      correspondenceText: correspondenceTextByProductId.get(productId) || ""
+    };
+    const deterministicStatus = c.deterministicStatus || deriveOverall(c.result);
+    const aiQual = qualifiesForAI(c.result, context);
+
+    if (!aiQual.needed) {
+      c.ai = { state: "idle", needed: false, review: null, merge: null, reason: "AI проверка не требуется (детерминированный результат)" };
+      c.status = deterministicStatus;
+      cache.set(productId, c);
+      refreshPanelRow(productId);
+      updateProgress(lastProgressDone, lastProgressTotal);
+      renderDetail(productId);
+      return;
+    }
+
+    c.ai = { state: "loading", needed: true, review: null, merge: null, reason: "AI проверка выполняется..." };
+    c.status = deterministicStatus;
+    cache.set(productId, c);
+    refreshPanelRow(productId);
+    renderDetail(productId);
+
+    let mergedStatus = deterministicStatus;
+    let aiState = c.ai;
+
+    if (aiQual.mathMatch && aiQual.mathMatch.matched && onlyDenominationUnresolved(c.result)) {
+      aiState = {
+        state: "done",
+        needed: true,
+        review: {
+          ok: true,
+          verdict: "approve",
+          confidence: 100,
+          reason: "Deterministic denomination math parser matched allowed option.",
+          denomination_ai: { status: "match", matched_option: aiQual.mathMatch.matched_option, reason: "math_parser" },
+          description_match: { status: "uncertain", reason: "" },
+          contact_policy: { status: "clean", reason: "" },
+          risk_flags: ["math_parser_match"]
+        },
+        merge: {
+          status: "OK",
+          aiApplied: true,
+          impact: "math_parser_pass",
+          reason: "Denomination подтверждена через deterministic math parser"
+        },
+        reason: "Denomination подтверждена через deterministic math parser"
+      };
+      mergedStatus = "OK";
+    } else {
+      const aiPayload = buildAIRequestPayload(c.result, context, aiQual);
+      const aiReview = await callAIReviewService(aiPayload);
+      const merge = mergeDeterministicAndAI(deterministicStatus, c.result, aiReview, aiQual);
+      aiState = {
+        state: aiReview && aiReview.ok ? "done" : "error",
+        needed: true,
+        review: aiReview,
+        merge: merge,
+        reason: merge.reason || (aiReview && aiReview.reason) || ""
+      };
+      mergedStatus = merge.status || deterministicStatus;
+    }
+
+    c.ai = aiState;
+    c.status = mergedStatus;
+    cache.set(productId, c);
+    refreshPanelRow(productId);
+    updateProgress(lastProgressDone, lastProgressTotal);
+    renderDetail(productId);
+  }
+
+  function wireAiControls(productId) {
+    if (!panelDetail) return;
+    const ta = panelDetail.querySelector("[data-ai-corr='1']");
+    const saveBtn = panelDetail.querySelector("[data-ai-save='1']");
+    const runBtn = panelDetail.querySelector("[data-ai-run='1']");
+    if (saveBtn && ta) {
+      saveBtn.onclick = () => {
+        correspondenceTextByProductId.set(productId, ta.value || "");
+        saveBtn.textContent = "Сохранено";
+        setTimeout(() => { try { saveBtn.textContent = "Сохранить текст"; } catch (_) {} }, 1200);
+      };
+    }
+    if (runBtn && ta) {
+      runBtn.onclick = async () => {
+        correspondenceTextByProductId.set(productId, ta.value || "");
+        const old = runBtn.textContent;
+        runBtn.disabled = true;
+        runBtn.textContent = "Запуск...";
+        try {
+          await rerunAIForProduct(productId);
+        } finally {
+          try { runBtn.disabled = false; runBtn.textContent = old; } catch (_) {}
+        }
+      };
+    }
+  }
+
+  function renderDetail(productId) {
+    if (!panelDetail) return;
+    const c = cache.get(productId);
+    if (!c) {
+      panelDetail.innerHTML = '<div style="color:#94a3b8;text-align:center;padding-top:40px;">\u0422\u043E\u0432\u0430\u0440 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D</div>';
+      return;
+    }
+    if (c.status === "loading") {
+      panelDetail.innerHTML = '<div style="color:#93c5fd;text-align:center;padding-top:40px;">\u23F3 \u0417\u0430\u0433\u0440\u0443\u0437\u043A\u0430 \u0438 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0430...</div>';
+      return;
+    }
+    if (c.status === "ERROR") {
+      panelDetail.innerHTML = section("\u041E\u0448\u0438\u0431\u043A\u0430", field("Product ID", productId) + field("\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435", c.name) + field("\u041E\u0448\u0438\u0431\u043A\u0430", c.error, "err"), "err");
+      return;
+    }
+
+    const r = c.result;
+    if (!r || !r.final) {
+      panelDetail.innerHTML = section("\u041D\u0435\u0442 \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442\u0430", field("Product ID", productId) + field("\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435", c.name) + field("\u0421\u0442\u0430\u0442\u0443\u0441", "\u0420\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0438 \u043E\u0442\u0441\u0443\u0442\u0441\u0442\u0432\u0443\u0435\u0442", "warn"), "warn");
+      return;
+    }
+
+    const overall = c.status;
+    const oTone = overall === "OK" ? "ok" : overall === "REVIEW" ? "warn" : "err";
+    const pTone = toneFromResult(r.final.product ? r.final.product.result : "");
+    const rTone = toneFromResult(r.final.region ? r.final.region.result : "");
+    const dTone = toneFromResult(r.final.denomination ? r.final.denomination.result : "");
+
+    let html = "";
+
+    html += section("1. \u0418\u0442\u043E\u0433\u043E\u0432\u044B\u0439 \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442",
+      field("Product ID", productId)
+      + field("\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435", c.name)
+      + field("\u0414\u0435\u0442\u0435\u0440\u043C\u0438\u043D\u0438\u0441\u0442\u0438\u0447\u0435\u0441\u043A\u0438\u0439 \u0441\u0442\u0430\u0442\u0443\u0441", statusLabel(c.deterministicStatus || deriveOverall(r)), toneFromResult((c.deterministicStatus || deriveOverall(r)) === "OK" ? "ok" : (c.deterministicStatus || deriveOverall(r)) === "FAIL" ? "failed" : "manual review"))
+      + field("\u0418\u0442\u043E\u0433\u043E\u0432\u044B\u0439 merged \u0441\u0442\u0430\u0442\u0443\u0441", statusLabel(overall), oTone)
+      + field("\u0413\u043B\u0430\u0432\u043D\u0430\u044F \u043F\u0440\u0438\u0447\u0438\u043D\u0430", mainReason(r), oTone)
+      + field("\u041D\u0435\u043E\u0431\u0445\u043E\u0434\u0438\u043C\u043E", actionNeeded(r), oTone)
+      + field("Blocking module", blockingModule(r))
+    , oTone);
+
+    html += section("AI Assist V2", buildAiSectionBody(c, productId), aiTone(c.ai));
+
+    if (r.final.manualReviewWords) {
+      const mrw = r.final.manualReviewWords;
+      const mTone = mrw.result === "manual review" ? "warn" : mrw.result === "ok" ? "ok" : "info";
+      const matchesText = (mrw.matches || []).map(function(x) {
+        return x.pattern + ((x.matched_in && x.matched_in.length) ? " [" + x.matched_in.join(", ") + "]" : "");
+      }).join(" | ") || "\u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E";
+      html += section("2. Manual Review Words",
+        badge(mrw.result || "\u2014", mTone)
+        + field("\u0421\u0442\u0430\u0442\u0443\u0441", mrw.text || "\u2014", mTone)
+        + field("\u0418\u0441\u0442\u043E\u0447\u043D\u0438\u043A", mrw.source || "manual_review_words")
+        + field("\u0421\u043E\u0432\u043F\u0430\u0434\u0435\u043D\u0438\u044F", matchesText, mTone)
+      , mTone);
+    }
+
+    html += section("3. ProductType",
+      badge(r.final.product ? r.final.product.result : "\u2014", pTone)
+      + field("\u0422\u0435\u043A\u0443\u0449\u0438\u0439", c.productType || (r.heuristic ? r.heuristic.currentTypeText : "\u2014"))
+      + field("\u0420\u0435\u043A\u043E\u043C\u0435\u043D\u0434\u043E\u0432\u0430\u043D\u043D\u044B\u0439", r.final.product ? r.final.product.recommended : "\u2014")
+      + field("\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435", r.final.product ? r.final.product.text : "\u2014", pTone)
+      + field("\u0418\u0441\u0442\u043E\u0447\u043D\u0438\u043A", r.final.product ? r.final.product.source : "\u2014")
+    , pTone);
+
+    const regionBody = badge(r.final.region ? r.final.region.result : "\u2014", rTone)
+      + field("\u0422\u0435\u043A\u0443\u0449\u0438\u0439", r.heuristic && r.heuristic.currentRegions ? r.heuristic.currentRegions.map(x => x.name).join(", ") : "\u2014")
+      + field("\u0420\u0435\u043A\u043E\u043C\u0435\u043D\u0434\u043E\u0432\u0430\u043D\u043D\u044B\u0439", r.final.region ? r.final.region.recommended : "\u2014")
+      + field("\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435", r.final.region ? r.final.region.text : "\u2014", rTone)
+      + field("\u0418\u0441\u0442\u043E\u0447\u043D\u0438\u043A", r.final.region ? r.final.region.source : "\u2014");
+    const denomBody = badge(r.final.denomination ? r.final.denomination.result : "\u2014", dTone)
+      + field("\u0422\u0435\u043A\u0443\u0449\u0438\u0439", r.heuristic && r.heuristic.denom && r.heuristic.denom.currentOpt ? r.heuristic.denom.currentOpt.text : "\u2014")
+      + field("\u0420\u0435\u0436\u0438\u043C", r.final.denomination ? r.final.denomination.mode : "\u2014")
+      + field("\u0420\u0435\u043A\u043E\u043C\u0435\u043D\u0434\u043E\u0432\u0430\u043D\u043D\u044B\u0439", r.final.denomination ? r.final.denomination.recommended : "\u2014")
+      + field("\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435", r.final.denomination ? r.final.denomination.text : "\u2014", dTone)
+      + field("\u0418\u0441\u0442\u043E\u0447\u043D\u0438\u043A", r.final.denomination ? r.final.denomination.source : "\u2014");
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">'
+      + section("4. \u0420\u0435\u0433\u0438\u043E\u043D", regionBody, rTone)
+      + section("5. Denomination", denomBody, dTone)
+      + '</div>';
+
+    let diag = "";
+    if (r.heuristic && r.heuristic.log) {
+      if (r.heuristic.log.product) diag += detailsBlock("\u042D\u0432\u0440\u0438\u0441\u0442\u0438\u043A\u0430 ProductType", r.heuristic.log.product);
+      if (r.heuristic.log.region) diag += detailsBlock("\u042D\u0432\u0440\u0438\u0441\u0442\u0438\u043A\u0430 Region", r.heuristic.log.region);
+      if (r.heuristic.log.denomination) diag += detailsBlock("\u042D\u0432\u0440\u0438\u0441\u0442\u0438\u043A\u0430 Denomination", r.heuristic.log.denomination);
+    }
+    if (r.catalogue && !r.catalogue.error) {
+      if (r.catalogue.activeCatalogue && r.catalogue.activeCatalogue.log)
+        diag += detailsBlock("\u0410\u043A\u0442\u0438\u0432\u043D\u044B\u0439 \u043A\u0430\u0442\u0430\u043B\u043E\u0433", r.catalogue.activeCatalogue.log);
+      if (r.catalogue.productDecision && r.catalogue.productDecision.log)
+        diag += detailsBlock("Catalogue ProductType", r.catalogue.productDecision.log);
+      if (r.catalogue.regionDecision && r.catalogue.regionDecision.log)
+        diag += detailsBlock("Catalogue Region", r.catalogue.regionDecision.log);
+      if (r.catalogue.denominationDecision && r.catalogue.denominationDecision.log)
+        diag += detailsBlock("Catalogue Denomination", r.catalogue.denominationDecision.log);
+      if (r.catalogue.meta)
+        diag += field("\u0412\u0435\u0440\u0441\u0438\u044F catalogue rules", r.catalogue.meta.rules_version || "unknown");
+    } else if (r.catalogue && r.catalogue.error) {
+      diag += field("Catalogue fallback", "Unavailable: " + r.catalogue.error, "warn");
+    }
+    if (r.manualReviewWords && r.manualReviewWords.log)
+      diag += detailsBlock("Manual Review Words", r.manualReviewWords.log);
+    if (c.ai && c.ai.review && c.ai.review.ok) {
+      diag += detailsBlock("AI Assist V2", [
+        "AI verdict: " + String(c.ai.review.verdict || "review"),
+        "Confidence: " + String(c.ai.review.confidence != null ? c.ai.review.confidence : 0),
+        "Reason: " + String(c.ai.review.reason || ""),
+        "Impact: " + String(c.ai.merge && c.ai.merge.impact || "none")
+      ]);
+    } else if (c.ai && c.ai.state === "error") {
+      diag += detailsBlock("AI Assist V2", [String(c.ai.reason || "AI error")]);
+    }
+    if (diag) html += section("6. \u0414\u0438\u0430\u0433\u043D\u043E\u0441\u0442\u0438\u043A\u0430", diag, "info");
+
+    panelDetail.innerHTML = html;
+    wireAiControls(productId);
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     9. STATE & CLEANUP
+     ═══════════════════════════════════════════════════════════════ */
+
+  const state = {
+    cleanup() {
+      preloadAbort = true;
+      closeWorkerWindow();
+      if (panel) { try { panel.remove(); } catch (_) {} panel = null; }
+      if (collapsedWidget) { try { collapsedWidget.remove(); } catch (_) {} collapsedWidget = null; }
+      try { document.removeEventListener("click", handleUpdClick, true); } catch (_) {}
+      listItems.forEach(item => {
+        if (item.tr) {
+          item.tr.style.background = "";
+          item.tr.style.outline = "";
+          item.tr.style.outlineOffset = "";
+        }
+      });
+      if (window[NS] === state) delete window[NS];
+    }
+  };
+
+  window[NS] = state;
+
+  /* ═══════════════════════════════════════════════════════════════
+     10. INIT
+     ═══════════════════════════════════════════════════════════════ */
+
+  const allUnderReview = scanUnderReviewRows();
+
+  if (!allUnderReview.length) {
+    alert("BSV List Review AI Assist: \u043D\u0430 \u0442\u0435\u043A\u0443\u0449\u0435\u0439 \u0441\u0442\u0440\u0430\u043D\u0438\u0446\u0435 \u043D\u0435\u0442 \u0442\u043E\u0432\u0430\u0440\u043E\u0432 \u0441\u043E \u0441\u0442\u0430\u0442\u0443\u0441\u043E\u043C Under Review.");
+    delete window[NS];
+    return;
+  }
+
+  const chosenCount = await showStartupModal(allUnderReview.length);
+  if (!chosenCount || chosenCount <= 0) {
+    delete window[NS];
+    return;
+  }
+
+  listItems = allUnderReview.slice(0, chosenCount).map((item, idx) => ({ ...item, subsetIndex: idx }));
+
+  buildPanel();
+  buildPanelList();
+
+  /* Setup UPD link interceptor */
+  document.addEventListener("click", handleUpdClick, true);
+
+  try {
+    await loadCheckerCode();
+  } catch (e) {
+    if (progressText) progressText.textContent = "\u274C \u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044C checker runtime: " + (e.message || e);
+    return;
+  }
+
+  selectProduct(listItems[0].productId);
+  await batchPreload(listItems);
+
+})();
