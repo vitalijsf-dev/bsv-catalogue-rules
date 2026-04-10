@@ -1,0 +1,1270 @@
+(async () => {
+'use strict';
+
+/* ═══════════════════════════════════════════════════════════════
+   BSV List Check WIP-01 Runtime — Stage 1
+   Feature : Проверка списка — Under Review mode only
+   Engine  : AI Core v1 Apps Script backend (postmessage transport)
+   Branch  : LIST-CHECK-WIP-01  (separate from LIST-STABLE-01)
+   Created : 2026-04-10 (MSG33)
+   DOM ref : 40_HTTP_PAGE_REFERENCES/HTTP_product_admin_*
+             40_HTTP_PAGE_REFERENCES/HTTP_product_update_id_153621_*
+   Stable fallback: BSV_v063_LIST_REVIEW_V3_RUNTIME.txt — UNTOUCHED
+   ═══════════════════════════════════════════════════════════════
+   Stage 1 scope:
+     ✓ Under Review rows on current list page only
+     ✓ AI Core v1 backend scan (postmessage iframe transport)
+     ✓ Green / Yellow / Red verdicts + manual override
+     ✓ Apply recommendations (ProductType + Denomination via DOM; regions: manual flag)
+     ✓ Approve/Save as explicit step
+     ✓ Apply Mod Status (config-driven rule table)
+     ✓ Export → clipboard TSV  [Apps Script→Sheets: backend gap, see EXPORT_CONFIG]
+     ✗ Published mode (Stage 2)
+     ✗ Multi-page crawl
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── CONSTANTS ────────────────────────────────────────────────── */
+const NS              = '__BSV_LIST_CHECK_WIP_01__';
+const BACKEND_URL     = 'https://script.google.com/a/macros/buysellvouchers.com/s/AKfycbyd1_1TJ0-VT91nNtckB-PKnyVXaTEvitwu1B7lN7u7ZMQuPeUio3OamINAtxUC4BIv/exec';
+const POSTMESSAGE_SRC = 'AI_CORE_V1_MONOLITH';
+const BACKEND_TIMEOUT = 50000;   /* ms — Apps Script can be slow on cold start */
+const PAGE_LOAD_MS    = 25000;
+const NAV_TIMEOUT_MS  = 10000;
+const POLL_MS         = 300;
+const BASE            = location.origin;
+
+/* ── CONFIG: COLOR → MOD STATUS ──────────────────────────────────
+   Config-driven. W2 safe defaults for Stage 1.
+   red → no_change + _blocked until rejectionReasonId is configured.
+   To enable red auto-reject: set modStatus:'rejected', requiresRejectionReason:true,
+   rejectionReasonId: <number 1-42 from #rejection-reason>, rejectionNote:'...'.        */
+const MOD_STATUS_RULES = [
+  {
+    color:                   'green',
+    modStatus:               'published',
+    requiresRejectionReason: false,
+    rejectionReasonId:       null,
+    rejectionNote:           '',
+    _blocked:                false,
+  },
+  {
+    color:                   'yellow',
+    modStatus:               'under_review',
+    requiresRejectionReason: false,
+    rejectionReasonId:       null,
+    rejectionNote:           '',
+    _blocked:                false,
+  },
+  {
+    color:                   'red',
+    modStatus:               'no_change',
+    requiresRejectionReason: false,
+    rejectionReasonId:       null,
+    rejectionNote:           '',
+    _blocked:                true,
+    _blockedReason:          'rejectionReasonId not configured — red cards cannot be auto-rejected in Stage 1. Configure MOD_STATUS_RULES[2] to enable.',
+  },
+];
+
+/* ── CONFIG: EXPORT DESTINATION ──────────────────────────────────
+   BACKEND GAP: Apps Script export endpoint does not exist in v15.gs.
+   Stage 1 interim: clipboard TSV.
+   To enable apps_script export: create v16.gs with writeExportRows() action,
+   set primary:'apps_script', set backendGap:false.                                     */
+const EXPORT_CONFIG = {
+  primary:    'clipboard',           /* 'clipboard' | 'apps_script' (requires v16.gs)   */
+  exportTab:  'LIST_CHECK_EXPORT',   /* target tab name (future use)                    */
+  batchesTab: 'LIST_CHECK_BATCHES',  /* batch log tab (future use)                      */
+  backendGap: true,                  /* true = show backend gap warning on export        */
+};
+
+/* ── GUARD: must be on list page ─────────────────────────────── */
+if (!document.querySelector('table.items')) {
+  alert('BSV List Check WIP-01:\nОткройте страницу списка товаров (/xdm/product/admin).');
+  return;
+}
+
+/* ── SINGLETON CLEANUP ───────────────────────────────────────── */
+if (window[NS] && typeof window[NS].cleanup === 'function') {
+  try { window[NS].cleanup(); } catch (_) {}
+}
+delete window[NS];
+
+/* ── RUNTIME STATE ───────────────────────────────────────────── */
+const _s = {
+  workerWin:       null,
+  navSeq:          0,
+  aborted:         false,
+  isFirstCard:     true,
+  msgHandlers:     new Map(),   /* reqId → handler fn */
+  overlay:         null,
+  session:         null,
+  uiFilter:        'all',
+  uiSelectedIds:   new Set(),
+  uiExpandedId:    null,
+  onStartScan:     null,        /* set by main(), called by startup button */
+};
+
+window[NS] = {
+  cleanup() {
+    _s.aborted = true;
+    if (_s.workerWin && !_s.workerWin.closed) {
+      try { _s.workerWin.close(); } catch (_) {}
+    }
+    _s.workerWin = null;
+    _s.msgHandlers.forEach(fn => window.removeEventListener('message', fn));
+    _s.msgHandlers.clear();
+    if (_s.overlay) { try { _s.overlay.remove(); } catch (_) {} _s.overlay = null; }
+    delete window[NS];
+  },
+};
+
+/* ── UTILITIES ───────────────────────────────────────────────── */
+const wait   = ms => new Promise(r => setTimeout(r, ms));
+const norm   = v  => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+const esc    = s  => String(s ?? '').replace(/[&<>"]/g,
+                       m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]));
+const isoNow = () => new Date().toISOString();
+
+/* ── DATA MODEL ──────────────────────────────────────────────── */
+function makeSnap() {
+  return {
+    productTypeId: null, productTypeName: null,
+    regions: [],         /* [{id, name, geoKeyword}] */
+    denominationOptionId: null, denominationLabel: null,
+    name: '', description: '',
+    capturedAt: null,
+  };
+}
+
+function makeCardResult(productId, productName, productType, updateUrl) {
+  const card = {
+    productId, productName, productType, updateUrl,
+    /* AI result */
+    aiVerdict: null, aiConfidence: null, aiReason: '', aiRaw: null,
+    recommendations: null,
+    /* Operator */
+    operatorOverride: null,
+    /* Before/After */
+    beforeSnapshot: null, afterSnapshot: null,
+    /* State flags */
+    applied: false, saved: false,
+    manuallyConfirmed: false,   /* Stage 1.2: operator confirmed manual fixes in popup */
+    modStatusApplied: false, modStatusNew: null,
+    /* Errors */
+    scanError: null, applyError: null, saveError: null,
+  };
+  Object.defineProperty(card, 'finalColor', {
+    get() { return this.operatorOverride || this.aiVerdict || 'error'; },
+    enumerable: true,
+  });
+  return card;
+}
+
+function makeBatchSession(totalFound) {
+  const pageParam = (location.search.match(/[?&]Product_page=(\d+)/) || [])[1];
+  return {
+    sessionId:  String(Date.now()),
+    mode:       'under_review',
+    pageUrl:    location.href,
+    pageNumber: pageParam ? parseInt(pageParam, 10) : 1,
+    scannedAt:  isoNow(),
+    cards:      [],
+    summary:    { totalFound, processed: 0, green: 0, yellow: 0, red: 0, errors: 0 },
+  };
+}
+
+/* ── SAFETY GATES (Stage 1.1 + 1.2 patch) ───────────────────── */
+/* Blocking applyError patterns — these indicate unresolved manual steps.
+   Card with any of these MUST NOT be batch-saved without operator resolution.
+   Stage 1.2: manuallyConfirmed=true clears blocking issues after operator
+   explicitly confirms manual fixes via "Подтвердить ручные правки" action. */
+const BLOCKING_APPLY_PATTERNS = ['REGION_MANUAL', 'PT_NO_MATCH', 'DENOM_NO_MATCH'];
+
+function getCardBlockingIssues(card) {
+  const issues = [];
+  if (!card.applied) { issues.push('not_applied'); return issues; }
+  if (card.saved)    return [];   /* already saved — no blockers */
+  if (card.manuallyConfirmed) return [];   /* Stage 1.2: operator confirmed manual fixes */
+  if (card.applyError) {
+    for (const pat of BLOCKING_APPLY_PATTERNS) {
+      if (card.applyError.includes(pat)) issues.push(pat);
+    }
+  }
+  return issues;
+}
+
+function isCardSaveReady(card) {
+  return card.applied && !card.saved && getCardBlockingIssues(card).length === 0;
+}
+
+function getModStatusBlockingReason(card) {
+  /* green: mod status allowed without save (no field changes expected) */
+  if (card.finalColor === 'green') return null;
+  /* red: existing _blocked logic in MOD_STATUS_RULES handles this */
+  if (card.finalColor === 'red') return null;
+  /* yellow: must be saved before mod status can be applied */
+  if (card.finalColor === 'yellow') {
+    if (card.applied && !card.saved) return 'yellow_unsaved';
+    if (!card.applied) return 'yellow_not_applied';
+  }
+  /* error: no mod status action */
+  if (card.finalColor === 'error') return 'error_card';
+  return null;
+}
+
+function isCardModStatusReady(card) {
+  const rule = getModStatusRule(card.finalColor);
+  if (!rule || rule._blocked || rule.modStatus === 'no_change') return false;
+  return getModStatusBlockingReason(card) === null;
+}
+
+/* ── LIST PAGE SCANNER ───────────────────────────────────────── */
+function scanUnderReviewRows() {
+  return [...document.querySelectorAll('table.items tr.odd, table.items tr.even')]
+    .map(tr => {
+      const tds = tr.querySelectorAll('td');
+      if (tds.length < 3) return null;
+      const modSel = tr.querySelector('select.mod-status-dropdown');
+      if (!modSel || modSel.value !== 'under_review') return null;
+      const updLink = tr.querySelector('a.upd[href*="/product/update?id="]');
+      if (!updLink) return null;
+      const productId   = norm(tds[0].textContent);
+      const productName = norm(tds[1].textContent);
+      const productType = norm(tds[2].textContent);
+      const updateUrl   = updLink.getAttribute('href');
+      if (!productId || !/^\d+$/.test(productId)) return null;
+      return { tr, productId, productName, productType, updateUrl };
+    })
+    .filter(Boolean);
+}
+
+/* ── POPUP MANAGER ───────────────────────────────────────────── */
+function openWorkerWindow(url) {
+  if (_s.workerWin && !_s.workerWin.closed) {
+    try { _s.workerWin.close(); } catch (_) {}
+  }
+  const w = window.open(url, '__bsv_wip01_worker__',
+    'width=1100,height=760,left=80,top=80,scrollbars=yes,resizable=yes');
+  if (!w) throw new Error(
+    'POPUP_BLOCKED: Браузер заблокировал popup-окно.\n' +
+    'Разрешите popup для этого сайта и перезапустите.'
+  );
+  _s.workerWin = w;
+  return w;
+}
+
+async function navigateWorkerWindow(win, url) {
+  const seq = ++_s.navSeq;
+  try { win.__bsv_nav_seq__ = seq; } catch (_) {}
+  win.location.href = url;
+  const deadline = Date.now() + NAV_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (win.closed) throw new Error('WORKER_CLOSED: Popup закрыт во время навигации');
+    try { if (win.__bsv_nav_seq__ !== seq) break; } catch (_) { break; }
+    await wait(100);
+  }
+  await wait(200);
+}
+
+async function waitForWorkerReady(win, ms) {
+  const deadline = Date.now() + (ms || PAGE_LOAD_MS);
+  while (Date.now() < deadline) {
+    if (win.closed) throw new Error('WORKER_CLOSED: Popup закрыт во время ожидания страницы');
+    try {
+      const doc = win.document;
+      if (doc && doc.readyState !== 'loading' && doc.querySelector('#product-form')) return;
+    } catch (_) {}
+    await wait(POLL_MS);
+  }
+  throw new Error('WORKER_PAGE_TIMEOUT: Страница не загрузилась за ' +
+    Math.round((ms || PAGE_LOAD_MS) / 1000) + 'с');
+}
+
+async function ensureWorkerAtUrl(url) {
+  const fullUrl = /^https?:\/\//i.test(url) ? url : (BASE + url);
+  if (_s.isFirstCard || !_s.workerWin || _s.workerWin.closed) {
+    openWorkerWindow(fullUrl);
+    _s.isFirstCard = false;
+  } else {
+    await navigateWorkerWindow(_s.workerWin, fullUrl);
+  }
+  await waitForWorkerReady(_s.workerWin, PAGE_LOAD_MS);
+  return _s.workerWin;
+}
+
+/* ── SNAPSHOT READER ─────────────────────────────────────────── */
+function readSnapshotFromPopup(win) {
+  try {
+    const doc   = win.document;
+    const typeEl  = doc.getElementById('Product_product_type_id');
+    const denomEl = doc.getElementById('denomination-select');
+    const nameEl  = doc.getElementById('Product_name');
+    const descEl  = doc.getElementById('Product_description');
+    const snap  = makeSnap();
+    snap.capturedAt      = isoNow();
+    snap.productTypeId   = typeEl  ? typeEl.value  : null;
+    snap.productTypeName = (typeEl && typeEl.selectedOptions && typeEl.selectedOptions[0])
+      ? norm(typeEl.selectedOptions[0].textContent) : null;
+    snap.regions = [...doc.querySelectorAll('#region-container .region-item')]
+      .map(el => ({
+        id:         parseInt(el.dataset.id, 10) || 0,
+        name:       norm((el.querySelector('.region-name') || {}).textContent || ''),
+        geoKeyword: el.dataset.geoKeyword || '',
+      })).filter(r => r.id);
+    snap.denominationOptionId = denomEl ? denomEl.value : null;
+    snap.denominationLabel    = (denomEl && denomEl.selectedOptions && denomEl.selectedOptions[0])
+      ? norm(denomEl.selectedOptions[0].textContent) : null;
+    snap.name        = nameEl ? norm(nameEl.value)          : '';
+    snap.description = descEl ? String(descEl.value || '').trim() : '';
+    return snap;
+  } catch (e) {
+    return null;
+  }
+}
+
+/* ── BACKEND CALLER (postmessage iframe transport) ───────────── */
+function callBackend(payload) {
+  return new Promise(resolve => {
+    const reqId  = 'wip01_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    const iframe = document.createElement('iframe');
+    const form   = document.createElement('form');
+    iframe.name       = 'wip01_f_' + reqId;
+    iframe.style.display = 'none';
+    form.method       = 'POST';
+    form.action       = BACKEND_URL;
+    form.target       = iframe.name;
+    form.style.display = 'none';
+
+    const addInput = (n, v) => {
+      const i = document.createElement('input');
+      i.type = 'hidden'; i.name = n;
+      i.value = (v == null) ? '' : String(v);
+      form.appendChild(i);
+    };
+    addInput('transport',         'postmessage');
+    addInput('client_request_id', reqId);
+    addInput('payload_json',      JSON.stringify(payload || {}));
+
+    let settled = false;
+    const tId = setTimeout(() => {
+      if (settled) return;
+      settled = true; cleanup();
+      resolve({ ok: false, final_status: 'review', reason: 'AI Core timeout (50s)', _timeout: true });
+    }, BACKEND_TIMEOUT);
+
+    function cleanup() {
+      const fn = _s.msgHandlers.get(reqId);
+      if (fn) { window.removeEventListener('message', fn); _s.msgHandlers.delete(reqId); }
+      clearTimeout(tId);
+      setTimeout(() => {
+        try { form.remove();   } catch (_) {}
+        try { iframe.remove(); } catch (_) {}
+      }, 600);
+    }
+
+    const handler = ev => {
+      const d = ev && ev.data;
+      if (!d || typeof d !== 'object') return;
+      if (d.source !== POSTMESSAGE_SRC) return;
+      if (String(d.client_request_id || '') !== reqId) return;
+      if (settled) return;
+      settled = true; cleanup(); resolve(d);
+    };
+    _s.msgHandlers.set(reqId, handler);
+    window.addEventListener('message', handler);
+    document.body.appendChild(iframe);
+    document.body.appendChild(form);
+    try { form.submit(); } catch (e) {
+      cleanup();
+      resolve({ ok: false, final_status: 'review', reason: 'Form submit error: ' + e.message });
+    }
+  });
+}
+
+/* ── BACKEND RESULT MAPPER ───────────────────────────────────── */
+/* Maps Apps Script response to internal card verdict + recommendations.
+   INTEGRATION NOTE: backend returns catalogue candidate_id keys (text),
+   not DOM select option values. resolvedDomValue is filled during apply
+   via best-effort text matching. If no match → applyError set, field not changed. */
+function mapBackendResult(raw) {
+  if (!raw || raw._timeout) {
+    return {
+      verdict: 'error',
+      confidence: null,
+      reason: raw ? raw.reason : 'Нет ответа от сервера',
+      recommendations: null,
+    };
+  }
+  const fs = String(raw.final_status || '').toLowerCase();
+  let verdict = 'error';
+  if (fs === 'approve') verdict = 'green';
+  else if (fs === 'review') verdict = 'yellow';
+  else if (fs === 'reject') verdict = 'red';
+
+  const sel     = raw.selection || {};
+  const modules = raw.modules   || {};
+
+  return {
+    verdict,
+    confidence:      raw.confidence != null ? Number(raw.confidence) : null,
+    reason:          norm(raw.reason || ''),
+    recommendations: {
+      productType: {
+        status:           (modules.product_type || {}).status || 'unknown',
+        candidateId:      sel.product_type_candidate_id || '',
+        resolvedDomValue: null,   /* filled during applyRecommendations() */
+        resolvedDomLabel: null,
+      },
+      region: {
+        status:      (modules.region || {}).status || 'unknown',
+        candidateId: sel.region_candidate_id || '',
+        /* Stage 1: region auto-apply not supported (needs candidate→region_id mapping).
+           Flagged as REGION_MANUAL in applyError if status !== 'match'. */
+      },
+      denomination: {
+        status:           (modules.denomination || {}).status || 'unknown',
+        candidateId:      sel.denomination_candidate_id || '',
+        resolvedDomValue: null,
+        resolvedDomLabel: null,
+      },
+    },
+  };
+}
+
+/* ── SUPPRESS PRODUCT TYPE AUTO-SUBMIT (W3) ──────────────────── */
+/* Clone-replace the select to remove all jQuery event listeners.
+   This prevents the page's auto-form-submit on ProductType change.
+   Must be called before setting .value on ProductType select in popup. */
+function suppressProductTypeAutoSubmit(win) {
+  try {
+    const doc = win.document;
+    const sel = doc.getElementById('Product_product_type_id');
+    if (!sel) return null;
+    const clone = sel.cloneNode(true);
+    sel.parentNode.replaceChild(clone, sel);
+    return clone;   /* caller sets clone.value */
+  } catch (_) {
+    return null;
+  }
+}
+
+/* ── BEST-EFFORT TEXT MATCH (for apply) ──────────────────────── */
+function findOptionByText(selectEl, candidateId) {
+  if (!selectEl || !candidateId) return null;
+  const needle = candidateId.toLowerCase().replace(/_/g, ' ').replace(/-/g, ' ').trim();
+  let best = null;
+  for (const opt of selectEl.options) {
+    if (!opt.value) continue;
+    const txt = opt.textContent.toLowerCase().trim();
+    if (txt === needle) return opt;                          /* exact match */
+    const parts = txt.split(/\s[-–]\s/);                    /* "Brand - Category" */
+    if (parts[0] && parts[0].trim() === needle) { best = opt; continue; }
+    if (txt.includes(needle) || needle.includes(parts[0] || '')) {
+      if (!best) best = opt;
+    }
+  }
+  return best;
+}
+
+/* ── APPLY RECOMMENDATIONS ENGINE ───────────────────────────── */
+async function applyRecommendations(card) {
+  const win = await ensureWorkerAtUrl(card.updateUrl);
+
+  /* Capture fresh beforeSnapshot (always at apply time) */
+  card.beforeSnapshot = readSnapshotFromPopup(win);
+
+  const recs = card.recommendations;
+  if (!recs) {
+    card.applied = true;   /* green card — nothing to apply */
+    return;
+  }
+
+  let changeMade = false;
+
+  /* ── Region: Stage 1 — flag as manual, no auto-apply ── */
+  const rStatus = (recs.region || {}).status;
+  if (rStatus === 'mismatch' || rStatus === 'uncertain') {
+    const note = 'REGION_MANUAL: Регион требует ручной проверки в popup. ' +
+      'Кандидат от AI: «' + (recs.region.candidateId || '?') + '». ' +
+      'Stage 1 не поддерживает авто-изменение регионов (нет маппинга candidate→region_id).';
+    card.applyError = card.applyError ? card.applyError + '; ' + note : note;
+  }
+
+  /* ── ProductType: clone-replace + text-match ── */
+  const ptStatus = (recs.productType || {}).status;
+  if (ptStatus === 'mismatch' || ptStatus === 'uncertain') {
+    const candId = (recs.productType || {}).candidateId || '';
+    if (candId) {
+      const ptSel = suppressProductTypeAutoSubmit(win);   /* removes change listener */
+      if (ptSel) {
+        const matched = findOptionByText(ptSel, candId);
+        if (matched) {
+          ptSel.value = matched.value;
+          recs.productType.resolvedDomValue = matched.value;
+          recs.productType.resolvedDomLabel = norm(matched.textContent);
+          changeMade = true;
+        } else {
+          const note = 'PT_NO_MATCH: ProductType кандидат «' + candId + '» не найден в select DOM. ' +
+            'Выберите ProductType вручную в popup.';
+          card.applyError = card.applyError ? card.applyError + '; ' + note : note;
+        }
+      }
+    }
+  }
+
+  /* ── Denomination: text-match ── */
+  const dStatus = (recs.denomination || {}).status;
+  if (dStatus === 'mismatch' || dStatus === 'uncertain') {
+    const dCandId = (recs.denomination || {}).candidateId || '';
+    if (dCandId) {
+      try {
+        const dSel = win.document.getElementById('denomination-select');
+        if (dSel) {
+          const matched = findOptionByText(dSel, dCandId);
+          if (matched) {
+            dSel.value = matched.value;
+            recs.denomination.resolvedDomValue = matched.value;
+            recs.denomination.resolvedDomLabel = norm(matched.textContent);
+            changeMade = true;
+          } else {
+            const note = 'DENOM_NO_MATCH: Denomination кандидат «' + dCandId + '» не найден.';
+            card.applyError = card.applyError ? card.applyError + '; ' + note : note;
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
+  card.afterSnapshot = readSnapshotFromPopup(win);
+  card.applied = true;
+
+  /* Focus popup so operator can review & manually fix region if needed */
+  try { win.focus(); } catch (_) {}
+}
+
+/* ── CONFIRM MANUAL FIXES (Stage 1.2) ───────────────────────── */
+/* Operator has manually fixed fields in popup (e.g. region, ProductType).
+   This action re-reads the popup DOM, updates afterSnapshot, and sets
+   manuallyConfirmed=true — which clears blocking issues in safety gates.
+   Requires popup to be open on the correct card page. */
+async function confirmManualFixes(card) {
+  const win = await ensureWorkerAtUrl(card.updateUrl);
+  const freshSnap = readSnapshotFromPopup(win);
+  if (!freshSnap) throw new Error('CONFIRM_FAIL: Не удалось прочитать состояние popup');
+  card.afterSnapshot = freshSnap;
+  card.manuallyConfirmed = true;
+}
+
+/* ── APPROVE / SAVE ENGINE ───────────────────────────────────── */
+/* Controlled save: navigates popup to card URL, re-applies recommendations,
+   then submits the form. No auto-save. Must be explicitly triggered. */
+async function saveCard(card) {
+  /* Navigate popup to the card page (re-apply ensures form state is correct) */
+  await applyRecommendations(card);
+
+  const win = _s.workerWin;
+  if (!win || win.closed) throw new Error('WORKER_CLOSED: Popup недоступен для сохранения');
+
+  const doc     = win.document;
+  const saveBtn = doc.querySelector('input[name="yt0"]');
+  const form    = doc.getElementById('product-form');
+  if (!saveBtn && !form) throw new Error('SAVE_FORM_NOT_FOUND: Кнопка Save не найдена в popup');
+
+  /* Navigation sentinel before submit */
+  const seq = ++_s.navSeq;
+  try { win.__bsv_nav_seq__ = seq; } catch (_) {}
+
+  try {
+    if (saveBtn) saveBtn.click();
+    else form.submit();
+  } catch (e) {
+    throw new Error('SAVE_SUBMIT_ERROR: ' + e.message);
+  }
+
+  /* Wait for old page context destruction */
+  const deadline = Date.now() + NAV_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (win.closed) throw new Error('WORKER_CLOSED: Popup закрыт после submit');
+    try { if (win.__bsv_nav_seq__ !== seq) break; } catch (_) { break; }
+    await wait(100);
+  }
+  await wait(300);
+
+  /* Wait for new page (save redirects back to same page) */
+  await waitForWorkerReady(win, PAGE_LOAD_MS);
+  card.afterSnapshot = readSnapshotFromPopup(win);
+  card.saved = true;
+}
+
+/* ── MOD STATUS ENGINE ───────────────────────────────────────── */
+function getModStatusRule(color) {
+  return MOD_STATUS_RULES.find(r => r.color === color) || null;
+}
+
+/* Try to extract Yii1 CSRF token (W5 — UNKNOWN in DOM snapshot).
+   Yii1 embeds YII_CSRF_TOKEN as a meta tag or hidden input.
+   If not found, sends without token (works if Yii CSRF is disabled for XHR). */
+function extractCsrfToken() {
+  try {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    if (meta) return meta.getAttribute('content') || '';
+    const hidden = document.querySelector('input[name="YII_CSRF_TOKEN"]');
+    if (hidden) return hidden.value || '';
+  } catch (_) {}
+  return '';
+}
+
+async function applyModStatus(card) {
+  const rule = getModStatusRule(card.finalColor);
+  if (!rule) throw new Error('MOD_STATUS_NO_RULE: Нет правила для цвета «' + card.finalColor + '»');
+  if (rule._blocked) throw new Error('MOD_STATUS_BLOCKED: ' + rule._blockedReason);
+  if (rule.modStatus === 'no_change') return;   /* skip silently */
+
+  const csrfToken = extractCsrfToken();
+  const bodyParts = [
+    'product_id='    + encodeURIComponent(card.productId),
+    'mod_status='    + encodeURIComponent(rule.modStatus),
+    'rejection_note=' + encodeURIComponent(rule.rejectionNote || ''),
+  ];
+  if (csrfToken) bodyParts.push('YII_CSRF_TOKEN=' + encodeURIComponent(csrfToken));
+  const body = bodyParts.join('&');
+
+  const resp = await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/xdm/product/updateModStatus', true);
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+    if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
+    xhr.timeout = 15000;
+    xhr.onload  = () => {
+      try { resolve(JSON.parse(xhr.responseText)); }
+      catch (_) { resolve({ success: false, error: 'Parse error: ' + xhr.responseText.slice(0, 100) }); }
+    };
+    xhr.onerror   = () => reject(new Error('XHR network error'));
+    xhr.ontimeout = () => reject(new Error('XHR timeout 15s'));
+    xhr.send(body);
+  });
+
+  if (!resp || !resp.success) {
+    throw new Error('MOD_STATUS_FAIL: ' + ((resp && resp.error) ? resp.error : 'Сервер вернул ошибку'));
+  }
+
+  card.modStatusApplied = true;
+  card.modStatusNew     = rule.modStatus;
+
+  /* Update live dropdown on list page */
+  try {
+    const sel = document.querySelector(
+      'select.mod-status-dropdown[data-id="' + card.productId + '"],' +
+      '#mod_status_' + card.productId
+    );
+    if (sel) sel.value = rule.modStatus;
+  } catch (_) {}
+}
+
+/* ── EXPORT ENGINE ───────────────────────────────────────────── */
+/* BACKEND GAP: Apps Script→Sheets export requires v16.gs (new writeExportRows action).
+   Stage 1 interim: clipboard TSV.                                                      */
+function buildExportTsv(session, cards) {
+  const hdr = [
+    'sessionId', 'scannedAt', 'productId', 'productName',
+    'ptBefore', 'ptAfter', 'regionsBefore', 'regionsAfter',
+    'denomBefore', 'denomAfter',
+    'aiVerdict', 'aiConfidence', 'aiReason',
+    'operatorOverride', 'finalColor',
+    'applied', 'saved', 'manuallyConfirmed', 'modStatusChanged', 'modStatusNew',
+    'scanError', 'applyError', 'saveError',
+  ].join('\t');
+
+  const snap2pt  = s => s ? (s.productTypeName || s.productTypeId || '—') : '—';
+  const snap2reg = s => s ? ((s.regions || []).map(r => r.name).join(', ') || '—') : '—';
+  const snap2den = s => s ? (s.denominationLabel || s.denominationOptionId || '—') : '—';
+
+  const rows = cards.map(c => [
+    session.sessionId,          session.scannedAt,
+    c.productId,                c.productName,
+    snap2pt(c.beforeSnapshot),  snap2pt(c.afterSnapshot),
+    snap2reg(c.beforeSnapshot), snap2reg(c.afterSnapshot),
+    snap2den(c.beforeSnapshot), snap2den(c.afterSnapshot),
+    c.aiVerdict    || '—',
+    c.aiConfidence != null ? c.aiConfidence : '—',
+    c.aiReason     || '—',
+    c.operatorOverride || '—',  c.finalColor || '—',
+    c.applied  ? 'yes' : 'no', c.saved ? 'yes' : 'no',
+    c.manuallyConfirmed ? 'yes' : 'no',
+    c.modStatusApplied ? 'yes' : 'no', c.modStatusNew || '—',
+    c.scanError  || '—',
+    c.applyError || '—',
+    c.saveError  || '—',
+  ].map(v => String(v).replace(/\t|\n/g, ' ')).join('\t'));
+
+  return [hdr, ...rows].join('\n');
+}
+
+async function runExport(session, cards) {
+  if (!cards.length) { alert('Нет карточек для экспорта.'); return; }
+  const tsv = buildExportTsv(session, cards);
+  let method = 'clipboard';
+  try {
+    await navigator.clipboard.writeText(tsv);
+  } catch (_) {
+    /* Fallback: open in new tab */
+    method = 'window';
+    const w = window.open('', '_blank');
+    if (w) { w.document.write('<pre style="font:12px monospace;padding:16px">' + esc(tsv) + '</pre>'); }
+  }
+  if (EXPORT_CONFIG.backendGap) {
+    alert(
+      'Экспорт: ' + cards.length + ' строк → ' + method + '\n\n' +
+      'BACKEND GAP: Экспорт в Google Sheets (таб «' + EXPORT_CONFIG.exportTab + '») ' +
+      'недоступен в Stage 1.\n' +
+      'Требуется v16.gs с action=writeExportRows.'
+    );
+  } else {
+    alert('Экспорт: ' + cards.length + ' строк → ' + method);
+  }
+}
+
+/* ── SCAN LOOP ───────────────────────────────────────────────── */
+async function runScan(items, session, onProgress) {
+  _s.isFirstCard = true;
+
+  for (let i = 0; i < items.length; i++) {
+    if (_s.aborted) break;
+    const item = items[i];
+    const card = makeCardResult(item.productId, item.productName, item.productType, item.updateUrl);
+    session.cards.push(card);
+
+    try {
+      /* 1. Open popup → capture beforeSnapshot */
+      const win = await ensureWorkerAtUrl(item.updateUrl);
+      card.beforeSnapshot = readSnapshotFromPopup(win);
+
+      /* 2. Build payload from snapshot */
+      const snap = card.beforeSnapshot || makeSnap();
+      const payload = {
+        product_id:   item.productId,
+        name:         snap.name        || item.productName,
+        description:  snap.description || '',
+        current: {
+          product_type: snap.productTypeName || item.productType,
+          region:       (snap.regions || []).map(r => r.name).join(', '),
+          denomination: snap.denominationLabel || '',
+        },
+        mode: 'card',
+      };
+
+      /* 3. Call AI Core v1 backend (postmessage from list page window) */
+      const raw    = await callBackend(payload);
+      const mapped = mapBackendResult(raw);
+      card.aiVerdict       = mapped.verdict;
+      card.aiConfidence    = mapped.confidence;
+      card.aiReason        = mapped.reason;
+      card.aiRaw           = raw;
+      card.recommendations = mapped.recommendations;
+
+    } catch (e) {
+      card.aiVerdict = 'error';
+      card.scanError = e.message || String(e);
+      if (e.message && e.message.includes('POPUP_BLOCKED')) { _s.aborted = true; break; }
+    }
+
+    /* Update summary */
+    const v = card.aiVerdict;
+    session.summary.processed++;
+    if (v === 'green')  session.summary.green++;
+    else if (v === 'yellow') session.summary.yellow++;
+    else if (v === 'red')    session.summary.red++;
+    else                     session.summary.errors++;
+
+    onProgress(i + 1, items.length, card);
+    await wait(60);   /* breathing room */
+  }
+
+  /* Close worker after scan completes (will reopen for apply) */
+  if (_s.workerWin && !_s.workerWin.closed) {
+    try { _s.workerWin.close(); } catch (_) {}
+    _s.workerWin = null;
+    _s.isFirstCard = true;
+  }
+}
+
+/* ── UI: COLOR TOKENS ────────────────────────────────────────── */
+const CLR = {
+  green:  { border: '#22c55e', badge: '🟢', selBg: 'rgba(34,197,94,.15)',  selTxt: '#4ade80'  },
+  yellow: { border: '#eab308', badge: '🟡', selBg: 'rgba(234,179,8,.15)',  selTxt: '#fcd34d'  },
+  red:    { border: '#ef4444', badge: '🔴', selBg: 'rgba(239,68,68,.15)',  selTxt: '#f87171'  },
+  error:  { border: '#6b7280', badge: '⚠',  selBg: 'rgba(107,114,128,.1)', selTxt: '#9ca3af'  },
+};
+const clr = v => CLR[v] || CLR.error;
+
+/* ── UI: OVERLAY RENDER ──────────────────────────────────────── */
+function renderOverlay() {
+  const el = document.createElement('div');
+  el.id = 'bsv-wip01-overlay';
+  el.style.cssText = [
+    'position:fixed','inset:0','z-index:2147483640',
+    'background:rgba(0,0,0,.4)',
+    'display:flex','align-items:flex-start','justify-content:flex-end',
+    'padding:14px','pointer-events:none',
+  ].join(';');
+
+  el.innerHTML = `
+    <div id="bsv-wip01-panel" style="pointer-events:all;width:520px;max-height:calc(100vh - 28px);
+      overflow:hidden;display:flex;flex-direction:column;
+      background:linear-gradient(180deg,#0f1d3d,#0a1428);
+      border:1px solid rgba(191,219,254,.2);border-radius:16px;
+      box-shadow:0 24px 48px rgba(0,0,0,.55);font:14px/1.45 Arial,sans-serif;color:#e5e7eb;">
+      <div id="wip01-hdr" style="display:flex;align-items:center;justify-content:space-between;
+        padding:12px 15px;border-bottom:1px solid rgba(191,219,254,.12);flex-shrink:0;">
+        <div style="font-weight:800;font-size:16px;color:#f8d26a;">BSV Проверка списка</div>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <span style="font-size:11px;background:rgba(99,102,241,.3);color:#a5b4fc;
+            padding:3px 9px;border-radius:8px;font-weight:700;">Under Review</span>
+          <span title="Stage 2 — not available" style="font-size:11px;background:rgba(255,255,255,.06);
+            color:#4b5563;padding:3px 9px;border-radius:8px;">Published</span>
+          <button id="wip01-close" type="button" style="border:none;border-radius:8px;
+            padding:5px 10px;background:rgba(255,255,255,.08);color:#9ca3af;cursor:pointer;
+            font-size:15px;font-weight:700;">✕</button>
+        </div>
+      </div>
+      <div id="wip01-body" style="flex:1;overflow-y:auto;padding:14px;min-height:0;"></div>
+      <div id="wip01-actions" style="flex-shrink:0;padding:10px 14px;
+        border-top:1px solid rgba(191,219,254,.09);display:none;"></div>
+    </div>`;
+
+  document.body.appendChild(el);
+  _s.overlay = el;
+  el.querySelector('#wip01-close').onclick = () => {
+    if (window[NS]) window[NS].cleanup();
+  };
+  return el;
+}
+
+const $body    = () => document.getElementById('wip01-body');
+const $actions = () => document.getElementById('wip01-actions');
+
+function setBody(html) { const b = $body(); if (b) b.innerHTML = html; }
+function setActions(html, bindFn) {
+  const a = $actions();
+  if (!a) return;
+  a.style.display = html ? '' : 'none';
+  a.innerHTML = html || '';
+  if (html && bindFn) bindFn(a);
+}
+
+/* ── UI: STARTUP PHASE ───────────────────────────────────────── */
+function renderStartup(count, onStart) {
+  setBody(`
+    <div style="text-align:center;padding:18px 0;">
+      <div style="font-size:13px;color:#94a3b8;margin-bottom:6px;">
+        Товаров <b style="color:#a5b4fc;">Under Review</b> на текущей странице:</div>
+      <div style="font-size:44px;font-weight:800;color:#60a5fa;margin:6px 0 16px;">${count}</div>
+      <div style="font-size:12px;color:#6b7280;">
+        Только текущая страница · Режим: Under Review · Без multi-page crawl</div>
+      ${count === 0 ? '<div style="margin-top:14px;color:#f59e0b;padding:10px 14px;background:rgba(245,158,11,.1);border-radius:10px;">На этой странице нет товаров Under Review.</div>' : ''}
+    </div>`);
+
+  if (count > 0) {
+    setActions(
+      `<button id="wip01-start" type="button" style="border:none;border-radius:10px;padding:11px 20px;
+        background:#2563eb;color:#fff;font-weight:700;font-size:14px;cursor:pointer;width:100%;">
+        Начать проверку (${count} товаров)</button>`,
+      a => { a.querySelector('#wip01-start').onclick = onStart; }
+    );
+  } else {
+    setActions('');
+  }
+}
+
+/* ── UI: SCAN PROGRESS PHASE ─────────────────────────────────── */
+function renderProgress(done, total, card) {
+  const pct = total ? Math.round(done / total * 100) : 0;
+  setBody(`
+    <div style="padding:6px 0;">
+      <div style="font-size:13px;color:#94a3b8;margin-bottom:6px;">
+        Проверка: <b style="color:#93c5fd;">${done} / ${total}</b></div>
+      <div style="background:rgba(255,255,255,.07);border-radius:8px;height:8px;overflow:hidden;margin-bottom:10px;">
+        <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#3b82f6,#6366f1);
+          border-radius:8px;transition:width .35s;"></div>
+      </div>
+      ${card ? `<div style="font-size:12px;color:#6b7280;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+        → ${esc(card.productId)} — ${esc(card.productName)}</div>` : ''}
+    </div>`);
+  setActions(
+    `<button id="wip01-cancel" type="button" style="border:none;border-radius:9px;padding:9px 16px;
+      background:#7f1d1d;color:#fca5a5;font-weight:700;font-size:13px;cursor:pointer;width:100%;">
+      Отмена</button>`,
+    a => { a.querySelector('#wip01-cancel').onclick = () => { _s.aborted = true; }; }
+  );
+}
+
+/* ── UI: DASHBOARD ───────────────────────────────────────────── */
+function rebuildSummary(session) {
+  const s = session.summary;
+  const cards = session.cards;
+  s.green  = cards.filter(c => c.finalColor === 'green').length;
+  s.yellow = cards.filter(c => c.finalColor === 'yellow').length;
+  s.red    = cards.filter(c => c.finalColor === 'red').length;
+  s.errors = cards.filter(c => c.aiVerdict === 'error').length;
+}
+
+function spill(lbl, val, txt, bg) {
+  return `<span style="background:${bg};color:${txt};padding:4px 10px;border-radius:18px;
+    font-size:12px;font-weight:700;">${lbl}${val !== '' ? ' ' + val : ''}</span>`;
+}
+
+function filterPill(val, lbl, cur) {
+  const on = cur === val;
+  return `<button type="button" data-wf="${val}" style="border:none;border-radius:8px;
+    padding:5px 11px;font-size:12px;font-weight:700;cursor:pointer;
+    background:${on ? '#2563eb' : 'rgba(255,255,255,.07)'};
+    color:${on ? '#fff' : '#9ca3af'};">${lbl}</button>`;
+}
+
+function renderCardRow(card) {
+  const c       = clr(card.finalColor);
+  const expanded = _s.uiExpandedId === card.productId;
+  const checked  = _s.uiSelectedIds.has(card.productId);
+
+  const blockIssues = getCardBlockingIssues(card);
+  const badges = [
+    card.applied  ? `<span style="background:rgba(99,102,241,.25);color:#a5b4fc;padding:2px 6px;border-radius:5px;font-size:10px;">Applied</span>` : '',
+    card.saved    ? `<span style="background:rgba(34,197,94,.2);color:#4ade80;padding:2px 6px;border-radius:5px;font-size:10px;">Saved</span>` : '',
+    (card.applied && !card.saved && blockIssues.length > 0) ? `<span title="${esc(blockIssues.join(', '))}" style="background:rgba(251,146,60,.2);color:#fb923c;padding:2px 6px;border-radius:5px;font-size:10px;cursor:help;">⚠ ${blockIssues.length} блок.</span>` : '',
+    card.modStatusApplied ? `<span style="background:rgba(245,158,11,.2);color:#fcd34d;padding:2px 6px;border-radius:5px;font-size:10px;">MS:${card.modStatusNew || '?'}</span>` : '',
+  ].join('');
+
+  const ovBtns = ['green','yellow','red'].map(col => {
+    const active = card.operatorOverride === col;
+    return `<button type="button" data-ov-id="${esc(card.productId)}" data-ov-col="${col}"
+      style="border:none;border-radius:5px;padding:1px 6px;cursor:pointer;font-size:12px;
+      opacity:${active ? '1' : '0.35'};background:${active ? 'rgba(255,255,255,.14)' : 'transparent'};">
+      ${clr(col).badge}</button>`;
+  }).join('');
+
+  let detail = '';
+  if (expanded) {
+    const b = card.beforeSnapshot, a = card.afterSnapshot;
+    const pt2  = s => s ? (s.productTypeName || s.productTypeId || '—') : '—';
+    const reg2 = s => s ? ((s.regions || []).map(r => r.name).join(', ') || '—') : '—';
+    const den2 = s => s ? (s.denominationLabel || s.denominationOptionId || '—') : '—';
+    const diff = (bv, av) => {
+      if (!a) return `<span style="color:#94a3b8">${esc(bv)}</span>`;
+      if (bv === av) return `<span style="color:#94a3b8">${esc(bv)}</span>`;
+      return `<span style="background:#7c2d12;color:#fca5a5;padding:1px 4px;border-radius:3px">${esc(bv)}</span>`
+           + ` → <span style="background:#14532d;color:#86efac;padding:1px 4px;border-radius:3px">${esc(av)}</span>`;
+    };
+
+    const recs = card.recommendations || {};
+    const recPt = recs.productType
+      ? `<tr><td style="color:#f8d26a;padding:2px 6px;">ProductType</td>
+          <td style="padding:2px 6px;">${esc(recs.productType.status)} · кандидат: <i>${esc(recs.productType.candidateId||'—')}</i>
+          ${recs.productType.resolvedDomLabel ? ' → <b>' + esc(recs.productType.resolvedDomLabel) + '</b>' : ''}</td></tr>` : '';
+    const recRg = recs.region
+      ? `<tr><td style="color:#f8d26a;padding:2px 6px;">Region</td>
+          <td style="padding:2px 6px;">${esc(recs.region.status)} · кандидат: <i>${esc(recs.region.candidateId||'—')}</i>
+          <span style="color:#f59e0b;font-size:11px;">[ручная проверка]</span></td></tr>` : '';
+    const recDn = recs.denomination
+      ? `<tr><td style="color:#f8d26a;padding:2px 6px;">Denomination</td>
+          <td style="padding:2px 6px;">${esc(recs.denomination.status)} · кандидат: <i>${esc(recs.denomination.candidateId||'—')}</i>
+          ${recs.denomination.resolvedDomLabel ? ' → <b>' + esc(recs.denomination.resolvedDomLabel) + '</b>' : ''}</td></tr>` : '';
+
+    detail = `
+      <div style="padding:10px 12px;border-top:1px solid rgba(191,219,254,.08);font-size:12px;">
+        <div style="color:#93c5fd;font-weight:700;margin-bottom:6px;">${esc(card.aiReason || '—')}</div>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:8px;">
+          <tr><td style="color:#6b7280;padding:2px 6px;width:100px;">ProductType</td><td style="padding:2px 6px;">${diff(pt2(b),pt2(a))}</td></tr>
+          <tr><td style="color:#6b7280;padding:2px 6px;">Регионы</td><td style="padding:2px 6px;">${diff(reg2(b),reg2(a))}</td></tr>
+          <tr><td style="color:#6b7280;padding:2px 6px;">Denomination</td><td style="padding:2px 6px;">${diff(den2(b),den2(a))}</td></tr>
+        </table>
+        ${(recPt || recRg || recDn) ? `<div style="color:#60a5fa;font-weight:700;margin-bottom:4px;">Рекомендации AI:</div>
+          <table style="width:100%;border-collapse:collapse;">${recPt}${recRg}${recDn}</table>` : ''}
+        ${card.scanError  ? `<div style="color:#f87171;margin-top:5px;font-size:11px;">⚠ scan: ${esc(card.scanError)}</div>`  : ''}
+        ${card.applyError ? `<div style="color:#fb923c;margin-top:5px;font-size:11px;">⚠ apply: ${esc(card.applyError)}</div>` : ''}
+        ${card.saveError  ? `<div style="color:#f87171;margin-top:5px;font-size:11px;">⚠ save: ${esc(card.saveError)}</div>`   : ''}
+        ${card.manuallyConfirmed ? `<div style="color:#4ade80;margin-top:5px;font-size:11px;">✓ Ручные правки подтверждены</div>` : ''}
+        ${(blockIssues.length > 0 && !card.manuallyConfirmed) ? `<div style="margin-top:8px;">
+          <button type="button" data-confirm-id="${esc(card.productId)}" style="border:none;border-radius:7px;
+            padding:6px 14px;background:#d97706;color:#fff;font-size:12px;font-weight:700;cursor:pointer;">
+            Подтвердить ручные правки</button>
+          <span style="font-size:11px;color:#9ca3af;margin-left:6px;">
+            Откройте popup, исправьте вручную, затем нажмите</span>
+        </div>` : ''}
+      </div>`;
+  }
+
+  return `
+    <div style="margin-bottom:5px;border:1px solid ${c.border};border-radius:10px;
+      background:rgba(255,255,255,.025);overflow:hidden;" data-card-id="${esc(card.productId)}">
+      <div style="display:flex;align-items:center;gap:7px;padding:7px 9px;">
+        <input type="checkbox" data-cb="${esc(card.productId)}" style="flex-shrink:0;accent-color:#3b82f6;"${checked ? ' checked' : ''}>
+        <span style="font-size:14px;">${c.badge}</span>
+        <span style="flex:1;font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+          title="${esc(card.productName)}">${esc(card.productId)} — ${esc(card.productName)}</span>
+        <span style="font-size:11px;color:#6b7280;">${card.aiConfidence != null ? card.aiConfidence + '%' : ''}</span>
+        <span style="display:flex;gap:3px;flex-shrink:0;">${badges}</span>
+        <div style="display:flex;gap:3px;">${ovBtns}</div>
+        <button type="button" data-exp="${esc(card.productId)}" style="border:none;
+          background:rgba(255,255,255,.07);color:#9ca3af;border-radius:6px;
+          padding:2px 7px;cursor:pointer;font-size:11px;flex-shrink:0;">${expanded ? '▲' : '▼'}</button>
+      </div>
+      ${detail}
+    </div>`;
+}
+
+function renderDashboard(session) {
+  rebuildSummary(session);
+  const { summary } = session;
+  const filter = _s.uiFilter;
+  const all    = session.cards;
+  const vis    = filter === 'all'    ? all
+               : filter === 'errors' ? all.filter(c => c.aiVerdict === 'error')
+               :                       all.filter(c => c.finalColor === filter);
+
+  const summaryBar = `
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+      ${spill('Всего', summary.totalFound, '#94a3b8', '#1e293b')}
+      ${spill('🟢', summary.green,  '#166534', 'rgba(34,197,94,.12)')}
+      ${spill('🟡', summary.yellow, '#854d0e', 'rgba(234,179,8,.12)')}
+      ${spill('🔴', summary.red,    '#991b1b', 'rgba(239,68,68,.12)')}
+      ${spill('⚠', summary.errors,  '#374151', 'rgba(107,114,128,.1)')}
+    </div>`;
+
+  const filterBar = `
+    <div style="display:flex;gap:5px;margin-bottom:10px;flex-wrap:wrap;">
+      ${filterPill('all','Все',filter)} ${filterPill('green','🟢 Green',filter)}
+      ${filterPill('yellow','🟡 Yellow',filter)} ${filterPill('red','🔴 Red',filter)}
+      ${filterPill('errors','⚠ Ошибки',filter)}
+    </div>`;
+
+  const rows = vis.map(c => renderCardRow(c)).join('');
+  setBody(summaryBar + filterBar + `<div id="wip01-list">${rows}</div>`);
+
+  /* Bind filter pills */
+  document.querySelectorAll('[data-wf]').forEach(b => {
+    b.onclick = () => { _s.uiFilter = b.dataset.wf; renderDashboard(session); };
+  });
+  /* Bind checkboxes */
+  document.querySelectorAll('[data-cb]').forEach(cb => {
+    cb.onchange = () => {
+      const id = cb.dataset.cb;
+      cb.checked ? _s.uiSelectedIds.add(id) : _s.uiSelectedIds.delete(id);
+      renderActionBar(session);
+    };
+  });
+  /* Bind expand toggles */
+  document.querySelectorAll('[data-exp]').forEach(b => {
+    b.onclick = () => {
+      const id = b.dataset.exp;
+      _s.uiExpandedId = (_s.uiExpandedId === id) ? null : id;
+      renderDashboard(session);
+    };
+  });
+  /* Bind confirm manual fixes buttons (Stage 1.2) */
+  document.querySelectorAll('[data-confirm-id]').forEach(b => {
+    b.onclick = async () => {
+      const id = b.dataset.confirmId;
+      const card = session.cards.find(c => c.productId === id);
+      if (!card) return;
+      b.disabled = true;
+      b.textContent = 'Проверяю popup...';
+      try {
+        await confirmManualFixes(card);
+      } catch (e) {
+        card.saveError = (card.saveError ? card.saveError + '; ' : '') + (e.message || String(e));
+      }
+      renderDashboard(session);
+    };
+  });
+  /* Bind color overrides */
+  document.querySelectorAll('[data-ov-id]').forEach(b => {
+    b.onclick = () => {
+      const id  = b.dataset.ovId;
+      const col = b.dataset.ovCol;
+      const card = session.cards.find(c => c.productId === id);
+      if (card) {
+        card.operatorOverride = (card.operatorOverride === col) ? null : col;
+        rebuildSummary(session);
+        renderDashboard(session);
+      }
+    };
+  });
+
+  renderActionBar(session);
+}
+
+/* ── UI: ACTION BAR ──────────────────────────────────────────── */
+function renderActionBar(session) {
+  const selIds  = [..._s.uiSelectedIds];
+  const selCards = session.cards.filter(c => selIds.includes(c.productId));
+  const yCandidates    = selCards.filter(c => c.finalColor === 'yellow' && !c.applied);
+  const saveReadyCards = selCards.filter(c => isCardSaveReady(c));
+  const needsConfirm   = selCards.filter(c => c.applied && !c.saved && !c.manuallyConfirmed && getCardBlockingIssues(c).length > 0);
+  const msEligible     = selCards.filter(c => isCardModStatusReady(c));
+
+  const btn = (id, label, enabled, bg, col) =>
+    `<button type="button" id="${id}" ${enabled ? '' : 'disabled'} style="border:none;border-radius:8px;
+      padding:7px 12px;font-size:12px;font-weight:700;cursor:${enabled ? 'pointer' : 'default'};
+      background:${enabled ? bg : '#374151'};color:${enabled ? col : '#6b7280'};">${label}</button>`;
+
+  setActions(`
+    <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:7px;">
+      <button id="wip01-sg" type="button" style="border:none;border-radius:7px;padding:4px 9px;font-size:11px;
+        font-weight:700;cursor:pointer;background:rgba(34,197,94,.12);color:#4ade80;">Выбрать 🟢</button>
+      <button id="wip01-sy" type="button" style="border:none;border-radius:7px;padding:4px 9px;font-size:11px;
+        font-weight:700;cursor:pointer;background:rgba(234,179,8,.12);color:#fcd34d;">Выбрать 🟡</button>
+      <button id="wip01-sr" type="button" style="border:none;border-radius:7px;padding:4px 9px;font-size:11px;
+        font-weight:700;cursor:pointer;background:rgba(239,68,68,.12);color:#f87171;">Выбрать 🔴</button>
+      <button id="wip01-sc" type="button" style="border:none;border-radius:7px;padding:4px 9px;font-size:11px;
+        font-weight:700;cursor:pointer;background:rgba(255,255,255,.06);color:#9ca3af;">Снять</button>
+    </div>
+    <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;">
+      ${btn('wip01-apply', 'Применить рек. (' + yCandidates.length + ')',  yCandidates.length > 0,  '#d97706', '#fff')}
+      ${btn('wip01-confirm', 'Подтв. ручные (' + needsConfirm.length + ')', needsConfirm.length > 0, '#b45309', '#fff')}
+      ${btn('wip01-save',  'Сохранить (' + saveReadyCards.length + ')',     saveReadyCards.length > 0, '#059669', '#fff')}
+      ${btn('wip01-ms',    'Mod Status (' + msEligible.length + '/' + selCards.length + ')', msEligible.length > 0, '#7c3aed', '#fff')}
+      <span style="flex:1;"></span>
+      ${btn('wip01-exp',   'Экспорт',                                       true,                   '#1e40af', '#bfdbfe')}
+    </div>`,
+  a => {
+    a.querySelector('#wip01-sg').onclick = () => selectByColor(session, 'green');
+    a.querySelector('#wip01-sy').onclick = () => selectByColor(session, 'yellow');
+    a.querySelector('#wip01-sr').onclick = () => selectByColor(session, 'red');
+    a.querySelector('#wip01-sc').onclick = () => { _s.uiSelectedIds.clear(); renderDashboard(session); };
+
+    const applyBtn = a.querySelector('#wip01-apply');
+    if (!applyBtn.disabled) applyBtn.onclick = () => runApplyBatch(session, yCandidates);
+
+    const confirmBtn = a.querySelector('#wip01-confirm');
+    if (!confirmBtn.disabled) confirmBtn.onclick = () => runConfirmBatch(session, needsConfirm);
+
+    const saveBtn = a.querySelector('#wip01-save');
+    if (!saveBtn.disabled)  saveBtn.onclick  = () => runSaveBatch(session, saveReadyCards);
+
+    const msBtn = a.querySelector('#wip01-ms');
+    if (!msBtn.disabled)    msBtn.onclick    = () => runModStatusBatch(session, msEligible);
+
+    a.querySelector('#wip01-exp').onclick = () => {
+      const expCards = _s.uiSelectedIds.size > 0
+        ? session.cards.filter(c => _s.uiSelectedIds.has(c.productId))
+        : session.cards;
+      runExport(session, expCards);
+    };
+  });
+}
+
+function selectByColor(session, color) {
+  session.cards.filter(c => c.finalColor === color).forEach(c => _s.uiSelectedIds.add(c.productId));
+  renderDashboard(session);
+}
+
+/* ── BATCH OPERATIONS ────────────────────────────────────────── */
+async function runConfirmBatch(session, cards) {
+  _s.isFirstCard = true;
+  for (const card of cards) {
+    if (_s.aborted) break;
+    try {
+      await confirmManualFixes(card);
+    } catch (e) {
+      card.saveError = (card.saveError ? card.saveError + '; ' : '') + (e.message || String(e));
+    }
+    renderDashboard(session);
+    await wait(150);
+  }
+}
+
+async function runApplyBatch(session, cards) {
+  _s.isFirstCard = true;
+  for (const card of cards) {
+    if (_s.aborted) break;
+    try {
+      await applyRecommendations(card);
+    } catch (e) {
+      const note = e.message || String(e);
+      card.applyError = card.applyError ? card.applyError + '; ' + note : note;
+    }
+    renderDashboard(session);
+    await wait(150);
+  }
+}
+
+async function runSaveBatch(session, cards) {
+  _s.isFirstCard = true;
+  for (const card of cards) {
+    if (_s.aborted) break;
+    /* Stage 1.1 safety gate: skip cards that are not save-ready */
+    if (!isCardSaveReady(card)) {
+      card.saveError = 'SAVE_BLOCKED: ' + (getCardBlockingIssues(card).join(', ') || 'not ready');
+      renderDashboard(session);
+      continue;
+    }
+    try {
+      await saveCard(card);
+    } catch (e) {
+      card.saveError = e.message || String(e);
+    }
+    renderDashboard(session);
+    await wait(300);
+  }
+}
+
+async function runModStatusBatch(session, cards) {
+  const blockedRed = cards.filter(c => {
+    const r = getModStatusRule(c.finalColor);
+    return r && r._blocked;
+  });
+  if (blockedRed.length) {
+    const ok = confirm(
+      'Red карточки (' + blockedRed.length + ' шт.) не могут быть автоматически отклонены:\n' +
+      'rejectionReasonId не настроен в MOD_STATUS_RULES.\n\n' +
+      'Они будут пропущены. Продолжить без red карточек?'
+    );
+    if (!ok) return;
+  }
+  for (const card of cards) {
+    if (_s.aborted) break;
+    const rule = getModStatusRule(card.finalColor);
+    if (!rule || rule._blocked || rule.modStatus === 'no_change') continue;
+    try {
+      await applyModStatus(card);
+    } catch (e) {
+      const note = 'modStatus: ' + (e.message || String(e));
+      card.saveError = card.saveError ? card.saveError + '; ' + note : note;
+    }
+    renderDashboard(session);
+    await wait(200);
+  }
+}
+
+/* ── MAIN ────────────────────────────────────────────────────── */
+async function main() {
+  const items   = scanUnderReviewRows();
+  const session = makeBatchSession(items.length);
+  _s.session    = session;
+
+  renderOverlay();
+
+  async function doScan() {
+    _s.aborted = false;
+    renderProgress(0, items.length, null);
+
+    await runScan(items, session, (done, total, card) => {
+      renderProgress(done, total, card);
+    });
+
+    _s.uiFilter = 'all';
+    renderDashboard(session);
+  }
+
+  renderStartup(items.length, doScan);
+}
+
+main().catch(e => {
+  console.error('[BSV WIP01]', e);
+  const b = $body();
+  if (b) b.innerHTML = '<div style="color:#f87171;padding:16px;">Критическая ошибка: ' + esc(e.message || String(e)) + '</div>';
+});
+
+})();
