@@ -1427,14 +1427,7 @@ function renderDetailPanel(session) {
   /* Ticket Context form block (above analysis) */
   const ticketCtx = renderTicketContext(card);
 
-  /* Block 1: Итоговый результат */
-  const sec1 = renderDetailSection('Итоговый результат', 1, card.finalColor, [
-    { label: 'Название', value: card.productName },
-    { label: 'Итоговый статус', value: c.label },
-    { label: 'Главная причина', value: card.aiReason || '—' },
-    { label: 'Необходимо', value: card.finalColor === 'green' ? 'можно сохранить без ручной проверки' :
-      card.finalColor === 'red' ? 'отклонить или исправить вручную' : 'проверить рекомендации и применить' },
-  ]);
+  /* ── Compute child block statuses FIRST, then aggregate for Block 1 ── */
 
   /* Block 2: Manual Review Words */
   const mrMod = mods.manual_review || {};
@@ -1503,6 +1496,22 @@ function renderDetailPanel(session) {
     { label: 'Рекомендованный', value: dnCand || dnCurrent },
     { label: 'Действие', value: dnAction },
     { label: 'Источник', value: 'catalogue' },
+  ]);
+
+  /* Block 1: Итоговый результат (aggregated from child blocks — MSG77) */
+  const childStatuses = [mrStatus, ptStatus, rgStatus, dnStatus];
+  const hasRed    = childStatuses.includes('red');
+  const hasYellow = childStatuses.includes('yellow');
+  const aggStatus = hasRed ? 'red' : hasYellow ? 'yellow' : 'green';
+  const aggC = clr(aggStatus);
+  const aggAction = aggStatus === 'green' ? 'можно сохранить без ручной проверки'
+    : aggStatus === 'red' ? 'отклонить или исправить вручную'
+    : 'проверить рекомендации и применить';
+  const sec1 = renderDetailSection('Итоговый результат', 1, aggStatus, [
+    { label: 'Название', value: card.productName },
+    { label: 'Итоговый статус', value: aggC.label },
+    { label: 'Главная причина', value: card.aiReason || '—' },
+    { label: 'Необходимо', value: aggAction },
   ]);
 
   /* Block 6: State badges + errors + manual confirm */
