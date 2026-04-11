@@ -101,6 +101,7 @@ const _s = {
   overlay:         null,
   session:         null,
   uiSelectedId:    null,         /* product ID of card shown in detail panel */
+  uiPhase:         'startup',    /* 'startup' | 'scanning' | 'results' | 'empty' | 'error' */
   uiTraceOpen:     false,        /* AI trace block collapsed by default */
   onStartScan:     null,         /* set by main(), called by startup button */
 };
@@ -1108,6 +1109,7 @@ function renderOverlay() {
 
 /* ── STARTUP ────────────────────────────────────────────────── */
 function renderStartup(count, onStart) {
+  _s.uiPhase = 'startup';
   $('wip01-list').innerHTML = `
     <div style="text-align:center;padding:28px 14px;">
       <div style="font-size:13px;color:#94a3b8;">Товаров <b style="color:#a5b4fc;">Under Review</b> на странице:</div>
@@ -1137,6 +1139,9 @@ function renderStartup(count, onStart) {
 
 /* ── PROGRESS ───────────────────────────────────────────────── */
 function renderProgress(done, total, card) {
+  /* Guard: do NOT overwrite results/detail if scan already completed */
+  if (_s.uiPhase !== 'scanning') return;
+
   const pct = total ? Math.round(done / total * 100) : 0;
   $('wip01-list').innerHTML = `
     <div style="padding:20px 14px;">
@@ -1148,7 +1153,6 @@ function renderProgress(done, total, card) {
       <button id="wip01-cancel" type="button" style="margin-top:14px;border:none;border-radius:9px;padding:9px 16px;
         background:#7f1d1d;color:#fca5a5;font-weight:700;font-size:13px;cursor:pointer;width:100%;">Отмена</button>
     </div>`;
-  /* Update right panel during scan — replace startup placeholder */
   const dp = $('wip01-detail');
   if (dp) dp.innerHTML = `<div style="color:#94a3b8;padding:24px;text-align:center;">
     <div style="font-size:14px;margin-bottom:6px;">Сканирование...</div>
@@ -1521,13 +1525,27 @@ function renderAiTraceBlock(card, session) {
 
 function renderDetailPanel(session) {
   const detail = $('wip01-detail');
-  /* Fallback: if selectedId is stale or null, auto-select first card */
+  if (!detail) return;
+
+  /* Phase guard: don't render results if we're still in startup/scanning */
+  if (_s.uiPhase === 'scanning') return;   /* progress handler owns right panel */
+  if (_s.uiPhase === 'startup') {
+    detail.innerHTML = '<div style="color:#6b7280;padding:24px;text-align:center;">Нажмите «Начать проверку» для запуска.</div>';
+    return;
+  }
+  if (_s.uiPhase === 'empty') {
+    detail.innerHTML = '<div style="color:#6b7280;padding:24px;text-align:center;">Нет результатов для отображения.</div>';
+    return;
+  }
+
+  /* Phase = results: find active card with fallback to first */
   let card = session.cards.find(c => c.productId === _s.uiSelectedId);
   if (!card && session.cards.length > 0) {
     card = session.cards[0];
     _s.uiSelectedId = card.productId;
   }
   if (!card) {
+    _s.uiPhase = 'empty';
     detail.innerHTML = '<div style="color:#6b7280;padding:24px;text-align:center;">Нет результатов для отображения.</div>';
     return;
   }
@@ -1872,6 +1890,7 @@ async function main() {
 
   async function doScan(scanCount) {
     _s.aborted = false;
+    _s.uiPhase = 'scanning';
     const toScan = scanCount ? items.slice(0, scanCount) : items;
     session.summary.totalFound = toScan.length;
     renderProgress(0, toScan.length, null);
@@ -1880,7 +1899,13 @@ async function main() {
       renderProgress(done, total, card);
     });
 
-    if (session.cards.length > 0) _s.uiSelectedId = session.cards[0].productId;
+    /* ── PHASE TRANSITION: scanning → results/empty ── */
+    if (session.cards.length > 0) {
+      _s.uiSelectedId = session.cards[0].productId;
+      _s.uiPhase = 'results';
+    } else {
+      _s.uiPhase = 'empty';
+    }
     renderDashboard(session);
   }
 
