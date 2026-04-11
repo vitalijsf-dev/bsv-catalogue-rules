@@ -1221,14 +1221,37 @@ function renderTicketContext(card) {
   const nm  = b ? (b.name || card.productName) : card.productName;
   const desc = b ? (b.description || '') : '';
 
-  /* Region hint (canonical comparison — MSG70 bugfix) */
+  /* Replacement hint builder (unified pattern — MSG81) */
+  const hintBox = lines => `<div style="margin-top:3px;padding:4px 8px;background:#fef3c7;border:1px solid #f59e0b;border-radius:4px;font-size:12px;color:#92400e;">${lines}</div>`;
+
+  /* ProductType hint */
+  const ptCand = sel.product_type_candidate_id || '';
+  const ptMatch = !ptCand || norm(pt) === norm(ptCand) || pt === ptCand;
+  let ptHelper = '';
+  if (ptCand && !ptMatch) {
+    ptHelper = hintBox(
+      `Название/описание указывает на другой ProductType: <b>${esc(ptCand)}</b><br>` +
+      `В таблице есть ProductType: <b>${esc(ptCand)}</b>`);
+  }
+
+  /* Region hint (canonical comparison — MSG70) */
   const rgCand = sel.region_candidate_id || '';
   const rgMatch = regionsCanonicallyEqual(rg, rgCand);
   let rgHelper = '';
   if (rgCand && !rgMatch) {
-    rgHelper = `<div style="margin-top:3px;padding:4px 8px;background:#fef3c7;border:1px solid #f59e0b;border-radius:4px;font-size:12px;color:#92400e;">
-      В name найден другой регион: <b>${esc(rgCand)}</b><br>
-      В таблице есть регион: <b>${esc(rgCand)}</b></div>`;
+    rgHelper = hintBox(
+      `В name найден другой регион: <b>${esc(rgCand)}</b><br>` +
+      `В таблице есть регион: <b>${esc(rgCand)}</b>`);
+  }
+
+  /* Denomination hint (canonical/entity — MSG79) */
+  const dnCandTc = sel.denomination_candidate_id || '';
+  const dnMatchTc = !dnCandTc || denominationsCanonicallyEqual(dn, dnCandTc);
+  let dnHelper = '';
+  if (dnCandTc && !dnMatchTc) {
+    dnHelper = hintBox(
+      `В name/description найден другой denomination: <b>${esc(dnCandTc)}</b><br>` +
+      `В таблице есть denomination: <b>${esc(dnCandTc)}</b>`);
   }
 
   const field = (label, value, tone, helper) => {
@@ -1254,10 +1277,10 @@ function renderTicketContext(card) {
         background:#f8fafc;">Ticket Context</div>
       <div style="background:#f9fafb;">
         ${field('Price', (raw.input_card || {}).price || '—', 'neutral')}
-        ${field('Product Type', pt, 'green')}
+        ${field('Product Type', pt, (ptCand && !ptMatch) ? 'yellow' : 'neutral', ptHelper)}
         ${field('Product nominal', (raw.input_card || {}).nominal || '—', 'neutral')}
         ${field('Region', rg, (rgCand && !rgMatch) ? 'yellow' : 'neutral', rgHelper)}
-        ${field('Denomination', dn, 'neutral')}
+        ${field('Denomination', dn, (dnCandTc && !dnMatchTc) ? 'yellow' : 'neutral', dnHelper)}
         ${field('Currency', (raw.input_card || {}).currency || '—', 'neutral')}
         <div style="display:grid;grid-template-columns:160px 1fr;border-bottom:1px solid #e5e7eb;">
           <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#475569;border-right:1px solid #e5e7eb;">Name</div>
