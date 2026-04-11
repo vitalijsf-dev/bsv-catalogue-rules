@@ -150,6 +150,33 @@ function regionsCanonicallyEqual(a, b) {
   return listA.join(',') === listB.join(',');
 }
 
+/* ── CANONICAL DENOMINATION (bugfix MSG79) ───────────────────── */
+/* DOM select values use format: [TypeKey][mode][Category][value]
+   Backend candidate IDs use format: dn::TypeKey::value
+   Both refer to the same denomination entity.
+   Extract entity key for canonical comparison. */
+function extractDenomEntity(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  /* Format: dn::SomeKey::Value → key=SomeKey, val=Value */
+  const dnMatch = s.match(/^dn::(.+?)::(.+)$/i);
+  if (dnMatch) return (dnMatch[1] + '::' + dnMatch[2]).toLowerCase();
+  /* Format: [TypeKey][mode][Category][value] → key=TypeKey, val=value */
+  const brMatch = s.match(/^\[([^\]]+)\]\[([^\]]*)\]\[([^\]]*)\]\[([^\]]*)\]$/);
+  if (brMatch) return (brMatch[1] + '::' + brMatch[4]).toLowerCase();
+  /* Fallback: normalize */
+  return s.toLowerCase().replace(/[_\-\s]+/g, '_');
+}
+function denominationsCanonicallyEqual(current, recommended) {
+  if (!current || !recommended) return false;
+  /* Quick exact/norm check first */
+  if (current === recommended || norm(current) === norm(recommended)) return true;
+  /* Entity extraction */
+  const eCur = extractDenomEntity(current);
+  const eRec = extractDenomEntity(recommended);
+  return eCur && eRec && eCur === eRec;
+}
+
 /* ── DATA MODEL ──────────────────────────────────────────────── */
 function makeSnap() {
   return {
@@ -1298,15 +1325,22 @@ function renderAiTraceBlock(card, session) {
   const rgRecCanon = rgCand ? canonicalRegion(rgCand) : '—';
   const rgCanonEq = regionsCanonicallyEqual(snapRg, rgCand);
   const dnCurNorm = norm(snapDn);
-  const dnRecNorm = norm(sel.denomination_candidate_id || '');
-  const dnEq = dnCurNorm === dnRecNorm;
+  const dnRecRaw = sel.denomination_candidate_id || '';
+  const dnRecNorm = norm(dnRecRaw);
+  const dnExactEq = dnCurNorm === dnRecNorm;
+  const dnEntityCur = extractDenomEntity(snapDn);
+  const dnEntityRec = extractDenomEntity(dnRecRaw);
+  const dnCanonEq = denominationsCanonicallyEqual(snapDn, dnRecRaw);
   const secB = tsec('B. Normalization', [
     trow('Region current → canonical', snapRg + ' → ' + rgCurCanon),
     trow('Region recommended → canonical', rgCand + ' → ' + rgRecCanon),
     trow('Region canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
-    trow('Denom current (norm)', dnCurNorm || '—'),
-    trow('Denom recommended (norm)', dnRecNorm || '—'),
-    trow('Denom exact match', String(dnEq), dnEq ? '#4ade80' : '#fbbf24'),
+    trow('Denom current (raw)', snapDn || '—'),
+    trow('Denom recommended (raw)', dnRecRaw || '—'),
+    trow('Denom exact/raw match', String(dnExactEq), dnExactEq ? '#4ade80' : '#fbbf24'),
+    trow('Denom entity current', dnEntityCur || '—'),
+    trow('Denom entity recommended', dnEntityRec || '—'),
+    trow('Denom canonical/entity match', String(dnCanonEq), dnCanonEq ? '#4ade80' : '#f87171'),
   ].join(''));
 
   /* C. AI Output */
@@ -1346,10 +1380,12 @@ function renderAiTraceBlock(card, session) {
     trow('RG recommended', rgCand || '—'),
     trow('RG canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
     trow('DN current', snapDn),
-    trow('DN recommended', sel.denomination_candidate_id || '—'),
-    trow('DN norm match', String(dnEq), dnEq ? '#4ade80' : '#fbbf24'),
-    trow('UI final color', card.finalColor, clr(card.finalColor).txt),
+    trow('DN recommended', dnRecRaw || '—'),
+    trow('DN exact match', String(dnExactEq), dnExactEq ? '#4ade80' : '#fbbf24'),
+    trow('DN canonical match', String(dnCanonEq), dnCanonEq ? '#4ade80' : '#f87171'),
+    trow('AI verdict (card)', card.aiVerdict || '—'),
     trow('operator override', card.operatorOverride || 'none'),
+    trow('card.finalColor', card.finalColor, clr(card.finalColor).txt),
   ].join(''));
 
   /* F. Iterative Chain Log */
@@ -1469,19 +1505,20 @@ function renderDetailPanel(session) {
     { label: 'Источник', value: 'catalogue' },
   ]);
 
-  /* Block 5: Denomination (MSG70 bugfix: status semantics) */
+  /* Block 5: Denomination (MSG79: canonical/entity comparison) */
   const dnMod = mods.denomination || {};
   const dnCand = sel.denomination_candidate_id || '';
   const dnCurrent = den2(b);
-  /* green = match confirmed AND current field already equals recommended
-     yellow = recommendation exists but current field differs (needs apply)
+  const dnCanonMatch = denominationsCanonicallyEqual(dnCurrent, dnCand);
+  /* green = match confirmed AND current is canonically equivalent to recommended
+     yellow = recommendation exists but current is genuinely different (needs apply)
      red = explicit mismatch / no valid candidate
      gray = no data */
   let dnStatus;
-  if (dnMod.status === 'match' && (!dnCand || dnCand === dnCurrent || norm(dnCand) === norm(dnCurrent))) {
+  if (dnMod.status === 'match' && (!dnCand || dnCanonMatch)) {
     dnStatus = 'green';
-  } else if (dnMod.status === 'match' && dnCand && norm(dnCand) !== norm(dnCurrent)) {
-    dnStatus = 'yellow';   /* recommendation confirmed but field not yet updated */
+  } else if (dnMod.status === 'match' && dnCand && !dnCanonMatch) {
+    dnStatus = 'yellow';
   } else if (dnMod.status === 'mismatch') {
     dnStatus = 'red';
   } else {
