@@ -125,6 +125,30 @@ const esc    = s  => String(s ?? '').replace(/[&<>"]/g,
                        m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]));
 const isoNow = () => new Date().toISOString();
 
+/* ── CANONICAL REGION (bugfix MSG70) ────────────────────────── */
+/* Maps known region display aliases to a single canonical key.
+   "Global" / "WW" / "Worldwide" are the same region. */
+const REGION_ALIASES = {
+  'ww': 'ww', 'global': 'ww', 'worldwide': 'ww', 'world': 'ww',
+  'us': 'us', 'usa': 'us', 'united states': 'us', 'u.s.': 'us', 'u.s.a': 'us', 'u.s.a.': 'us',
+  'uk': 'uk', 'united kingdom': 'uk', 'great britain': 'uk', 'gb': 'uk',
+  'eu': 'eu', 'europe': 'eu', 'european union': 'eu',
+  'uae': 'uae', 'united arab emirates': 'uae',
+  'ksa': 'ksa', 'saudi arabia': 'ksa',
+  'turkiye': 'turkiye', 'türkiye': 'turkiye', 'turkey': 'turkiye',
+};
+function canonicalRegion(r) {
+  const k = String(r || '').toLowerCase().trim();
+  return REGION_ALIASES[k] || k;
+}
+function regionsCanonicallyEqual(a, b) {
+  if (!a || !b) return false;
+  /* Compare comma-separated region lists */
+  const listA = String(a).split(',').map(s => canonicalRegion(s.trim())).filter(Boolean).sort();
+  const listB = String(b).split(',').map(s => canonicalRegion(s.trim())).filter(Boolean).sort();
+  return listA.join(',') === listB.join(',');
+}
+
 /* ── DATA MODEL ──────────────────────────────────────────────── */
 function makeSnap() {
   return {
@@ -1169,10 +1193,11 @@ function renderTicketContext(card) {
   const nm  = b ? (b.name || card.productName) : card.productName;
   const desc = b ? (b.description || '') : '';
 
-  /* Region hint */
+  /* Region hint (canonical comparison — MSG70 bugfix) */
   const rgCand = sel.region_candidate_id || '';
+  const rgMatch = regionsCanonicallyEqual(rg, rgCand);
   let rgHelper = '';
-  if (rgCand && rgCand !== rg) {
+  if (rgCand && !rgMatch) {
     rgHelper = `<div style="margin-top:3px;padding:4px 8px;background:#fef3c7;border:1px solid #f59e0b;border-radius:4px;font-size:12px;color:#92400e;">
       В name найден другой регион: <b>${esc(rgCand)}</b><br>
       В таблице есть регион: <b>${esc(rgCand)}</b></div>`;
@@ -1203,7 +1228,7 @@ function renderTicketContext(card) {
         ${field('Price', (raw.input_card || {}).price || '—', 'neutral')}
         ${field('Product Type', pt, 'green')}
         ${field('Product nominal', (raw.input_card || {}).nominal || '—', 'neutral')}
-        ${field('Region', rg, rgCand && rgCand !== rg ? 'yellow' : 'neutral', rgHelper)}
+        ${field('Region', rg, (rgCand && !rgMatch) ? 'yellow' : 'neutral', rgHelper)}
         ${field('Denomination', dn, 'neutral')}
         ${field('Currency', (raw.input_card || {}).currency || '—', 'neutral')}
         <div style="display:grid;grid-template-columns:160px 1fr;border-bottom:1px solid #e5e7eb;">
@@ -1272,31 +1297,53 @@ function renderDetailPanel(session) {
     { label: 'Источник', value: 'catalogue' },
   ]);
 
-  /* Block 4: Регион */
+  /* Block 4: Регион (canonical comparison — MSG70 bugfix) */
   const rgMod = mods.region || {};
-  const rgStatus = rgMod.status === 'match' ? 'green' : rgMod.status === 'mismatch' ? 'red' : 'yellow';
-  const rgCand = sel.region_candidate_id || '';
+  const rgCand2 = sel.region_candidate_id || '';
   const rgCurrent = reg2(b);
+  const rgCanonMatch = regionsCanonicallyEqual(rgCurrent, rgCand2);
+  /* Override status if backend says mismatch but canonical says match */
+  const rgStatus = rgCanonMatch ? 'green'
+    : rgMod.status === 'match' ? 'green'
+    : rgMod.status === 'mismatch' ? 'red' : 'yellow';
   let rgHints = '';
-  if (rgCand && rgCand !== rgCurrent) {
-    rgHints = `<div style="margin-top:4px;font-size:12px;color:#fbbf24;">В name найден другой регион: <b>${esc(rgCand)}</b></div>` +
-              `<div style="font-size:12px;color:#fbbf24;">В таблице есть регион: <b>${esc(rgCand)}</b></div>`;
+  if (rgCand2 && !rgCanonMatch) {
+    rgHints = `<div style="margin-top:4px;font-size:12px;color:#fbbf24;">В name найден другой регион: <b>${esc(rgCand2)}</b></div>` +
+              `<div style="font-size:12px;color:#fbbf24;">В таблице есть регион: <b>${esc(rgCand2)}</b></div>`;
   }
   const sec4 = renderDetailSection('Регион', 4, rgStatus, [
     { label: 'Текущий', value: rgCurrent },
-    { label: 'Рекомендованный', html: esc(rgCand || '—') + rgHints },
-    { label: 'Действие', value: rgMod.reason || '—' },
+    { label: 'Рекомендованный', html: esc(rgCand2 || '—') + (rgCanonMatch && rgCand2 ? ' <span style="color:#4ade80;font-size:11px;">(canonical match)</span>' : '') + rgHints },
+    { label: 'Действие', value: rgCanonMatch ? 'Регион подтверждён (canonical match).' : (rgMod.reason || '—') },
     { label: 'Источник', value: 'catalogue' },
   ]);
 
-  /* Block 5: Denomination */
+  /* Block 5: Denomination (MSG70 bugfix: status semantics) */
   const dnMod = mods.denomination || {};
-  const dnStatus = dnMod.status === 'match' ? 'green' : dnMod.status === 'mismatch' ? 'red' : 'gray';
+  const dnCand = sel.denomination_candidate_id || '';
+  const dnCurrent = den2(b);
+  /* green = match confirmed AND current field already equals recommended
+     yellow = recommendation exists but current field differs (needs apply)
+     red = explicit mismatch / no valid candidate
+     gray = no data */
+  let dnStatus;
+  if (dnMod.status === 'match' && (!dnCand || dnCand === dnCurrent || norm(dnCand) === norm(dnCurrent))) {
+    dnStatus = 'green';
+  } else if (dnMod.status === 'match' && dnCand && norm(dnCand) !== norm(dnCurrent)) {
+    dnStatus = 'yellow';   /* recommendation confirmed but field not yet updated */
+  } else if (dnMod.status === 'mismatch') {
+    dnStatus = 'red';
+  } else {
+    dnStatus = 'gray';
+  }
+  const dnAction = dnStatus === 'green' ? (dnMod.reason || 'Denomination подтверждён.')
+    : dnStatus === 'yellow' ? 'Рекомендованный denomination подтверждён, но текущее значение в карточке отличается. Нужно применить замену.'
+    : (dnMod.reason || '—');
   const sec5 = renderDetailSection('Denomination', 5, dnStatus, [
-    { label: 'Текущий', value: den2(b) },
+    { label: 'Текущий', value: dnCurrent },
     { label: 'Режим', value: dnMod.mode || 'numeric' },
-    { label: 'Рекомендованный', value: sel.denomination_candidate_id || den2(b) },
-    { label: 'Действие', value: dnMod.reason || '—' },
+    { label: 'Рекомендованный', value: dnCand || dnCurrent },
+    { label: 'Действие', value: dnAction },
     { label: 'Источник', value: 'catalogue' },
   ]);
 
