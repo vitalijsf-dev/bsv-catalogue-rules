@@ -1354,22 +1354,23 @@ function renderTicketContext(card) {
       </div>
     </div>`;
   };
-  /* Dropdown field — shows real options from popup snapshot (MSG97) */
-  const selectField = (label, currentVal, options, recommended, tone, helper) => {
+  /* Dropdown field — shows real options from popup snapshot (MSG97 + MSG100) */
+  const selectField = (label, currentVal, options, recommended, canonMatch, tone, helper) => {
     const ts = toneStyles[tone] || toneStyles.neutral;
     if (!options || !options.length) return field(label, currentVal, tone, helper);
+    const showRec = recommended && !canonMatch;   /* hide recommendation when canonical match */
     const opts = options.map(o => {
       const isCurrent = (o.value === currentVal || o.label === currentVal);
-      const isRec = recommended && (o.label.toLowerCase().includes(recommended.toLowerCase()) ||
+      const isRec = showRec && (o.label.toLowerCase().includes(recommended.toLowerCase()) ||
         o.value.toLowerCase().includes(recommended.toLowerCase()));
-      const mark = isCurrent && isRec ? ' ✓ (текущий + рек.)' : isCurrent ? ' ✓ (текущий)' : isRec ? ' ★ (рекомендован)' : '';
+      const mark = isCurrent && isRec ? ' \u2713 (текущий + рек.)' : isCurrent ? ' \u2713 (текущий)' : isRec ? ' \u2605 (рекомендован)' : '';
       return `<option value="${esc(o.value)}"${isCurrent ? ' selected' : ''}>${esc(o.label)}${mark}</option>`;
     }).join('');
     return `<div style="display:grid;grid-template-columns:160px 1fr;border-bottom:1px solid #e5e7eb;">
       <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#475569;border-right:1px solid #e5e7eb;">${esc(label)}</div>
       <div style="padding:8px 12px;">
-        <select disabled style="width:100%;padding:7px 10px;font-size:14px;border-radius:4px;appearance:auto;${ts}">${opts}</select>
-        ${recommended ? `<div style="margin-top:2px;font-size:11px;color:#6b7280;">Рекомендация AI: <b>${esc(recommended)}</b></div>` : ''}
+        <select style="width:100%;padding:7px 10px;font-size:14px;border-radius:4px;appearance:auto;cursor:pointer;${ts}">${opts}</select>
+        ${showRec ? `<div style="margin-top:2px;font-size:11px;color:#6b7280;">Рекомендация AI: <b>${esc(recommended)}</b></div>` : ''}
         ${helper || ''}
       </div>
     </div>`;
@@ -1386,12 +1387,12 @@ function renderTicketContext(card) {
       <div style="background:#f9fafb;">
         ${field('Price', (raw.input_card || {}).price || '—', 'neutral')}
         ${ptOptions.length > 0
-          ? selectField('Product Type', b ? (b.productTypeId || '') : '', ptOptions, ptCand, (ptCand && !ptCanonMatch) ? 'yellow' : 'neutral', ptHelper)
+          ? selectField('Product Type', b ? (b.productTypeId || '') : '', ptOptions, ptCand, ptCanonMatch, (ptCand && !ptCanonMatch) ? 'yellow' : 'neutral', ptHelper)
           : field('Product Type', pt, (ptCand && !ptCanonMatch) ? 'yellow' : 'neutral', ptHelper)}
         ${field('Product nominal', (raw.input_card || {}).nominal || '—', 'neutral')}
         ${field('Region', rg, (rgCand && !rgMatch) ? 'yellow' : 'neutral', rgHelper)}
         ${dnOptions.length > 0
-          ? selectField('Denomination', b ? (b.denominationOptionId || '') : '', dnOptions, dnCandTc, (dnCandTc && !dnMatchTc) ? 'yellow' : 'neutral', dnHelper)
+          ? selectField('Denomination', b ? (b.denominationOptionId || '') : '', dnOptions, dnCandTc, dnMatchTc, (dnCandTc && !dnMatchTc) ? 'yellow' : 'neutral', dnHelper)
           : field('Denomination', dn, (dnCandTc && !dnMatchTc) ? 'yellow' : 'neutral', dnHelper)}
         ${field('Currency', (raw.input_card || {}).currency || '—', 'neutral')}
         <div style="display:grid;grid-template-columns:160px 1fr;border-bottom:1px solid #e5e7eb;">
