@@ -198,8 +198,10 @@ function denominationsCanonicallyEqual(current, recommended) {
 function makeSnap() {
   return {
     productTypeId: null, productTypeName: null,
-    regions: [],         /* [{id, name, geoKeyword}] */
+    productTypeOptions: [],    /* [{value, label}] — all available PT options from popup */
+    regions: [],               /* [{id, name, geoKeyword}] */
     denominationOptionId: null, denominationLabel: null,
+    denominationOptions: [],   /* [{value, label}] — all available denom options from popup */
     name: '', description: '',
     capturedAt: null,
   };
@@ -381,6 +383,17 @@ function readSnapshotFromPopup(win) {
     snap.denominationOptionId = denomEl ? denomEl.value : null;
     snap.denominationLabel    = (denomEl && denomEl.selectedOptions && denomEl.selectedOptions[0])
       ? norm(denomEl.selectedOptions[0].textContent) : null;
+    /* Capture available options for operator dropdowns (MSG97) */
+    if (typeEl) {
+      snap.productTypeOptions = [...typeEl.options]
+        .filter(o => o.value)
+        .map(o => ({ value: o.value, label: norm(o.textContent) }));
+    }
+    if (denomEl) {
+      snap.denominationOptions = [...denomEl.options]
+        .filter(o => o.value)
+        .map(o => ({ value: o.value, label: norm(o.textContent) }));
+    }
     snap.name        = nameEl ? norm(nameEl.value)          : '';
     snap.description = descEl ? String(descEl.value || '').trim() : '';
     return snap;
@@ -1283,16 +1296,33 @@ function renderTicketContext(card) {
       `В таблице есть denomination: <b>${esc(dnCandTc)}</b>`);
   }
 
-  /* Evidence highlighting (MSG89): collect terms that influenced the decision */
+  /* Evidence highlighting (MSG89 + MSG97): collect terms that influenced the decision */
   const evidenceTerms = [];   /* [{term, type:'confirm'|'replace'}] */
-  /* Confirmed values → green highlights */
-  if (pt && pt !== '—') evidenceTerms.push({ term: pt, type: 'confirm' });
-  if (rg && rg !== '—') rg.split(',').forEach(r => { const t = r.trim(); if (t) evidenceTerms.push({ term: t, type: 'confirm' }); });
-  if (dn && dn !== '—') evidenceTerms.push({ term: dn, type: 'confirm' });
-  /* Replacement candidates → yellow highlights */
-  if (ptCand && !ptCanonMatch) evidenceTerms.push({ term: ptCand, type: 'replace' });
-  if (rgCand && !rgMatch) evidenceTerms.push({ term: rgCand, type: 'replace' });
-  if (dnCandTc && !dnMatchTc) evidenceTerms.push({ term: dnCandTc, type: 'replace' });
+  const mods = raw.modules || {};
+  const addEvidence = (term, type) => {
+    if (!term || term === '—' || term.length < 2) return;
+    /* Avoid duplicates */
+    if (evidenceTerms.some(e => e.term.toLowerCase() === term.toLowerCase())) return;
+    evidenceTerms.push({ term, type });
+  };
+  /* Confirmed current values → green */
+  if (pt && pt !== '—') addEvidence(pt, 'confirm');
+  if (rg && rg !== '—') rg.split(',').forEach(r => addEvidence(r.trim(), 'confirm'));
+  if (dn && dn !== '—' && dn.length < 60) addEvidence(dn, 'confirm');
+  /* Replacement candidates → yellow */
+  if (ptCand && !ptCanonMatch) addEvidence(ptCand, 'replace');
+  if (rgCand && !rgMatch) addEvidence(rgCand, 'replace');
+  if (dnCandTc && !dnMatchTc && dnCandTc.length < 60) addEvidence(dnCandTc, 'replace');
+  /* Module-level evidence: extract key terms from PT/RG candidate IDs */
+  /* PT candidate parts (e.g. "Games-Fortnite" → "Games", "Fortnite") */
+  if (ptCand) ptCand.split(/[-–_/]/).forEach(p => { const t = p.trim(); if (t.length >= 3) addEvidence(t, ptCanonMatch ? 'confirm' : 'replace'); });
+  /* RG candidate — add as evidence if short enough */
+  if (rgCand && rgCand.length < 30) addEvidence(rgCand, rgMatch ? 'confirm' : 'replace');
+  /* DN candidate — extract readable part if it's a dn:: format */
+  if (dnCandTc) {
+    const dnParts = dnCandTc.match(/^dn::(.+?)::(.+)$/i);
+    if (dnParts) { addEvidence(dnParts[2], dnMatchTc ? 'confirm' : 'replace'); }
+  }
   /* Build highlight function */
   function highlightEvidence(text) {
     if (!text || !evidenceTerms.length) return esc(text);
@@ -1308,13 +1338,13 @@ function renderTicketContext(card) {
     return html;
   }
 
+  const toneStyles = {
+    neutral: 'border:1px solid #d1d5db;background:#fff;color:#1e293b;',
+    green:   'border:1px solid #86efac;background:#f0fdf4;color:#14532d;',
+    yellow:  'border:1px solid #fcd34d;background:#fefce8;color:#713f12;',
+    red:     'border:1px solid #fca5a5;background:#fef2f2;color:#7f1d1d;',
+  };
   const field = (label, value, tone, helper) => {
-    const toneStyles = {
-      neutral: 'border:1px solid #d1d5db;background:#fff;color:#1e293b;',
-      green:   'border:1px solid #86efac;background:#f0fdf4;color:#14532d;',
-      yellow:  'border:1px solid #fcd34d;background:#fefce8;color:#713f12;',
-      red:     'border:1px solid #fca5a5;background:#fef2f2;color:#7f1d1d;',
-    };
     const ts = toneStyles[tone] || toneStyles.neutral;
     return `<div style="display:grid;grid-template-columns:160px 1fr;border-bottom:1px solid #e5e7eb;">
       <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#475569;border-right:1px solid #e5e7eb;">${esc(label)}</div>
@@ -1324,6 +1354,30 @@ function renderTicketContext(card) {
       </div>
     </div>`;
   };
+  /* Dropdown field — shows real options from popup snapshot (MSG97) */
+  const selectField = (label, currentVal, options, recommended, tone, helper) => {
+    const ts = toneStyles[tone] || toneStyles.neutral;
+    if (!options || !options.length) return field(label, currentVal, tone, helper);
+    const opts = options.map(o => {
+      const isCurrent = (o.value === currentVal || o.label === currentVal);
+      const isRec = recommended && (o.label.toLowerCase().includes(recommended.toLowerCase()) ||
+        o.value.toLowerCase().includes(recommended.toLowerCase()));
+      const mark = isCurrent && isRec ? ' ✓ (текущий + рек.)' : isCurrent ? ' ✓ (текущий)' : isRec ? ' ★ (рекомендован)' : '';
+      return `<option value="${esc(o.value)}"${isCurrent ? ' selected' : ''}>${esc(o.label)}${mark}</option>`;
+    }).join('');
+    return `<div style="display:grid;grid-template-columns:160px 1fr;border-bottom:1px solid #e5e7eb;">
+      <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#475569;border-right:1px solid #e5e7eb;">${esc(label)}</div>
+      <div style="padding:8px 12px;">
+        <select disabled style="width:100%;padding:7px 10px;font-size:14px;border-radius:4px;appearance:auto;${ts}">${opts}</select>
+        ${recommended ? `<div style="margin-top:2px;font-size:11px;color:#6b7280;">Рекомендация AI: <b>${esc(recommended)}</b></div>` : ''}
+        ${helper || ''}
+      </div>
+    </div>`;
+  };
+
+  /* Available options from popup snapshot */
+  const ptOptions = b ? (b.productTypeOptions || []) : [];
+  const dnOptions = b ? (b.denominationOptions || []) : [];
 
   return `
     <div style="margin-bottom:12px;border:1px solid #d1d5db;border-radius:12px;overflow:hidden;background:#fff;">
@@ -1331,10 +1385,14 @@ function renderTicketContext(card) {
         background:#f8fafc;">Ticket Context</div>
       <div style="background:#f9fafb;">
         ${field('Price', (raw.input_card || {}).price || '—', 'neutral')}
-        ${field('Product Type', pt, (ptCand && !ptCanonMatch) ? 'yellow' : 'neutral', ptHelper)}
+        ${ptOptions.length > 0
+          ? selectField('Product Type', b ? (b.productTypeId || '') : '', ptOptions, ptCand, (ptCand && !ptCanonMatch) ? 'yellow' : 'neutral', ptHelper)
+          : field('Product Type', pt, (ptCand && !ptCanonMatch) ? 'yellow' : 'neutral', ptHelper)}
         ${field('Product nominal', (raw.input_card || {}).nominal || '—', 'neutral')}
         ${field('Region', rg, (rgCand && !rgMatch) ? 'yellow' : 'neutral', rgHelper)}
-        ${field('Denomination', dn, (dnCandTc && !dnMatchTc) ? 'yellow' : 'neutral', dnHelper)}
+        ${dnOptions.length > 0
+          ? selectField('Denomination', b ? (b.denominationOptionId || '') : '', dnOptions, dnCandTc, (dnCandTc && !dnMatchTc) ? 'yellow' : 'neutral', dnHelper)
+          : field('Denomination', dn, (dnCandTc && !dnMatchTc) ? 'yellow' : 'neutral', dnHelper)}
         ${field('Currency', (raw.input_card || {}).currency || '—', 'neutral')}
         <div style="display:grid;grid-template-columns:160px 1fr;border-bottom:1px solid #e5e7eb;">
           <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#475569;border-right:1px solid #e5e7eb;">Name</div>
