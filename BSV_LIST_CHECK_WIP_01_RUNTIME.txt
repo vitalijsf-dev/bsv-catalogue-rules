@@ -1144,6 +1144,72 @@ function renderDetailSection(title, idx, status, fields) {
     </div>`;
 }
 
+/* ── TICKET CONTEXT BLOCK ───────────────────────────────────── */
+function renderTicketContext(card) {
+  const b   = card.beforeSnapshot;
+  const raw = card.aiRaw || {};
+  const sel = raw.selection || {};
+  const pt  = b ? (b.productTypeName || b.productTypeId || '—') : card.productType || '—';
+  const rg  = b ? ((b.regions || []).map(r => r.name).join(', ') || '—') : '—';
+  const dn  = b ? (b.denominationLabel || b.denominationOptionId || '—') : '—';
+  const nm  = b ? (b.name || card.productName) : card.productName;
+  const desc = b ? (b.description || '') : '';
+
+  /* Region hint */
+  const rgCand = sel.region_candidate_id || '';
+  let rgHelper = '';
+  if (rgCand && rgCand !== rg) {
+    rgHelper = `<div style="margin-top:3px;padding:4px 8px;background:rgba(251,191,36,.08);border-radius:6px;font-size:12px;color:#fbbf24;">
+      В name найден другой регион: <b>${esc(rgCand)}</b><br>
+      В таблице есть регион: <b>${esc(rgCand)}</b></div>`;
+  }
+
+  const field = (label, value, tone, helper) => {
+    const toneColors = {
+      neutral: 'border-color:rgba(255,255,255,.12);background:rgba(255,255,255,.03);color:#e5e7eb;',
+      green:   'border-color:rgba(34,197,94,.4);background:rgba(34,197,94,.06);color:#86efac;',
+      yellow:  'border-color:rgba(234,179,8,.4);background:rgba(234,179,8,.06);color:#fde68a;',
+      red:     'border-color:rgba(239,68,68,.4);background:rgba(239,68,68,.06);color:#fca5a5;',
+    };
+    const ts = toneColors[tone] || toneColors.neutral;
+    return `<div style="display:grid;grid-template-columns:150px 1fr;border-bottom:1px solid rgba(255,255,255,.06);">
+      <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#cbd5e1;border-right:1px solid rgba(255,255,255,.06);">${esc(label)}</div>
+      <div style="padding:8px 12px;">
+        <div style="border:1px solid;padding:6px 10px;font-size:14px;border-radius:4px;${ts}">${esc(value)}</div>
+        ${helper || ''}
+      </div>
+    </div>`;
+  };
+
+  return `
+    <div style="margin-bottom:12px;border:1px solid rgba(255,255,255,.15);border-radius:16px;overflow:hidden;background:#d9d9dc;">
+      <div style="padding:8px 14px;border-bottom:1px solid rgba(0,0,0,.12);font-size:16px;font-weight:800;color:#1e293b;">
+        Ticket Context</div>
+      <div style="background:#0f1a30;">
+        ${field('Price', (raw.input_card || {}).price || '—', 'neutral')}
+        ${field('Product Type', pt, 'green')}
+        ${field('Product nominal', (raw.input_card || {}).nominal || '—', 'neutral')}
+        ${field('Region', rg, rgCand && rgCand !== rg ? 'yellow' : 'neutral', rgHelper)}
+        ${field('Denomination', dn, 'neutral')}
+        ${field('Currency', (raw.input_card || {}).currency || '—', 'neutral')}
+        <div style="display:grid;grid-template-columns:150px 1fr;border-bottom:1px solid rgba(255,255,255,.06);">
+          <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#cbd5e1;border-right:1px solid rgba(255,255,255,.06);">Name</div>
+          <div style="padding:8px 12px;">
+            <div style="border:1px solid rgba(147,197,253,.3);background:rgba(255,255,255,.03);padding:6px 10px;
+              font-size:14px;color:#e5e7eb;border-radius:4px;word-break:break-word;">${esc(nm)}</div>
+          </div>
+        </div>
+        ${desc ? `<div style="display:grid;grid-template-columns:150px 1fr;">
+          <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#cbd5e1;border-right:1px solid rgba(255,255,255,.06);">Description</div>
+          <div style="padding:8px 12px;">
+            <div style="border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);padding:6px 10px;
+              font-size:13px;color:#cbd5e1;border-radius:4px;white-space:pre-line;max-height:160px;overflow-y:auto;">${esc(desc)}</div>
+          </div>
+        </div>` : ''}
+      </div>
+    </div>`;
+}
+
 function renderDetailPanel(session) {
   const detail = $('wip01-detail');
   const card = session.cards.find(c => c.productId === _s.uiSelectedId);
@@ -1160,6 +1226,9 @@ function renderDetailPanel(session) {
   const pt2  = s => s ? (s.productTypeName || s.productTypeId || '—') : '—';
   const reg2 = s => s ? ((s.regions || []).map(r => r.name).join(', ') || '—') : '—';
   const den2 = s => s ? (s.denominationLabel || s.denominationOptionId || '—') : '—';
+
+  /* Ticket Context form block (above analysis) */
+  const ticketCtx = renderTicketContext(card);
 
   /* Block 1: Итоговый результат */
   const sec1 = renderDetailSection('Итоговый результат', 1, card.finalColor, [
@@ -1264,6 +1333,7 @@ function renderDetailPanel(session) {
         </div>
       </div>
       <div style="padding:14px 18px;">
+        ${ticketCtx}
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
           <div style="grid-column:1/-1;">${sec1}</div>
           ${sec2}
