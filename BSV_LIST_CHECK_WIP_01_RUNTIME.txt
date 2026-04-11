@@ -1552,27 +1552,33 @@ function renderDetailPanel(session) {
     { label: 'Источник', value: 'catalogue' },
   ]);
 
-  /* Block 5: Denomination (MSG79: canonical/entity comparison) */
+  /* Block 5: Denomination (MSG87: status rules registry aligned)
+     Rules (see LIST_CHECK_STATUS_RULES_REGISTRY):
+       green   = recommended found AND current canonically equals recommended
+       yellow  = recommended found AND current differs (needs apply)
+       red     = explicit mismatch / no valid candidate
+       neutral = ONLY if no recommended candidate exists at all */
   const dnMod = mods.denomination || {};
   const dnCand = sel.denomination_candidate_id || '';
   const dnCurrent = den2(b);
   const dnCanonMatch = denominationsCanonicallyEqual(dnCurrent, dnCand);
-  /* green = match confirmed AND current is canonically equivalent to recommended
-     yellow = recommendation exists but current is genuinely different (needs apply)
-     red = explicit mismatch / no valid candidate
-     gray = no data */
   let dnStatus;
-  if (dnMod.status === 'match' && (!dnCand || dnCanonMatch)) {
-    dnStatus = 'green';
-  } else if (dnMod.status === 'match' && dnCand && !dnCanonMatch) {
-    dnStatus = 'yellow';
+  if (dnCand && dnCanonMatch) {
+    dnStatus = 'green';                      /* recommended found, current matches */
+  } else if (dnCand && !dnCanonMatch) {
+    dnStatus = 'yellow';                     /* recommended found, current differs → apply needed */
   } else if (dnMod.status === 'mismatch') {
-    dnStatus = 'red';
+    dnStatus = 'red';                        /* explicit conflict */
+  } else if (!dnCand && dnMod.status === 'match') {
+    dnStatus = 'green';                      /* match without specific candidate (backend confirmed) */
+  } else if (!dnCand) {
+    dnStatus = 'gray';                       /* no candidate, no conflict → truly neutral */
   } else {
-    dnStatus = 'gray';
+    dnStatus = 'yellow';                     /* fallback: candidate exists → needs review */
   }
   const dnAction = dnStatus === 'green' ? (dnMod.reason || 'Denomination подтверждён.')
-    : dnStatus === 'yellow' ? 'Рекомендованный denomination подтверждён, но текущее значение в карточке отличается. Нужно применить замену.'
+    : dnStatus === 'yellow' ? 'Рекомендованный denomination найден, но текущее значение в карточке отличается. Нужно применить замену.'
+    : dnStatus === 'red' ? (dnMod.reason || 'Конфликт denomination.')
     : (dnMod.reason || '—');
   const sec5 = renderDetailSection('Denomination', 5, dnStatus, [
     { label: 'Текущий', value: dnCurrent },
