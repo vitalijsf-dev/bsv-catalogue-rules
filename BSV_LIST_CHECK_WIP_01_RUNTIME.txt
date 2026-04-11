@@ -150,6 +150,22 @@ function regionsCanonicallyEqual(a, b) {
   return listA.join(',') === listB.join(',');
 }
 
+/* ── CANONICAL PRODUCT TYPE (bugfix MSG84) ───────────────────── */
+/* "Fortnite - Games" and "Games-Fortnite" are the same ProductType.
+   Canonicalize by: lowercase, split on separators, sort parts, join. */
+function canonicalProductType(v) {
+  const s = String(v || '').toLowerCase().trim();
+  if (!s) return '';
+  /* Split on common separators: " - ", " – ", "-", "_", "/" */
+  const parts = s.split(/\s*[-–/_]\s*/).map(p => p.trim()).filter(Boolean).sort();
+  return parts.join('::');
+}
+function productTypesCanonicallyEqual(current, recommended) {
+  if (!current || !recommended) return false;
+  if (current === recommended || norm(current) === norm(recommended)) return true;
+  return canonicalProductType(current) === canonicalProductType(recommended);
+}
+
 /* ── CANONICAL DENOMINATION (bugfix MSG79) ───────────────────── */
 /* DOM select values use format: [TypeKey][mode][Category][value]
    Backend candidate IDs use format: dn::TypeKey::value
@@ -1224,11 +1240,11 @@ function renderTicketContext(card) {
   /* Replacement hint builder (unified pattern — MSG81) */
   const hintBox = lines => `<div style="margin-top:3px;padding:4px 8px;background:#fef3c7;border:1px solid #f59e0b;border-radius:4px;font-size:12px;color:#92400e;">${lines}</div>`;
 
-  /* ProductType hint */
+  /* ProductType hint (canonical — MSG84) */
   const ptCand = sel.product_type_candidate_id || '';
-  const ptMatch = !ptCand || norm(pt) === norm(ptCand) || pt === ptCand;
+  const ptCanonMatch = !ptCand || productTypesCanonicallyEqual(pt, ptCand);
   let ptHelper = '';
-  if (ptCand && !ptMatch) {
+  if (ptCand && !ptCanonMatch) {
     ptHelper = hintBox(
       `Название/описание указывает на другой ProductType: <b>${esc(ptCand)}</b><br>` +
       `В таблице есть ProductType: <b>${esc(ptCand)}</b>`);
@@ -1277,7 +1293,7 @@ function renderTicketContext(card) {
         background:#f8fafc;">Ticket Context</div>
       <div style="background:#f9fafb;">
         ${field('Price', (raw.input_card || {}).price || '—', 'neutral')}
-        ${field('Product Type', pt, (ptCand && !ptMatch) ? 'yellow' : 'neutral', ptHelper)}
+        ${field('Product Type', pt, (ptCand && !ptCanonMatch) ? 'yellow' : 'neutral', ptHelper)}
         ${field('Product nominal', (raw.input_card || {}).nominal || '—', 'neutral')}
         ${field('Region', rg, (rgCand && !rgMatch) ? 'yellow' : 'neutral', rgHelper)}
         ${field('Denomination', dn, (dnCandTc && !dnMatchTc) ? 'yellow' : 'neutral', dnHelper)}
@@ -1394,11 +1410,15 @@ function renderAiTraceBlock(card, session) {
 
   /* E. Comparison Matrix */
   const ptRec = sel.product_type_candidate_id || '';
+  const ptExactEq = norm(snapPt) === norm(ptRec);
+  const ptCanonEq = productTypesCanonicallyEqual(snapPt, ptRec);
   const secE = tsec('E. Comparison Matrix', [
     trow('PT current', snapPt),
     trow('PT recommended', ptRec || '—'),
-    trow('PT match', snapPt && ptRec ? String(norm(snapPt) === norm(ptRec)) : '—',
-      norm(snapPt) === norm(ptRec) ? '#4ade80' : '#fbbf24'),
+    trow('PT canonical current', canonicalProductType(snapPt) || '—'),
+    trow('PT canonical recommended', canonicalProductType(ptRec) || '—'),
+    trow('PT exact match', snapPt && ptRec ? String(ptExactEq) : '—', ptExactEq ? '#4ade80' : '#fbbf24'),
+    trow('PT canonical match', snapPt && ptRec ? String(ptCanonEq) : '—', ptCanonEq ? '#4ade80' : '#f87171'),
     trow('RG current', snapRg),
     trow('RG recommended', rgCand || '—'),
     trow('RG canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
@@ -1497,13 +1517,17 @@ function renderDetailPanel(session) {
     { label: 'Совпадения', value: mrMod.reason || 'не найдено' },
   ]);
 
-  /* Block 3: ProductType */
+  /* Block 3: ProductType (canonical — MSG84) */
   const ptMod = mods.product_type || {};
-  const ptStatus = ptMod.status === 'match' ? 'green' : ptMod.status === 'mismatch' ? 'red' : 'yellow';
+  const ptCand3 = sel.product_type_candidate_id || '';
+  const ptCur3 = pt2(b);
+  const ptCanonMatch3 = productTypesCanonicallyEqual(ptCur3, ptCand3);
+  const ptStatus = (ptCanonMatch3 || ptMod.status === 'match') ? 'green'
+    : ptMod.status === 'mismatch' ? 'red' : 'yellow';
   const sec3 = renderDetailSection('ProductType', 3, ptStatus, [
-    { label: 'Текущий', value: pt2(b) },
-    { label: 'Рекомендованный', value: sel.product_type_candidate_id || pt2(b) },
-    { label: 'Действие', value: ptMod.reason || '—' },
+    { label: 'Текущий', value: ptCur3 },
+    { label: 'Рекомендованный', html: esc(ptCand3 || ptCur3) + (ptCanonMatch3 && ptCand3 ? ' <span style="color:#4ade80;font-size:11px;">(canonical match)</span>' : '') },
+    { label: 'Действие', value: ptCanonMatch3 ? 'ProductType подтверждён (canonical match).' : (ptMod.reason || '—') },
     { label: 'Источник', value: 'catalogue' },
   ]);
 
