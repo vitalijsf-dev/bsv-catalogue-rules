@@ -1296,46 +1296,77 @@ function renderTicketContext(card) {
       `В таблице есть denomination: <b>${esc(dnCandTc)}</b>`);
   }
 
-  /* Evidence highlighting (MSG89 + MSG97): collect terms that influenced the decision */
+  /* Evidence highlighting (MSG89/97/103): collect terms that influenced the decision */
+  /* Known aliases from AI_Allowed_Aliases (product_type relevant subset) */
+  const PT_ALIASES = ['itunes','apple','psn','playstation network','lol','pubg','pubg mobile',
+    'razer','razer pin','currys','google play','spotify','fortnite','xbox','steam','nintendo',
+    'gift card','gift cards','subscription','game key','game keys'];
   const evidenceTerms = [];   /* [{term, type:'confirm'|'replace'}] */
-  const mods = raw.modules || {};
   const addEvidence = (term, type) => {
     if (!term || term === '—' || term.length < 2) return;
-    /* Avoid duplicates */
     if (evidenceTerms.some(e => e.term.toLowerCase() === term.toLowerCase())) return;
     evidenceTerms.push({ term, type });
   };
-  /* Confirmed current values → green */
-  if (pt && pt !== '—') addEvidence(pt, 'confirm');
+  /* Helper: split compound PT name into individual meaningful words */
+  const splitPtTerms = (s) => {
+    if (!s) return [];
+    const terms = [];
+    /* Split on separators first */
+    s.split(/[-–_/,]/).forEach(chunk => {
+      const t = chunk.trim();
+      if (t.length >= 3) terms.push(t);
+      /* Also split multi-word chunks into individual words ≥3 chars */
+      t.split(/\s+/).forEach(w => { if (w.length >= 3 && w !== t) terms.push(w); });
+    });
+    return terms;
+  };
+  const ptType = ptCanonMatch ? 'confirm' : 'replace';
+  /* PT terms: full name + parts + individual words */
+  if (pt && pt !== '—') {
+    addEvidence(pt, 'confirm');
+    splitPtTerms(pt).forEach(t => addEvidence(t, 'confirm'));
+  }
+  if (ptCand) splitPtTerms(ptCand).forEach(t => addEvidence(t, ptType));
+  /* PT aliases: check which known aliases appear to be relevant */
+  PT_ALIASES.forEach(alias => {
+    const al = alias.toLowerCase();
+    if ((pt && pt.toLowerCase().includes(al)) || (ptCand && ptCand.toLowerCase().includes(al))) {
+      addEvidence(alias, ptType);
+    }
+  });
+  /* Region */
   if (rg && rg !== '—') rg.split(',').forEach(r => addEvidence(r.trim(), 'confirm'));
+  if (rgCand && !rgMatch && rgCand.length < 30) addEvidence(rgCand, 'replace');
+  /* Denomination */
   if (dn && dn !== '—' && dn.length < 60) addEvidence(dn, 'confirm');
-  /* Replacement candidates → yellow */
-  if (ptCand && !ptCanonMatch) addEvidence(ptCand, 'replace');
-  if (rgCand && !rgMatch) addEvidence(rgCand, 'replace');
   if (dnCandTc && !dnMatchTc && dnCandTc.length < 60) addEvidence(dnCandTc, 'replace');
-  /* Module-level evidence: extract key terms from PT/RG candidate IDs */
-  /* PT candidate parts (e.g. "Games-Fortnite" → "Games", "Fortnite") */
-  if (ptCand) ptCand.split(/[-–_/]/).forEach(p => { const t = p.trim(); if (t.length >= 3) addEvidence(t, ptCanonMatch ? 'confirm' : 'replace'); });
-  /* RG candidate — add as evidence if short enough */
-  if (rgCand && rgCand.length < 30) addEvidence(rgCand, rgMatch ? 'confirm' : 'replace');
-  /* DN candidate — extract readable part if it's a dn:: format */
   if (dnCandTc) {
     const dnParts = dnCandTc.match(/^dn::(.+?)::(.+)$/i);
-    if (dnParts) { addEvidence(dnParts[2], dnMatchTc ? 'confirm' : 'replace'); }
+    if (dnParts) addEvidence(dnParts[2], dnMatchTc ? 'confirm' : 'replace');
   }
-  /* Build highlight function */
+
+  /* Build highlight function — single-pass to avoid nested HTML corruption (MSG103 fix) */
   function highlightEvidence(text) {
     if (!text || !evidenceTerms.length) return esc(text);
-    let html = esc(text);
+    /* Work on raw text, not pre-escaped */
+    const raw = String(text);
+    /* Build combined regex from all terms, longest first */
     const sorted = [...evidenceTerms].sort((a, b) => b.term.length - a.term.length);
-    for (const ev of sorted) {
-      const t = ev.term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const style = ev.type === 'confirm'
-        ? 'background:#dcfce7;color:#14532d;padding:0 3px;border-radius:3px;font-weight:600;'
-        : 'background:#fef3c7;color:#92400e;padding:0 3px;border-radius:3px;font-weight:600;';
-      html = html.replace(new RegExp(t, 'gi'), m => `<span style="${style}">${m}</span>`);
-    }
-    return html;
+    const patterns = sorted.map(ev => ev.term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    if (!patterns.length) return esc(text);
+    const combinedRe = new RegExp('(' + patterns.join('|') + ')', 'gi');
+    /* Split text into parts: matched vs unmatched */
+    const parts = raw.split(combinedRe);
+    return parts.map(part => {
+      const ev = sorted.find(e => e.term.toLowerCase() === part.toLowerCase());
+      if (ev) {
+        const style = ev.type === 'confirm'
+          ? 'background:#dcfce7;color:#14532d;padding:0 3px;border-radius:3px;font-weight:600'
+          : 'background:#fef3c7;color:#92400e;padding:0 3px;border-radius:3px;font-weight:600';
+        return '<span style="' + style + '">' + esc(part) + '</span>';
+      }
+      return esc(part);
+    }).join('');
   }
 
   const toneStyles = {
