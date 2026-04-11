@@ -1266,13 +1266,15 @@ function renderTicketContext(card) {
 
   /* ── Candidate comparisons (MUST be declared before evidence terms use them — MSG95 fix) ── */
   const ptCand = sel.product_type_candidate_id || '';
-  const ptCanonMatch = !ptCand || productTypesCanonicallyEqual(pt, ptCand);
+  const ptModStatus = ((raw.modules || {}).product_type || {}).status || '';
+  /* PT is resolved as confirmed if: backend says match OR canonical/semantic match (MSG110) */
+  const ptCanonMatch = !ptCand || ptModStatus === 'match' || productTypesCanonicallyEqual(pt, ptCand);
   const rgCand = sel.region_candidate_id || '';
   const rgMatch = regionsCanonicallyEqual(rg, rgCand);
   const dnCandTc = sel.denomination_candidate_id || '';
   const dnMatchTc = !dnCandTc || denominationsCanonicallyEqual(dn, dnCandTc);
 
-  /* ProductType hint */
+  /* ProductType hint — only shown when PT is genuinely unconfirmed (MSG110) */
   let ptHelper = '';
   if (ptCand && !ptCanonMatch) {
     ptHelper = hintBox(
