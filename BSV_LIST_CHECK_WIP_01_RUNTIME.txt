@@ -101,6 +101,7 @@ const _s = {
   overlay:         null,
   session:         null,
   uiSelectedId:    null,         /* product ID of card shown in detail panel */
+  uiTraceOpen:     false,        /* AI trace block collapsed by default */
   onStartScan:     null,         /* set by main(), called by startup button */
 };
 
@@ -1249,6 +1250,163 @@ function renderTicketContext(card) {
     </div>`;
 }
 
+/* ── AI TRACE / DEBUG BLOCK (MSG74) ──────────────────────────── */
+function renderAiTraceBlock(card, session) {
+  if (!_s.uiTraceOpen) {
+    return `<div style="margin-top:12px;">
+      <button type="button" id="wip01-trace-toggle" style="border:1px solid rgba(255,255,255,.1);
+        border-radius:8px;padding:6px 14px;background:rgba(255,255,255,.04);color:#6b7280;
+        font-size:12px;font-weight:700;cursor:pointer;width:100%;">
+        ▶ AI Trace / Debug</button></div>`;
+  }
+
+  const raw  = card.aiRaw || {};
+  const mods = raw.modules || {};
+  const sel  = raw.selection || {};
+  const inp  = raw.input_card || {};
+  const b    = card.beforeSnapshot;
+  const a    = card.afterSnapshot;
+
+  const trow = (k, v, color) => {
+    const vc = color ? ` style="color:${color};"` : '';
+    return `<tr><td style="padding:2px 8px;color:#6b7280;font-size:11px;white-space:nowrap;vertical-align:top;">${esc(k)}</td>` +
+      `<td${vc} style="padding:2px 8px;font-size:11px;word-break:break-all;">${esc(String(v ?? '—'))}</td></tr>`;
+  };
+  const tsec = (title, rows) =>
+    `<div style="margin-bottom:8px;">
+      <div style="font-size:11px;font-weight:800;color:#60a5fa;margin-bottom:2px;text-transform:uppercase;letter-spacing:.08em;">${esc(title)}</div>
+      <table style="width:100%;border-collapse:collapse;font-family:monospace,monospace;">${rows}</table>
+    </div>`;
+
+  /* A. Input snapshot */
+  const snapPt  = b ? (b.productTypeName || b.productTypeId || '') : '';
+  const snapRg  = b ? ((b.regions || []).map(r => r.name).join(', ')) : '';
+  const snapDn  = b ? (b.denominationLabel || b.denominationOptionId || '') : '';
+  const snapNm  = b ? b.name : card.productName;
+  const snapDesc = b ? (b.description || '').slice(0, 200) : '';
+  const secA = tsec('A. Input Snapshot', [
+    trow('ProductType (raw)', snapPt),
+    trow('Region (raw)', snapRg),
+    trow('Denomination (raw)', snapDn),
+    trow('Name', snapNm),
+    trow('Description', snapDesc + (snapDesc.length >= 200 ? '...' : '')),
+  ].join(''));
+
+  /* B. Normalization */
+  const rgCand = sel.region_candidate_id || '';
+  const rgCurCanon = snapRg ? snapRg.split(',').map(s => canonicalRegion(s.trim())).join(', ') : '—';
+  const rgRecCanon = rgCand ? canonicalRegion(rgCand) : '—';
+  const rgCanonEq = regionsCanonicallyEqual(snapRg, rgCand);
+  const dnCurNorm = norm(snapDn);
+  const dnRecNorm = norm(sel.denomination_candidate_id || '');
+  const dnEq = dnCurNorm === dnRecNorm;
+  const secB = tsec('B. Normalization', [
+    trow('Region current → canonical', snapRg + ' → ' + rgCurCanon),
+    trow('Region recommended → canonical', rgCand + ' → ' + rgRecCanon),
+    trow('Region canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
+    trow('Denom current (norm)', dnCurNorm || '—'),
+    trow('Denom recommended (norm)', dnRecNorm || '—'),
+    trow('Denom exact match', String(dnEq), dnEq ? '#4ade80' : '#fbbf24'),
+  ].join(''));
+
+  /* C. AI Output */
+  const secC = tsec('C. AI Output', [
+    trow('final_status', raw.final_status || '—'),
+    trow('confidence', raw.confidence != null ? raw.confidence : '—'),
+    trow('reason', raw.reason || '—'),
+    trow('selection.product_type', sel.product_type_candidate_id || '—'),
+    trow('selection.region', sel.region_candidate_id || '—'),
+    trow('selection.denomination', sel.denomination_candidate_id || '—'),
+  ].join(''));
+
+  /* D. Module Statuses */
+  const ptM = mods.product_type || {};
+  const rgM = mods.region || {};
+  const dnM = mods.denomination || {};
+  const mrM = mods.manual_review || {};
+  const secD = tsec('D. Module Statuses', [
+    trow('product_type.status', ptM.status || '—', ptM.status === 'match' ? '#4ade80' : '#fbbf24'),
+    trow('product_type.reason', ptM.reason || '—'),
+    trow('region.status', rgM.status || '—', rgM.status === 'match' ? '#4ade80' : '#fbbf24'),
+    trow('region.reason', rgM.reason || '—'),
+    trow('denomination.status', dnM.status || '—', dnM.status === 'match' ? '#4ade80' : '#fbbf24'),
+    trow('denomination.reason', dnM.reason || '—'),
+    trow('manual_review.status', mrM.status || '—', mrM.status === 'match' ? '#f87171' : '#4ade80'),
+    trow('manual_review.reason', mrM.reason || '—'),
+  ].join(''));
+
+  /* E. Comparison Matrix */
+  const ptRec = sel.product_type_candidate_id || '';
+  const secE = tsec('E. Comparison Matrix', [
+    trow('PT current', snapPt),
+    trow('PT recommended', ptRec || '—'),
+    trow('PT match', snapPt && ptRec ? String(norm(snapPt) === norm(ptRec)) : '—',
+      norm(snapPt) === norm(ptRec) ? '#4ade80' : '#fbbf24'),
+    trow('RG current', snapRg),
+    trow('RG recommended', rgCand || '—'),
+    trow('RG canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
+    trow('DN current', snapDn),
+    trow('DN recommended', sel.denomination_candidate_id || '—'),
+    trow('DN norm match', String(dnEq), dnEq ? '#4ade80' : '#fbbf24'),
+    trow('UI final color', card.finalColor, clr(card.finalColor).txt),
+    trow('operator override', card.operatorOverride || 'none'),
+  ].join(''));
+
+  /* F. Iterative Chain Log */
+  const recs = card.recommendations || {};
+  const ptRes = recs.productType || {};
+  const rgRes = recs.region || {};
+  const dnRes = recs.denomination || {};
+  const secF = tsec('F. Iterative Chain', [
+    trow('1. Initial scan', card.aiVerdict || '—'),
+    trow('2. PT apply', ptRes.resolvedDomLabel ? 'applied → ' + ptRes.resolvedDomLabel : (ptRes.status || 'no change')),
+    trow('3. Backend re-call after PT', ptRes.resolvedDomLabel ? 'yes' : 'skipped'),
+    trow('4. Region', rgRes.status === 'mismatch' || rgRes.status === 'uncertain' ? 'REGION_MANUAL: ' + (rgRes.candidateId || '?') : (rgRes.status || 'no change')),
+    trow('5. Backend re-call after RG', 'depends on PT change'),
+    trow('6. Denomination', dnRes.resolvedDomLabel ? 'applied → ' + dnRes.resolvedDomLabel : (dnRes.status || 'no change')),
+    trow('7. Final applied', String(card.applied)),
+    trow('8. Final saved', String(card.saved)),
+  ].join(''));
+
+  /* G. Blocking Reasons */
+  const issues = getCardBlockingIssues(card);
+  const msBlock = getModStatusBlockingReason(card);
+  const secG = tsec('G. Blocking Reasons', [
+    trow('save blocking issues', issues.length ? issues.join(', ') : 'none', issues.length ? '#fb923c' : '#4ade80'),
+    trow('isCardSaveReady', String(isCardSaveReady(card)), isCardSaveReady(card) ? '#4ade80' : '#fb923c'),
+    trow('modStatus blocking', msBlock || 'none', msBlock ? '#fb923c' : '#4ade80'),
+    trow('isCardModStatusReady', String(isCardModStatusReady(card))),
+    trow('manuallyConfirmed', String(card.manuallyConfirmed)),
+    trow('applyError', card.applyError || 'none'),
+    trow('scanError', card.scanError || 'none'),
+    trow('saveError', card.saveError || 'none'),
+  ].join(''));
+
+  /* H. Session / Export */
+  const secH = tsec('H. Session / Export', [
+    trow('sessionId', session.sessionId),
+    trow('productId', card.productId),
+    trow('scannedAt', session.scannedAt),
+    trow('applied', String(card.applied)),
+    trow('saved', String(card.saved)),
+    trow('manuallyConfirmed', String(card.manuallyConfirmed)),
+    trow('exportedToSheet', String(card.exportedToSheet)),
+    trow('modStatusApplied', String(card.modStatusApplied)),
+    trow('modStatusNew', card.modStatusNew || '—'),
+  ].join(''));
+
+  return `<div style="margin-top:12px;">
+    <button type="button" id="wip01-trace-toggle" style="border:1px solid rgba(255,255,255,.15);
+      border-radius:8px;padding:6px 14px;background:rgba(99,102,241,.1);color:#a5b4fc;
+      font-size:12px;font-weight:700;cursor:pointer;width:100%;">
+      ▼ AI Trace / Debug</button>
+    <div style="margin-top:6px;padding:12px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.08);
+      border-radius:10px;max-height:500px;overflow-y:auto;">
+      ${secA}${secB}${secC}${secD}${secE}${secF}${secG}${secH}
+    </div>
+  </div>`;
+}
+
 function renderDetailPanel(session) {
   const detail = $('wip01-detail');
   const card = session.cards.find(c => c.productId === _s.uiSelectedId);
@@ -1403,8 +1561,16 @@ function renderDetailPanel(session) {
           ${sec5}
         </div>
         ${stateHtml}
+        ${renderAiTraceBlock(card, session)}
       </div>
     </div>`;
+
+  /* Bind trace toggle */
+  const traceToggle = $('wip01-trace-toggle');
+  if (traceToggle) traceToggle.onclick = () => {
+    _s.uiTraceOpen = !_s.uiTraceOpen;
+    renderDetailPanel(session);
+  };
 
   /* Bind detail-level buttons */
   $$('[data-confirm-detail]').forEach(btn => {
