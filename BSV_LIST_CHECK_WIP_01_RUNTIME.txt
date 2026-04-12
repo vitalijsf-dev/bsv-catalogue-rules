@@ -781,13 +781,36 @@ async function applyRecommendations(card) {
     }
   }
 
-  /* ═══ STEP 3b: Apply Denomination (MSG119/121: entity match + diag) ═══ */
-  const dStatus = (recs.denomination || {}).status;
-  if (dStatus === 'mismatch' || dStatus === 'uncertain') {
-    const dCandId = (recs.denomination || {}).candidateId || '';
-    if (dCandId) {
+  /* ═══ STEP 3b: Apply Denomination (MSG123: candidate+canonical trigger) ═══ */
+  /* Trigger rule: apply when candidate exists AND current differs canonically.
+     Do NOT rely solely on module status — AI may return status=match while
+     current and recommended are canonically different (MSG123 root cause). */
+  const dCandId = (recs.denomination || {}).candidateId || '';
+  let dnApplyTriggered = false;
+  if (dCandId) {
+    /* Read current denomination from popup for canonical comparison */
+    const curSnap = readSnapshotFromPopup(win) || card.beforeSnapshot;
+    const curDn = curSnap ? (curSnap.denominationLabel || curSnap.denominationOptionId || '') : '';
+    const dnCanonEq = denominationsCanonicallyEqual(curDn, dCandId);
+    if (dnCanonEq) {
+      /* Already correct — mark as alreadyMatched, no apply needed */
+      if (!recs.denomination) recs.denomination = {};
+      recs.denomination.alreadyMatched = true;
+      recs.denomination.applyDiag = {
+        ts: isoNow(), candidateRaw: dCandId,
+        candidateEntity: extractDenomEntity(dCandId),
+        currentRaw: curDn, currentEntity: extractDenomEntity(curDn),
+        alreadyCanonEqual: true, rootCause: 'ALREADY_MATCHED', ok: true,
+        selectFound: true, optionCount: 0, options: [],
+        matchedOptionValue: '', matchedOptionLabel: '', matchedOptionEntity: '',
+        oldSelectValue: '', newSelectValue: '', valueActuallyChanged: false,
+        eventsDispatched: false, valueAfterEvents: '', currentValue: '',
+      };
+    } else {
+      /* Canonical mismatch — apply denomination */
+      dnApplyTriggered = true;
       const res = applyDenominationInPopup(win, dCandId);
-      if (res.diag) recs.denomination.applyDiag = res.diag;   /* MSG121: store diagnostic */
+      if (res.diag) recs.denomination.applyDiag = res.diag;
       if (res.ok) {
         recs.denomination.resolvedDomValue = res.value;
         recs.denomination.resolvedDomLabel = res.label;
@@ -801,7 +824,12 @@ async function applyRecommendations(card) {
   }
 
   card.afterSnapshot = readSnapshotFromPopup(win);
-  card.applied = true;
+  /* MSG123 ACTION 2: applied=true only if something actually changed or was alreadyMatched */
+  const ptApplied = (recs.productType || {}).resolvedDomValue != null;
+  const dnApplied = (recs.denomination || {}).resolvedDomValue != null;
+  const dnAlreadyOk = (recs.denomination || {}).alreadyMatched === true;
+  const anyFieldApplied = ptChanged || ptApplied || dnApplied || dnAlreadyOk;
+  card.applied = anyFieldApplied || (!card.applyError);
   try { win.focus(); } catch (_) {}
 }
 
@@ -2033,18 +2061,21 @@ function renderActionBar(session) {
     try { await applyRecommendations(freshSel); } catch (e) {
       freshSel.applyError = (freshSel.applyError ? freshSel.applyError + '; ' : '') + (e.message || String(e));
     }
-    /* Verify that something actually changed */
+    /* Verify that something actually changed (MSG123: consistent applied state) */
     const snapAfter = freshSel.afterSnapshot;
-    if (freshSel.applied && snapBefore && snapAfter) {
-      const ptChanged = (snapBefore.productTypeId !== snapAfter.productTypeId);
-      const rgChanged = JSON.stringify((snapBefore.regions||[]).map(r=>r.id).sort()) !== JSON.stringify((snapAfter.regions||[]).map(r=>r.id).sort());
-      const dnChanged = (snapBefore.denominationOptionId !== snapAfter.denominationOptionId);
-      /* MSG119: alreadyMatched means denomination was already correct — not a failure */
-      const dnAlready = ((freshSel.recommendations || {}).denomination || {}).alreadyMatched === true;
-      if (!ptChanged && !rgChanged && !dnChanged && !dnAlready && !freshSel.applyError) {
+    if (snapBefore && snapAfter) {
+      const ptChanged2 = (snapBefore.productTypeId !== snapAfter.productTypeId);
+      const rgChanged2 = JSON.stringify((snapBefore.regions||[]).map(r=>r.id).sort()) !== JSON.stringify((snapAfter.regions||[]).map(r=>r.id).sort());
+      const dnChanged2 = (snapBefore.denominationOptionId !== snapAfter.denominationOptionId);
+      const dnAlready2 = ((freshSel.recommendations || {}).denomination || {}).alreadyMatched === true;
+      if (!ptChanged2 && !rgChanged2 && !dnChanged2 && !dnAlready2 && !freshSel.applyError) {
         freshSel.applyError = (freshSel.applyError ? freshSel.applyError + '; ' : '') +
           'APPLY_NO_CHANGE: Popup открыт, но ни одно поле не изменилось. Проверьте рекомендации вручную.';
       }
+    }
+    /* MSG123 ACTION 2: APPLY_NO_CHANGE + applied=true is inconsistent */
+    if (freshSel.applyError && freshSel.applyError.includes('APPLY_NO_CHANGE')) {
+      freshSel.applied = false;
     }
     renderCardList(session); renderDetailPanel(session); renderActionBar(session);
   };
