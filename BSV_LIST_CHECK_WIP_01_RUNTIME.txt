@@ -201,7 +201,58 @@ function resolveProductTypeFromCatalogue(candidateId, options) {
 /* MSG137: Unified ProductType resolution state.
    Compares current display label against recommended candidate,
    using catalogue lookup when available. */
-function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleStatus) {
+/* MSG142: Signal classification for ProductType candidate validation.
+   Platform keywords alone must not override product identity signals. */
+const PT_PLATFORM_KEYWORDS = [
+  'xbox', 'playstation', 'psn', 'nintendo', 'steam', 'pc', 'mobile',
+  'switch', 'ps4', 'ps5', 'ps3', 'wii', 'ios', 'android',
+];
+const PT_GENERIC_FAMILIES = [
+  'gift_cards', 'gift-cards', 'gift cards', 'giftcards',
+  'top_up', 'top-up', 'topup',
+  'subscription', 'subscriptions',
+];
+/* Known game/brand identities that are strong product signals */
+const PT_IDENTITY_KEYWORDS = [
+  'ea sports fc', 'fc 24', 'fc 25', 'fc 26',
+  'fortnite', 'pubg', 'playerunknown', 'battlegrounds',
+  'apex legends', 'call of duty', 'cod', 'valorant', 'overwatch',
+  'minecraft', 'roblox', 'gta', 'grand theft auto',
+  'fifa', 'nba 2k', 'madden', 'nhl',
+  'diablo', 'world of warcraft', 'wow', 'starfield', 'cyberpunk',
+  'elden ring', 'hogwarts legacy', 'zelda', 'mario',
+  'razer', 'razer pin',
+  'spotify', 'netflix', 'disney',
+  'v-bucks', 'vbucks', 'robux',
+  'game key', 'game keys', 'cd key', 'cd keys',
+  'edition', 'deluxe', 'ultimate', 'standard', 'premium',
+  'icons edition', 'gold edition', 'special edition',
+];
+
+/* Check if candidate is a generic platform family (e.g., Gift_cards-Xbox) */
+function isGenericPlatformCandidate(candidateSlug) {
+  const s = normSlug(candidateSlug);
+  return PT_GENERIC_FAMILIES.some(fam => s.includes(fam)) &&
+         PT_PLATFORM_KEYWORDS.some(plat => s.includes(plat));
+}
+
+/* Check if text contains strong product identity signals */
+function findIdentitySignals(text) {
+  const t = String(text || '').toLowerCase();
+  return PT_IDENTITY_KEYWORDS.filter(kw => t.includes(kw));
+}
+
+/* Check if text's only relevant signal is a platform keyword */
+function findPlatformSignals(text) {
+  const t = String(text || '').toLowerCase();
+  return PT_PLATFORM_KEYWORDS.filter(kw => {
+    /* Match as whole word to avoid false positives (e.g., "switch" in "switching") */
+    const re = new RegExp('\\b' + kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b');
+    return re.test(t);
+  });
+}
+
+function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleStatus, productName) {
   const state = {
     currentRaw: currentLabel || '',
     recommendedRaw: candidateId || '',
@@ -211,6 +262,10 @@ function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleSta
     recommendedCanonical: canonicalProductType(candidateId),
     semanticMatch: false,
     catalogueResolved: false,
+    candidateSuspect: false,       /* MSG142: true if candidate looks like false platform match */
+    identitySignals: [],           /* MSG142: identity keywords found in product name */
+    platformSignals: [],           /* MSG142: platform keywords found in product name */
+    suspectReason: '',             /* MSG142: why candidate is suspect */
     showHelper: false,
     helperMode: 'none',       /* 'none' | 'replacement' | 'unresolved' */
     uiStatus: 'yellow',       /* 'green' | 'yellow' | 'red' */
@@ -253,11 +308,50 @@ function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleSta
     state.semanticMatch = true;
   }
 
+  /* Step 2b (MSG142): Candidate quality validation — identity vs platform signal priority.
+     If candidate is a generic platform family (e.g., Gift_cards-Xbox) but product name
+     contains strong identity signals (e.g., "EA Sports FC", "Edition"), the candidate
+     is likely a false positive driven by a platform keyword. */
+  if (!state.semanticMatch && productName) {
+    state.identitySignals = findIdentitySignals(productName);
+    state.platformSignals = findPlatformSignals(productName);
+    const candidateIsGenericPlatform = isGenericPlatformCandidate(candidateId);
+
+    if (candidateIsGenericPlatform && state.identitySignals.length > 0) {
+      /* Product has strong identity signals but candidate is generic platform → suspect */
+      state.candidateSuspect = true;
+      state.suspectReason = 'candidate is generic platform family (' +
+        (state.catalogueResolved ? state.recommendedDisplay : candidateId) +
+        ') but product name contains identity signals: ' +
+        state.identitySignals.join(', ') +
+        '. Platform keyword alone insufficient.';
+    }
+
+    /* Also check: if current PT already contains identity keywords that match product name,
+       and candidate is a completely different family, this strengthens suspicion */
+    if (!state.candidateSuspect && candidateIsGenericPlatform) {
+      const currentIdentity = findIdentitySignals(currentLabel);
+      const nameIdentity = findIdentitySignals(productName);
+      const overlap = currentIdentity.filter(kw => nameIdentity.includes(kw));
+      if (overlap.length > 0) {
+        state.candidateSuspect = true;
+        state.suspectReason = 'current PT shares identity signals with product name (' +
+          overlap.join(', ') + ') but candidate is generic platform family.';
+      }
+    }
+  }
+
   /* Step 3: Determine UI state */
   if (state.semanticMatch) {
     state.uiStatus = 'green';
     state.showHelper = false;
     state.helperMode = 'none';
+  } else if (state.candidateSuspect) {
+    /* MSG142: suspect candidate → yellow but DO NOT show replacement helper.
+       Instead show unresolved/warning — operator should verify manually. */
+    state.uiStatus = 'yellow';
+    state.showHelper = true;
+    state.helperMode = 'unresolved';
   } else if (moduleStatus === 'mismatch') {
     state.uiStatus = 'red';
     state.showHelper = true;
@@ -1644,19 +1738,24 @@ function renderTicketContext(card) {
   const ptModStatus = ((raw.modules || {}).product_type || {}).status || '';
   /* MSG137: Catalogue-driven ProductType resolution */
   const ptOptions = b ? (b.productTypeOptions || []) : [];
-  const ptResolved = resolveProductTypeState(pt, ptCand, ptOptions, ptModStatus);
+  const ptResolved = resolveProductTypeState(pt, ptCand, ptOptions, ptModStatus, nm);
   const ptCanonMatch = ptResolved.semanticMatch;
   const rgCand = sel.region_candidate_id || '';
   const rgMatch = regionsCanonicallyEqual(rg, rgCand);
   const dnCandTc = sel.denomination_candidate_id || '';
   const dnMatchTc = !dnCandTc || denominationsCanonicallyEqual(dn, dnCandTc);
 
-  /* ProductType hint — MSG137: use resolved display label, not raw slug */
+  /* ProductType hint — MSG137/142: use resolved display label, handle suspect candidates */
   let ptHelper = '';
   if (ptResolved.showHelper && ptResolved.helperMode === 'replacement') {
     ptHelper = hintBox(
       `Название/описание указывает на другой ProductType: <b>${esc(ptResolved.recommendedDisplay)}</b><br>` +
       `В таблице есть ProductType: <b>${esc(ptResolved.recommendedDisplay)}</b>`);
+  } else if (ptResolved.showHelper && ptResolved.helperMode === 'unresolved') {
+    /* MSG142: suspect candidate — warn operator, don't suggest replacement */
+    ptHelper = hintBox(
+      `AI предложил ProductType: <b>${esc(ptResolved.recommendedDisplay)}</b>, но это может быть ложное совпадение по platform keyword.<br>` +
+      `Требуется ручная проверка ProductType.`);
   }
 
   /* Region hint (MSG135: separate replacement vs evidence-warning modes) */
@@ -1934,7 +2033,8 @@ function renderAiTraceBlock(card, session) {
   /* E. Comparison Matrix (MSG137: catalogue-driven PT resolution) */
   const ptRec = sel.product_type_candidate_id || '';
   const ptTraceOpts = b ? (b.productTypeOptions || []) : [];
-  const ptTraceRes = resolveProductTypeState(snapPt, ptRec, ptTraceOpts, (mods.product_type || {}).status);
+  const ptTraceName = b ? (b.name || card.productName) : card.productName;
+  const ptTraceRes = resolveProductTypeState(snapPt, ptRec, ptTraceOpts, (mods.product_type || {}).status, ptTraceName);
   const ptExactEq = norm(snapPt) === norm(ptRec);
   const ptCanonEq = ptTraceRes.semanticMatch;
   const secE = tsec('E. Comparison Matrix', [
@@ -1946,6 +2046,10 @@ function renderAiTraceBlock(card, session) {
     trow('PT canonical recommended', canonicalProductType(ptTraceRes.recommendedDisplay || ptRec) || '—'),
     trow('PT exact match', snapPt && ptRec ? String(ptExactEq) : '—', ptExactEq ? '#4ade80' : '#fbbf24'),
     trow('PT semantic match', snapPt && ptRec ? String(ptCanonEq) : '—', ptCanonEq ? '#4ade80' : '#f87171'),
+    trow('PT identity signals', (ptTraceRes.identitySignals || []).join(', ') || 'none'),
+    trow('PT platform signals', (ptTraceRes.platformSignals || []).join(', ') || 'none'),
+    trow('PT candidate suspect', String(ptTraceRes.candidateSuspect), ptTraceRes.candidateSuspect ? '#f59e0b' : '#4ade80'),
+    trow('PT suspect reason', ptTraceRes.suspectReason || '—'),
     trow('RG current', snapRg),
     trow('RG recommended', rgCand || '—'),
     trow('RG canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
@@ -2108,15 +2212,26 @@ function renderDetailPanel(session) {
   const ptCand3 = sel.product_type_candidate_id || '';
   const ptCur3 = pt2(b);
   const ptOpts3 = b ? (b.productTypeOptions || []) : [];
-  const ptRes3 = resolveProductTypeState(ptCur3, ptCand3, ptOpts3, ptMod.status);
+  const ptName3 = b ? (b.name || card.productName) : card.productName;
+  const ptRes3 = resolveProductTypeState(ptCur3, ptCand3, ptOpts3, ptMod.status, ptName3);
   const ptStatus = ptRes3.uiStatus;
   const ptMatchLabel = ptRes3.semanticMatch
     ? (ptRes3.catalogueResolved ? '(catalogue match)' : '(canonical match)')
     : '';
+  let ptAction3;
+  if (ptRes3.semanticMatch) {
+    ptAction3 = `ProductType подтверждён ${ptMatchLabel}.`;
+  } else if (ptRes3.candidateSuspect) {
+    ptAction3 = 'AI candidate может быть ложным (platform keyword). Требуется ручная проверка.';
+  } else {
+    ptAction3 = ptMod.reason || '—';
+  }
   const sec3 = renderDetailSection('ProductType', 3, ptStatus, [
     { label: 'Текущий', value: ptCur3 },
-    { label: 'Рекомендованный', html: esc(ptRes3.recommendedDisplay || ptCur3) + (ptRes3.semanticMatch && ptCand3 ? ` <span style="color:#4ade80;font-size:11px;">${ptMatchLabel}</span>` : '') },
-    { label: 'Действие', value: ptRes3.semanticMatch ? `ProductType подтверждён ${ptMatchLabel}.` : (ptMod.reason || '—') },
+    { label: 'Рекомендованный', html: esc(ptRes3.recommendedDisplay || ptCur3) +
+      (ptRes3.semanticMatch && ptCand3 ? ` <span style="color:#4ade80;font-size:11px;">${ptMatchLabel}</span>` : '') +
+      (ptRes3.candidateSuspect ? ' <span style="color:#f59e0b;font-size:11px;">(suspect — platform keyword)</span>' : '') },
+    { label: 'Действие', value: ptAction3 },
     { label: 'Источник', value: 'catalogue' },
   ]);
 
