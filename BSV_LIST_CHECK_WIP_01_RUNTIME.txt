@@ -138,6 +138,7 @@ const REGION_ALIASES = {
   'uae': 'uae', 'united arab emirates': 'uae',
   'ksa': 'ksa', 'saudi arabia': 'ksa',
   'turkiye': 'turkiye', 'türkiye': 'turkiye', 'turkey': 'turkiye',
+  'br': 'br', 'brazil': 'br',   /* MSG132: AI_Allowed_Aliases alignment */
 };
 function canonicalRegion(r) {
   const k = String(r || '').toLowerCase().trim();
@@ -1601,9 +1602,9 @@ function renderTicketContext(card) {
       addEvidence(alias, ptType);
     }
   });
-  /* Region */
+  /* Region (MSG132: canonical match → confirm, not replace) */
   if (rg && rg !== '—') rg.split(',').forEach(r => addEvidence(r.trim(), 'confirm'));
-  if (rgCand && !rgMatch && rgCand.length < 30) addEvidence(rgCand, 'replace');
+  if (rgCand && rgCand.length < 30) addEvidence(rgCand, rgMatch ? 'confirm' : 'replace');
   /* Denomination */
   if (dn && dn !== '—' && dn.length < 60) addEvidence(dn, 'confirm');
   if (dnCandTc && !dnMatchTc && dnCandTc.length < 60) addEvidence(dnCandTc, 'replace');
