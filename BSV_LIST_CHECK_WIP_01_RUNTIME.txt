@@ -1548,20 +1548,35 @@ function renderTicketContext(card) {
       `В таблице есть ProductType: <b>${esc(ptCand)}</b>`);
   }
 
-  /* Region hint */
+  /* Region hint (MSG135: separate replacement vs evidence-warning modes) */
+  const rgModTc = (raw.modules || {}).region || {};
+  const rgUncertainTc = rgModTc.status === 'uncertain';
   let rgHelper = '';
   if (rgCand && !rgMatch) {
+    /* Replacement case: canonical mismatch */
     rgHelper = hintBox(
       `В name найден другой регион: <b>${esc(rgCand)}</b><br>` +
       `В таблице есть регион: <b>${esc(rgCand)}</b>`);
+  } else if (rgCand && rgMatch && rgUncertainTc) {
+    /* Evidence-warning case: canonical match but no text evidence (MSG135) */
+    rgHelper = hintBox(
+      `Регион совпадает с candidate (canonical match), но seller text не подтверждает. Требуется проверка.`);
   }
 
-  /* Denomination hint */
+  /* Denomination hint (MSG135: text-evidence gate) */
+  const dnModTc = (raw.modules || {}).denomination || {};
+  const dnUncertainTc = dnModTc.status === 'uncertain';
   let dnHelper = '';
   if (dnCandTc && !dnMatchTc) {
+    /* Replacement case */
     dnHelper = hintBox(
       `В name/description найден другой denomination: <b>${esc(dnCandTc)}</b><br>` +
       `В таблице есть denomination: <b>${esc(dnCandTc)}</b>`);
+  } else if (dnCandTc && dnMatchTc && (dnUncertainTc || rgUncertainTc)) {
+    /* Evidence-warning case: canonical match but evidence missing or region unconfirmed (MSG135) */
+    const reason = rgUncertainTc ? 'регион не подтверждён seller text' : 'text evidence отсутствует';
+    dnHelper = hintBox(
+      `Denomination совпадает с candidate, но ${reason}. Автоподтверждение заблокировано.`);
   }
 
   /* Evidence highlighting (MSG89/97/103): collect terms that influenced the decision */
@@ -1986,55 +2001,102 @@ function renderDetailPanel(session) {
     { label: 'Источник', value: 'catalogue' },
   ]);
 
-  /* Block 4: Регион (canonical comparison — MSG70 bugfix) */
+  /* Block 4: Регион (MSG70 canonical + MSG135 text-evidence gate) */
   const rgMod = mods.region || {};
   const rgCand2 = sel.region_candidate_id || '';
   const rgCurrent = reg2(b);
   const rgCanonMatch = regionsCanonicallyEqual(rgCurrent, rgCand2);
-  /* Override status if backend says mismatch but canonical says match */
-  const rgStatus = rgCanonMatch ? 'green'
-    : rgMod.status === 'match' ? 'green'
-    : rgMod.status === 'mismatch' ? 'red' : 'yellow';
+  /* MSG135: text-evidence gate — canonical match alone cannot override uncertain/missing evidence */
+  const rgTextConfirmed = rgMod.status === 'match';
+  const rgUncertain = rgMod.status === 'uncertain';
+  let rgStatus;
+  if (rgCanonMatch && rgTextConfirmed) {
+    rgStatus = 'green';                          /* canonical + text evidence = confirmed */
+  } else if (rgCanonMatch && rgUncertain) {
+    rgStatus = 'yellow';                         /* canonical OK but no text evidence → needs review */
+  } else if (rgCanonMatch && !rgUncertain) {
+    rgStatus = 'green';                          /* canonical match, status not uncertain (e.g. no module) */
+  } else if (rgTextConfirmed) {
+    rgStatus = 'green';                          /* text evidence alone = confirmed */
+  } else if (rgMod.status === 'mismatch') {
+    rgStatus = 'red';
+  } else {
+    rgStatus = 'yellow';
+  }
+  /* Hints: two modes — replacement (canonical mismatch) vs evidence-warning (canonical match but uncertain) */
   let rgHints = '';
   if (rgCand2 && !rgCanonMatch) {
+    /* Replacement case */
     rgHints = `<div style="margin-top:4px;font-size:12px;color:#fbbf24;">В name найден другой регион: <b>${esc(rgCand2)}</b></div>` +
               `<div style="font-size:12px;color:#fbbf24;">В таблице есть регион: <b>${esc(rgCand2)}</b></div>`;
+  } else if (rgCanonMatch && rgUncertain) {
+    /* Evidence-warning case (MSG135) */
+    rgHints = `<div style="margin-top:4px;font-size:12px;color:#fbbf24;">Canonical match, но seller text не подтверждает регион. Автоподтверждение запрещено.</div>`;
+  }
+  let rgAction;
+  if (rgCanonMatch && rgTextConfirmed) {
+    rgAction = 'Регион подтверждён (canonical match + text evidence).';
+  } else if (rgCanonMatch && rgUncertain) {
+    rgAction = rgMod.reason || 'Текущее значение совпадает с candidate, но регион не подтверждён seller text. Требуется ручная проверка.';
+  } else if (rgCanonMatch) {
+    rgAction = 'Регион подтверждён (canonical match).';
+  } else {
+    rgAction = rgMod.reason || '—';
   }
   const sec4 = renderDetailSection('Регион', 4, rgStatus, [
     { label: 'Текущий', value: rgCurrent },
     { label: 'Рекомендованный', html: esc(rgCand2 || '—') + (rgCanonMatch && rgCand2 ? ' <span style="color:#4ade80;font-size:11px;">(canonical match)</span>' : '') + rgHints },
-    { label: 'Действие', value: rgCanonMatch ? 'Регион подтверждён (canonical match).' : (rgMod.reason || '—') },
+    { label: 'Действие', value: rgAction },
     { label: 'Источник', value: 'catalogue' },
   ]);
 
-  /* Block 5: Denomination (MSG87: status rules registry aligned)
+  /* Block 5: Denomination (MSG87 + MSG135: text-evidence gate)
      Rules (see LIST_CHECK_STATUS_RULES_REGISTRY):
-       green   = recommended found AND current canonically equals recommended
-       yellow  = recommended found AND current differs (needs apply)
+       green   = recommended found AND current canonically equals recommended AND text evidence confirmed
+       yellow  = recommended found but current differs OR text evidence missing OR region unconfirmed
        red     = explicit mismatch / no valid candidate
        neutral = ONLY if no recommended candidate exists at all */
   const dnMod = mods.denomination || {};
   const dnCand = sel.denomination_candidate_id || '';
   const dnCurrent = den2(b);
   const dnCanonMatch = denominationsCanonicallyEqual(dnCurrent, dnCand);
+  /* MSG135: text-evidence gate for denomination */
+  const dnTextConfirmed = dnMod.status === 'match';
+  const dnUncertain = dnMod.status === 'uncertain';
+  /* MSG135: denomination depends on region — if region is uncertain, denomination cannot be green */
+  const dnRegionBlocked = rgUncertain || rgStatus === 'yellow' || rgStatus === 'red';
   let dnStatus;
-  if (dnCand && dnCanonMatch) {
-    dnStatus = 'green';                      /* recommended found, current matches */
+  if (dnCand && dnCanonMatch && dnTextConfirmed && !dnRegionBlocked) {
+    dnStatus = 'green';                      /* canonical + text evidence + region OK */
+  } else if (dnCand && dnCanonMatch && (dnUncertain || dnRegionBlocked)) {
+    dnStatus = 'yellow';                     /* canonical OK but evidence missing or region blocked */
+  } else if (dnCand && dnCanonMatch) {
+    dnStatus = 'green';                      /* canonical match, no uncertainty flags */
   } else if (dnCand && !dnCanonMatch) {
     dnStatus = 'yellow';                     /* recommended found, current differs → apply needed */
   } else if (dnMod.status === 'mismatch') {
     dnStatus = 'red';                        /* explicit conflict */
-  } else if (!dnCand && dnMod.status === 'match') {
+  } else if (!dnCand && dnTextConfirmed) {
     dnStatus = 'green';                      /* match without specific candidate (backend confirmed) */
   } else if (!dnCand) {
     dnStatus = 'gray';                       /* no candidate, no conflict → truly neutral */
   } else {
     dnStatus = 'yellow';                     /* fallback: candidate exists → needs review */
   }
-  const dnAction = dnStatus === 'green' ? (dnMod.reason || 'Denomination подтверждён.')
-    : dnStatus === 'yellow' ? 'Рекомендованный denomination найден, но текущее значение в карточке отличается. Нужно применить замену.'
-    : dnStatus === 'red' ? (dnMod.reason || 'Конфликт denomination.')
-    : (dnMod.reason || '—');
+  let dnAction;
+  if (dnStatus === 'green') {
+    dnAction = dnMod.reason || 'Denomination подтверждён.';
+  } else if (dnCanonMatch && dnRegionBlocked) {
+    dnAction = 'Denomination совпадает с candidate, но регион не подтверждён seller text. Автоподтверждение denomination заблокировано.';
+  } else if (dnCanonMatch && dnUncertain) {
+    dnAction = dnMod.reason || 'Denomination совпадает с candidate, но text evidence отсутствует. Требуется ручная проверка.';
+  } else if (dnStatus === 'yellow') {
+    dnAction = 'Рекомендованный denomination найден, но текущее значение в карточке отличается. Нужно применить замену.';
+  } else if (dnStatus === 'red') {
+    dnAction = dnMod.reason || 'Конфликт denomination.';
+  } else {
+    dnAction = dnMod.reason || '—';
+  }
   const sec5 = renderDetailSection('Denomination', 5, dnStatus, [
     { label: 'Текущий', value: dnCurrent },
     { label: 'Режим', value: dnMod.mode || 'numeric' },
