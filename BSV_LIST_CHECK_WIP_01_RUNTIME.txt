@@ -131,6 +131,8 @@ const EMBEDDED_ALIAS_SNAPSHOT_FALLBACK = {
 /* Runtime alias state — populated on startup by loadAliasSnapshot() */
 const _aliasState = {
   source:    'not_loaded',   /* 'live' | 'embedded_fallback' | 'not_loaded' */
+  transport: 'none',         /* 'iframe-postmessage' | 'fallback' | 'none' (MSG166) */
+  status:    '',             /* LIVE_OK | LIVE_TIMEOUT | LIVE_TRANSPORT_ERROR | LIVE_RESPONSE_INVALID | FALLBACK_USED */
   version:   '',
   updatedAt: '',
   rowCount:  0,
@@ -210,48 +212,107 @@ function buildAliasMapsFromRows(rows) {
   return { regionMap, ptAliases };
 }
 
+/* MSG166: iframe + postMessage transport for alias snapshot (browser-compatible).
+   Same proven pattern as callBackend(). fetch() fails due to CORS/redirect on
+   Apps Script cross-origin. iframe+form+postMessage works reliably. */
 async function loadAliasSnapshot() {
-  /* Try live service first */
+  _aliasState.transport = 'none';
+
   if (ALIAS_SNAPSHOT_CONFIG.enabled && ALIAS_SNAPSHOT_CONFIG.url) {
     try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), ALIAS_SNAPSHOT_CONFIG.timeout);
-      const resp = await fetch(ALIAS_SNAPSHOT_CONFIG.url, { signal: ctrl.signal });
-      clearTimeout(timer);
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data && data.ok && Array.isArray(data.rows)) {
-          const maps = buildAliasMapsFromRows(data.rows);
-          _aliasState.source = 'live';
-          _aliasState.version = data.version || '';
-          _aliasState.updatedAt = data.updated_at || '';
-          _aliasState.rowCount = data.rows.length;
-          _aliasState.regionMap = maps.regionMap;
-          _aliasState.ptAliases = maps.ptAliases;
-          _aliasState.loaded = true;
-          _aliasState.error = '';
-          return;
-        }
-        _aliasState.error = 'Service response not ok: ' + JSON.stringify(data).slice(0, 200);
-      } else {
-        _aliasState.error = 'HTTP ' + resp.status;
+      const data = await fetchAliasViaIframe_(ALIAS_SNAPSHOT_CONFIG.url, ALIAS_SNAPSHOT_CONFIG.timeout);
+      if (data && data.ok && Array.isArray(data.rows)) {
+        const maps = buildAliasMapsFromRows(data.rows);
+        _aliasState.source = 'live';
+        _aliasState.transport = 'iframe-postmessage';
+        _aliasState.version = data.version || '';
+        _aliasState.updatedAt = data.updated_at || '';
+        _aliasState.rowCount = data.rows.length;
+        _aliasState.regionMap = maps.regionMap;
+        _aliasState.ptAliases = maps.ptAliases;
+        _aliasState.loaded = true;
+        _aliasState.error = '';
+        _aliasState.status = 'LIVE_OK';
+        return;
       }
+      _aliasState.error = 'LIVE_RESPONSE_INVALID: ' + JSON.stringify(data).slice(0, 200);
+      _aliasState.status = 'LIVE_RESPONSE_INVALID';
     } catch (e) {
-      _aliasState.error = 'Fetch error: ' + (e.message || String(e));
+      const msg = e.message || String(e);
+      _aliasState.error = 'LIVE_TRANSPORT_ERROR: ' + msg;
+      _aliasState.status = msg.includes('timeout') ? 'LIVE_TIMEOUT' : 'LIVE_TRANSPORT_ERROR';
     }
   } else {
     _aliasState.error = 'Service URL not configured';
+    _aliasState.status = 'LIVE_TRANSPORT_ERROR';
   }
 
   /* Fallback to embedded snapshot */
   const maps = buildAliasMapsFromRows(EMBEDDED_ALIAS_SNAPSHOT_FALLBACK.rows);
   _aliasState.source = 'embedded_fallback';
+  _aliasState.transport = 'fallback';
   _aliasState.version = EMBEDDED_ALIAS_SNAPSHOT_FALLBACK.version;
   _aliasState.updatedAt = '';
   _aliasState.rowCount = EMBEDDED_ALIAS_SNAPSHOT_FALLBACK.rows.length;
   _aliasState.regionMap = maps.regionMap;
   _aliasState.ptAliases = maps.ptAliases;
   _aliasState.loaded = true;
+  _aliasState.status = 'FALLBACK_USED';
+}
+
+const ALIAS_SNAPSHOT_SRC = 'LIST_CHECK_ALIAS_SNAPSHOT_SERVICE_V1';
+
+function fetchAliasViaIframe_(url, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const reqId = 'alias_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    const iframe = document.createElement('iframe');
+    const form   = document.createElement('form');
+    iframe.name  = 'alias_f_' + reqId;
+    iframe.style.display = 'none';
+    form.method  = 'POST';
+    form.action  = url;
+    form.target  = iframe.name;
+    form.style.display = 'none';
+
+    const addInput = (n, v) => {
+      const inp = document.createElement('input');
+      inp.type = 'hidden'; inp.name = n; inp.value = String(v ?? '');
+      form.appendChild(inp);
+    };
+    addInput('transport', 'postmessage');
+    addInput('client_request_id', reqId);
+
+    let settled = false;
+    const tId = setTimeout(() => {
+      if (settled) return;
+      settled = true; cleanup();
+      reject(new Error('Alias snapshot timeout (' + timeoutMs + 'ms)'));
+    }, timeoutMs);
+
+    function cleanup() {
+      if (handler) { window.removeEventListener('message', handler); }
+      clearTimeout(tId);
+      setTimeout(() => {
+        try { form.remove(); } catch (_) {}
+        try { iframe.remove(); } catch (_) {}
+      }, 600);
+    }
+
+    const handler = ev => {
+      const d = ev && ev.data;
+      if (!d || typeof d !== 'object') return;
+      if (d.source !== ALIAS_SNAPSHOT_SRC && d.service !== ALIAS_SNAPSHOT_SRC) return;
+      if (settled) return;
+      settled = true; cleanup(); resolve(d);
+    };
+    window.addEventListener('message', handler);
+    document.body.appendChild(iframe);
+    document.body.appendChild(form);
+    try { form.submit(); } catch (e) {
+      cleanup();
+      reject(new Error('Form submit error: ' + e.message));
+    }
+  });
 }
 
 /* ── CANONICAL REGION (MSG70 + MSG158: snapshot-driven) ──────── */
@@ -2277,11 +2338,15 @@ function renderAiTraceBlock(card, session) {
     ].join(''));
   }
 
-  /* J. Alias Snapshot Source (MSG158) */
+  /* J. Alias Snapshot Source (MSG158/166) */
   const srcColor = _aliasState.source === 'live' ? '#4ade80'
     : _aliasState.source === 'embedded_fallback' ? '#fbbf24' : '#f87171';
-  const secJ = tsec('J. Alias Snapshot (MSG158)', [
+  const statusColor = _aliasState.status === 'LIVE_OK' ? '#4ade80'
+    : _aliasState.status === 'FALLBACK_USED' ? '#fbbf24' : '#f87171';
+  const secJ = tsec('J. Alias Snapshot (MSG158/166)', [
     trow('source', _aliasState.source, srcColor),
+    trow('transport', _aliasState.transport || 'none'),
+    trow('status', _aliasState.status || '—', statusColor),
     trow('version', _aliasState.version || '—'),
     trow('updated_at', _aliasState.updatedAt || '—'),
     trow('row_count', String(_aliasState.rowCount)),
