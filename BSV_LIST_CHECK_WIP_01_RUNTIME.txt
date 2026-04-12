@@ -1139,14 +1139,31 @@ async function applyRecommendations(card) {
     }
   }
 
-  /* ═══ STEP 2b: Apply Region ═══ */
-  const rgStatus = (recs.region || {}).status;
-  if (rgStatus === 'mismatch' || rgStatus === 'uncertain') {
+  /* ═══ STEP 2b: Apply Region (MSG178/185: brand whitelist suppresses manual) ═══ */
+  const rgApplyStatus = (recs.region || {}).status;
+  if (rgApplyStatus === 'mismatch' || rgApplyStatus === 'uncertain') {
     const rgCand = (recs.region || {}).candidateId || '';
     if (rgCand) {
-      /* Region add/del requires server-side AJAX → still manual for now */
-      addError('REGION_MANUAL: Регион требует ручной проверки в popup. ' +
-        'Кандидат от AI: «' + rgCand + '».');
+      /* MSG185: check brand whitelist before flagging as manual */
+      const curSnap2b = readSnapshotFromPopup(win) || card.beforeSnapshot;
+      const rgName2b = curSnap2b ? (curSnap2b.name || card.productName) : card.productName;
+      const rgDesc2b = curSnap2b ? (curSnap2b.description || '') : '';
+      const rgCurRegion2b = curSnap2b ? ((curSnap2b.regions || []).map(r => r.name).join(', ')) : '';
+      const brandInf2b = checkBrandRegionInference(rgName2b, rgDesc2b);
+      const brandConfirms2b = brandInf2b.matched &&
+        (regionsCanonicallyEqual(rgCurRegion2b, brandInf2b.inferredRegion) ||
+         regionsCanonicallyEqual(rgCand, brandInf2b.inferredRegion));
+      if (brandConfirms2b) {
+        /* Brand whitelist confirms region — no manual action needed */
+        if (!recs.region) recs.region = {};
+        recs.region.brandConfirmed = true;
+        recs.region.brandFamily = brandInf2b.brand;
+        recs.region.brandInferredRegion = brandInf2b.inferredRegion;
+      } else {
+        /* Region add/del requires server-side AJAX → still manual for now */
+        addError('REGION_MANUAL: Регион требует ручной проверки в popup. ' +
+          'Кандидат от AI: «' + rgCand + '».');
+      }
     }
   }
 
@@ -2266,7 +2283,11 @@ function renderAiTraceBlock(card, session) {
     trow('1. Initial scan', card.aiVerdict || '—'),
     trow('2. PT apply', ptRes.resolvedDomLabel ? 'applied → ' + ptRes.resolvedDomLabel : (ptRes.status || 'no change')),
     trow('3. Backend re-call after PT', ptRes.resolvedDomLabel ? 'yes' : 'skipped'),
-    trow('4. Region', rgRes.status === 'mismatch' || rgRes.status === 'uncertain' ? 'REGION_MANUAL: ' + (rgRes.candidateId || '?') : (rgRes.status || 'no change')),
+    trow('4. Region', rgRes.brandConfirmed
+      ? 'BRAND_WHITELIST: ' + (rgRes.brandFamily || '?') + ' → ' + (rgRes.brandInferredRegion || '?')
+      : (rgRes.status === 'mismatch' || rgRes.status === 'uncertain'
+        ? 'REGION_MANUAL: ' + (rgRes.candidateId || '?')
+        : (rgRes.status || 'no change'))),
     trow('5. Backend re-call after RG', 'depends on PT change'),
     trow('6. Denomination', dnRes.resolvedDomLabel ? 'applied → ' + dnRes.resolvedDomLabel : (dnRes.status || 'no change')),
     trow('7. Final applied', String(card.applied)),
