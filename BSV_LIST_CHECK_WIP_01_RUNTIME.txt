@@ -143,6 +143,33 @@ const _aliasState = {
   ptAliases: [],             /* product_type alias strings */
 };
 
+/* ── BRAND → REGION INFERENCE WHITELIST (MSG178) ────────────────
+   Approved brands that imply a specific region even when seller text
+   does not contain an explicit region token.
+   Priority: explicit text > brand inference > canonical alias > uncertain */
+const BRAND_REGION_WHITELIST = [
+  {
+    brandFamily: 'Yandex',
+    tokens: ['яндекс', 'yandex', 'яндекс лавка', 'яндекс еда',
+             'яндекс маркет', 'яндекс плюс', 'яндекс музыка', 'яндекс драйв'],
+    inferredRegion: 'RU',
+  },
+];
+
+/* Check if product name/description matches a whitelisted brand.
+   Returns { matched: true, brand, inferredRegion } or { matched: false }. */
+function checkBrandRegionInference(productName, description) {
+  const text = (String(productName || '') + ' ' + String(description || '')).toLowerCase();
+  for (const entry of BRAND_REGION_WHITELIST) {
+    for (const token of entry.tokens) {
+      if (text.includes(token)) {
+        return { matched: true, brand: entry.brandFamily, token, inferredRegion: entry.inferredRegion };
+      }
+    }
+  }
+  return { matched: false };
+}
+
 /* ── GUARD: must be on list page ─────────────────────────────── */
 if (!document.querySelector('table.items')) {
   alert('BSV List Check WIP-01:\nОткройте страницу списка товаров (/xdm/product/admin).');
@@ -1912,33 +1939,39 @@ function renderTicketContext(card) {
       `Требуется ручная проверка ProductType.`);
   }
 
-  /* Region hint (MSG135: separate replacement vs evidence-warning modes) */
+  /* Region hint (MSG135 + MSG178: brand inference whitelist) */
   const rgModTc = (raw.modules || {}).region || {};
   const rgUncertainTc = rgModTc.status === 'uncertain';
+  const rgBrandInfTc = checkBrandRegionInference(nm, desc);
+  const rgBrandConfirmsTc = rgBrandInfTc.matched &&
+    (regionsCanonicallyEqual(rg, rgBrandInfTc.inferredRegion) ||
+     regionsCanonicallyEqual(rgCand, rgBrandInfTc.inferredRegion));
   let rgHelper = '';
-  if (rgCand && !rgMatch) {
-    /* Replacement case: canonical mismatch */
+  if (rgCand && !rgMatch && !rgBrandConfirmsTc) {
+    /* Replacement case: canonical mismatch, no brand inference */
     rgHelper = hintBox(
       `В name найден другой регион: <b>${esc(rgCand)}</b><br>` +
       `В таблице есть регион: <b>${esc(rgCand)}</b>`);
-  } else if (rgCand && rgMatch && rgUncertainTc) {
-    /* Evidence-warning case: canonical match but no text evidence (MSG135) */
+  } else if (rgCand && rgMatch && rgUncertainTc && !rgBrandConfirmsTc) {
+    /* Evidence-warning case: canonical match but no text evidence and no brand inference (MSG135) */
     rgHelper = hintBox(
       `Регион совпадает с candidate (canonical match), но seller text не подтверждает. Требуется проверка.`);
   }
+  /* MSG178: brand inference does NOT show replacement/warning helper — it's a green-path */
 
-  /* Denomination hint (MSG135: text-evidence gate) */
+  /* Denomination hint (MSG135 + MSG178: brand inference unblocks region) */
   const dnModTc = (raw.modules || {}).denomination || {};
   const dnUncertainTc = dnModTc.status === 'uncertain';
+  const rgStillUncertainTc = rgUncertainTc && !rgBrandConfirmsTc;
   let dnHelper = '';
   if (dnCandTc && !dnMatchTc) {
     /* Replacement case */
     dnHelper = hintBox(
       `В name/description найден другой denomination: <b>${esc(dnCandTc)}</b><br>` +
       `В таблице есть denomination: <b>${esc(dnCandTc)}</b>`);
-  } else if (dnCandTc && dnMatchTc && (dnUncertainTc || rgUncertainTc)) {
+  } else if (dnCandTc && dnMatchTc && (dnUncertainTc || rgStillUncertainTc)) {
     /* Evidence-warning case: canonical match but evidence missing or region unconfirmed (MSG135) */
-    const reason = rgUncertainTc ? 'регион не подтверждён seller text' : 'text evidence отсутствует';
+    const reason = rgStillUncertainTc ? 'регион не подтверждён seller text' : 'text evidence отсутствует';
     dnHelper = hintBox(
       `Denomination совпадает с candidate, но ${reason}. Автоподтверждение заблокировано.`);
   }
@@ -2194,6 +2227,9 @@ function renderAiTraceBlock(card, session) {
   const ptTraceRes = resolveProductTypeState(snapPt, ptRec, ptTraceOpts, (mods.product_type || {}).status, ptTraceName);
   const ptExactEq = norm(snapPt) === norm(ptRec);
   const ptCanonEq = ptTraceRes.semanticMatch;
+  /* MSG178: brand inference for trace */
+  const rgTraceDesc = b ? (b.description || '') : '';
+  const rgTraceBrand = checkBrandRegionInference(ptTraceName, rgTraceDesc);
   const secE = tsec('E. Comparison Matrix', [
     trow('PT current', snapPt),
     trow('PT recommended (raw)', ptRec || '—'),
@@ -2210,6 +2246,8 @@ function renderAiTraceBlock(card, session) {
     trow('RG current', snapRg),
     trow('RG recommended', rgCand || '—'),
     trow('RG canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
+    trow('RG brand inference', rgTraceBrand.matched ? rgTraceBrand.brand + ' → ' + rgTraceBrand.inferredRegion : 'none',
+      rgTraceBrand.matched ? '#a78bfa' : '#6b7280'),
     trow('DN current', snapDn),
     trow('DN recommended', dnRecRaw || '—'),
     trow('DN exact match', String(dnExactEq), dnExactEq ? '#4ade80' : '#fbbf24'),
@@ -2410,53 +2448,69 @@ function renderDetailPanel(session) {
     { label: 'Источник', value: 'catalogue' },
   ]);
 
-  /* Block 4: Регион (MSG70 canonical + MSG135 text-evidence gate) */
+  /* Block 4: Регион (MSG70 + MSG135 + MSG178: brand inference whitelist) */
   const rgMod = mods.region || {};
   const rgCand2 = sel.region_candidate_id || '';
   const rgCurrent = reg2(b);
   const rgCanonMatch = regionsCanonicallyEqual(rgCurrent, rgCand2);
-  /* MSG135: text-evidence gate — canonical match alone cannot override uncertain/missing evidence */
   const rgTextConfirmed = rgMod.status === 'match';
   const rgUncertain = rgMod.status === 'uncertain';
+  /* MSG178: brand → region inference check */
+  const rgProductName = b ? (b.name || card.productName) : card.productName;
+  const rgProductDesc = b ? (b.description || '') : '';
+  const rgBrandInf = checkBrandRegionInference(rgProductName, rgProductDesc);
+  /* Brand inference is valid when: brand matches, inferred region matches candidate or current,
+     and there is no explicit contradicting region signal from another country */
+  const rgBrandConfirms = rgBrandInf.matched &&
+    (regionsCanonicallyEqual(rgCurrent, rgBrandInf.inferredRegion) ||
+     regionsCanonicallyEqual(rgCand2, rgBrandInf.inferredRegion));
   let rgStatus;
+  let rgSource = 'uncertain';  /* explicit_text | brand_region_whitelist | canonical_alias | uncertain */
   if (rgCanonMatch && rgTextConfirmed) {
-    rgStatus = 'green';                          /* canonical + text evidence = confirmed */
+    rgStatus = 'green'; rgSource = 'explicit_text';
+  } else if (rgBrandConfirms && rgCanonMatch) {
+    rgStatus = 'green'; rgSource = 'brand_region_whitelist';
+  } else if (rgBrandConfirms && rgUncertain) {
+    rgStatus = 'green'; rgSource = 'brand_region_whitelist';
   } else if (rgCanonMatch && rgUncertain) {
-    rgStatus = 'yellow';                         /* canonical OK but no text evidence → needs review */
+    rgStatus = 'yellow'; rgSource = 'canonical_alias';
   } else if (rgCanonMatch && !rgUncertain) {
-    rgStatus = 'green';                          /* canonical match, status not uncertain (e.g. no module) */
+    rgStatus = 'green'; rgSource = 'canonical_alias';
   } else if (rgTextConfirmed) {
-    rgStatus = 'green';                          /* text evidence alone = confirmed */
+    rgStatus = 'green'; rgSource = 'explicit_text';
   } else if (rgMod.status === 'mismatch') {
     rgStatus = 'red';
   } else {
     rgStatus = 'yellow';
   }
-  /* Hints: two modes — replacement (canonical mismatch) vs evidence-warning (canonical match but uncertain) */
+  /* Hints */
   let rgHints = '';
-  if (rgCand2 && !rgCanonMatch) {
-    /* Replacement case */
+  if (rgCand2 && !rgCanonMatch && !rgBrandConfirms) {
     rgHints = `<div style="margin-top:4px;font-size:12px;color:#fbbf24;">В name найден другой регион: <b>${esc(rgCand2)}</b></div>` +
               `<div style="font-size:12px;color:#fbbf24;">В таблице есть регион: <b>${esc(rgCand2)}</b></div>`;
-  } else if (rgCanonMatch && rgUncertain) {
-    /* Evidence-warning case (MSG135) */
+  } else if (rgCanonMatch && rgUncertain && !rgBrandConfirms) {
     rgHints = `<div style="margin-top:4px;font-size:12px;color:#fbbf24;">Canonical match, но seller text не подтверждает регион. Автоподтверждение запрещено.</div>`;
   }
   let rgAction;
-  if (rgCanonMatch && rgTextConfirmed) {
-    rgAction = 'Регион подтверждён (canonical match + text evidence).';
-  } else if (rgCanonMatch && rgUncertain) {
-    rgAction = rgMod.reason || 'Текущее значение совпадает с candidate, но регион не подтверждён seller text. Требуется ручная проверка.';
-  } else if (rgCanonMatch) {
+  if (rgSource === 'explicit_text') {
+    rgAction = 'Регион подтверждён (text evidence' + (rgCanonMatch ? ' + canonical match' : '') + ').';
+  } else if (rgSource === 'brand_region_whitelist') {
+    rgAction = 'Регион подтверждён правилом brand → region whitelist: ' + rgBrandInf.brand + ' → ' + rgBrandInf.inferredRegion + '.';
+  } else if (rgSource === 'canonical_alias' && rgStatus === 'green') {
     rgAction = 'Регион подтверждён (canonical match).';
+  } else if (rgSource === 'canonical_alias' && rgStatus === 'yellow') {
+    rgAction = rgMod.reason || 'Canonical match, но seller text не подтверждает. Требуется ручная проверка.';
   } else {
     rgAction = rgMod.reason || '—';
   }
+  const rgSourceLabel = rgSource === 'brand_region_whitelist'
+    ? ` <span style="color:#a78bfa;font-size:11px;">(brand whitelist: ${esc(rgBrandInf.brand)} → ${esc(rgBrandInf.inferredRegion)})</span>`
+    : (rgCanonMatch && rgCand2 ? ' <span style="color:#4ade80;font-size:11px;">(canonical match)</span>' : '');
   const sec4 = renderDetailSection('Регион', 4, rgStatus, [
     { label: 'Текущий', value: rgCurrent },
-    { label: 'Рекомендованный', html: esc(rgCand2 || '—') + (rgCanonMatch && rgCand2 ? ' <span style="color:#4ade80;font-size:11px;">(canonical match)</span>' : '') + rgHints },
+    { label: 'Рекомендованный', html: esc(rgCand2 || '—') + rgSourceLabel + rgHints },
     { label: 'Действие', value: rgAction },
-    { label: 'Источник', value: 'catalogue' },
+    { label: 'Источник', value: rgSource === 'brand_region_whitelist' ? 'brand whitelist' : 'catalogue' },
   ]);
 
   /* Block 5: Denomination (MSG87 + MSG135: text-evidence gate)
@@ -2472,8 +2526,9 @@ function renderDetailPanel(session) {
   /* MSG135: text-evidence gate for denomination */
   const dnTextConfirmed = dnMod.status === 'match';
   const dnUncertain = dnMod.status === 'uncertain';
-  /* MSG135: denomination depends on region — if region is uncertain, denomination cannot be green */
-  const dnRegionBlocked = rgUncertain || rgStatus === 'yellow' || rgStatus === 'red';
+  /* MSG135 + MSG178: denomination depends on resolved region status, not raw module status.
+     Brand inference can resolve region to green even when module says uncertain. */
+  const dnRegionBlocked = rgStatus === 'yellow' || rgStatus === 'red';
   let dnStatus;
   if (dnCand && dnCanonMatch && dnTextConfirmed && !dnRegionBlocked) {
     dnStatus = 'green';                      /* canonical + text evidence + region OK */
