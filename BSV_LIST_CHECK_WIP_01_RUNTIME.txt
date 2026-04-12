@@ -588,23 +588,111 @@ function applyProductTypeInPopup(win, candidateId) {
 }
 
 function applyDenominationInPopup(win, candidateId) {
-  if (!candidateId) return { ok: false, error: 'DENOM_EMPTY: Нет candidateId' };
+  /* MSG121: full diagnostic instrumentation for denomination apply */
+  const diag = {
+    ts: isoNow(),
+    candidateRaw: candidateId || '',
+    candidateEntity: '',
+    selectFound: false,
+    optionCount: 0,
+    options: [],          /* [{value, label, entity}] — all popup options */
+    currentRaw: '',
+    currentEntity: '',
+    currentValue: '',
+    alreadyCanonEqual: false,
+    matchedOptionValue: '',
+    matchedOptionLabel: '',
+    matchedOptionEntity: '',
+    oldSelectValue: '',
+    newSelectValue: '',
+    valueActuallyChanged: false,
+    eventsDispatched: false,
+    valueAfterEvents: '',
+    rootCause: 'UNKNOWN',
+    ok: false,
+  };
+
+  if (!candidateId) {
+    diag.rootCause = 'DENOM_EMPTY';
+    return { ok: false, error: 'DENOM_EMPTY: Нет candidateId', diag };
+  }
+  diag.candidateEntity = extractDenomEntity(candidateId);
+
   try {
     const dSel = win.document.getElementById('denomination-select');
-    if (!dSel) return { ok: false, error: 'DENOM_NO_SELECT: select не найден' };
-    /* Check if current value already matches candidate canonically (MSG119) */
-    const currentOpt = dSel.options[dSel.selectedIndex];
-    if (currentOpt && denominationsCanonicallyEqual(currentOpt.textContent.trim(), candidateId)) {
-      return { ok: true, value: currentOpt.value, label: norm(currentOpt.textContent),
-               alreadyMatched: true };
+    if (!dSel) {
+      diag.rootCause = 'SELECT_NOT_FOUND';
+      return { ok: false, error: 'DENOM_NO_SELECT: select не найден', diag };
     }
+    diag.selectFound = true;
+    diag.optionCount = dSel.options.length;
+    /* Capture all options for diagnostic */
+    for (const opt of dSel.options) {
+      if (!opt.value) continue;
+      const lbl = opt.textContent.trim();
+      diag.options.push({
+        value: opt.value,
+        label: lbl,
+        entity: extractDenomEntity(lbl),
+      });
+    }
+
+    /* Current state */
+    const currentOpt = dSel.options[dSel.selectedIndex];
+    diag.currentRaw = currentOpt ? currentOpt.textContent.trim() : '';
+    diag.currentEntity = extractDenomEntity(diag.currentRaw);
+    diag.currentValue = dSel.value;
+    diag.oldSelectValue = dSel.value;
+
+    /* Check if current value already matches candidate canonically (MSG119) */
+    if (currentOpt && denominationsCanonicallyEqual(currentOpt.textContent.trim(), candidateId)) {
+      diag.alreadyCanonEqual = true;
+      diag.rootCause = 'ALREADY_MATCHED';
+      diag.ok = true;
+      return { ok: true, value: currentOpt.value, label: norm(currentOpt.textContent),
+               alreadyMatched: true, diag };
+    }
+
     /* Entity-based matching: dn::TypeKey::value ↔ [TypeKey][mode][Cat][value] (MSG119) */
     const matched = findDenominationOptionByEntity(dSel, candidateId);
-    if (!matched) return { ok: false, error: 'DENOM_APPLY_NO_MATCH: Denomination кандидат «' + candidateId + '» не найден среди опций popup select' };
+    if (!matched) {
+      diag.rootCause = 'OPTION_NOT_FOUND';
+      return { ok: false, error: 'DENOM_APPLY_NO_MATCH: Denomination кандидат «' + candidateId + '» не найден среди опций popup select', diag };
+    }
+    diag.matchedOptionValue = matched.value;
+    diag.matchedOptionLabel = matched.textContent.trim();
+    diag.matchedOptionEntity = extractDenomEntity(matched.textContent.trim());
+
+    /* Apply: set value */
     dSel.value = matched.value;
-    return { ok: true, value: matched.value, label: norm(matched.textContent) };
-  } catch (_) {
-    return { ok: false, error: 'DENOM_ERROR' };
+    diag.newSelectValue = dSel.value;
+    diag.valueActuallyChanged = (dSel.value === matched.value);
+
+    if (!diag.valueActuallyChanged) {
+      diag.rootCause = 'VALUE_SET_FAILED';
+      return { ok: false, error: 'DENOM_VALUE_SET_FAILED: select.value не изменился после присвоения', diag };
+    }
+
+    /* Dispatch change/input events so page JS reacts */
+    try {
+      dSel.dispatchEvent(new Event('change', { bubbles: true }));
+      dSel.dispatchEvent(new Event('input', { bubbles: true }));
+      diag.eventsDispatched = true;
+    } catch (_) { diag.eventsDispatched = false; }
+
+    /* Check if value survived event handlers (no automatic revert) */
+    diag.valueAfterEvents = dSel.value;
+    if (dSel.value !== matched.value) {
+      diag.rootCause = 'VALUE_REVERTED_AFTER_SET';
+      return { ok: false, error: 'DENOM_VALUE_REVERTED: значение вернулось к «' + dSel.value + '» после dispatch events', diag };
+    }
+
+    diag.rootCause = 'SUCCESS';
+    diag.ok = true;
+    return { ok: true, value: matched.value, label: norm(matched.textContent), diag };
+  } catch (e) {
+    diag.rootCause = 'EXCEPTION: ' + (e.message || String(e));
+    return { ok: false, error: 'DENOM_ERROR: ' + (e.message || e), diag };
   }
 }
 
@@ -693,12 +781,13 @@ async function applyRecommendations(card) {
     }
   }
 
-  /* ═══ STEP 3b: Apply Denomination (MSG119: entity-based matching) ═══ */
+  /* ═══ STEP 3b: Apply Denomination (MSG119/121: entity match + diag) ═══ */
   const dStatus = (recs.denomination || {}).status;
   if (dStatus === 'mismatch' || dStatus === 'uncertain') {
     const dCandId = (recs.denomination || {}).candidateId || '';
     if (dCandId) {
       const res = applyDenominationInPopup(win, dCandId);
+      if (res.diag) recs.denomination.applyDiag = res.diag;   /* MSG121: store diagnostic */
       if (res.ok) {
         recs.denomination.resolvedDomValue = res.value;
         recs.denomination.resolvedDomLabel = res.label;
@@ -1629,6 +1718,46 @@ function renderAiTraceBlock(card, session) {
     trow('modStatusNew', card.modStatusNew || '—'),
   ].join(''));
 
+  /* I. Denomination Apply Debug (MSG121 diagnostic) */
+  const dnDiag = ((card.recommendations || {}).denomination || {}).applyDiag;
+  let secI = '';
+  if (dnDiag) {
+    const optSummary = (dnDiag.options || []).map(o =>
+      o.label + ' → entity:' + (o.entity || 'NONE')
+    ).join('\n');
+    const rootColor = dnDiag.ok ? '#4ade80' : '#f87171';
+    secI = tsec('I. Denom Apply Debug (MSG121)', [
+      trow('timestamp', dnDiag.ts || '—'),
+      trow('candidate raw', dnDiag.candidateRaw || '—'),
+      trow('candidate entity', dnDiag.candidateEntity || '—'),
+      trow('select found', String(dnDiag.selectFound)),
+      trow('option count', String(dnDiag.optionCount)),
+      trow('current raw', dnDiag.currentRaw || '—'),
+      trow('current entity', dnDiag.currentEntity || '—'),
+      trow('current value', dnDiag.currentValue || '—'),
+      trow('already canon equal', String(dnDiag.alreadyCanonEqual)),
+      trow('matched option value', dnDiag.matchedOptionValue || '—'),
+      trow('matched option label', dnDiag.matchedOptionLabel || '—'),
+      trow('matched option entity', dnDiag.matchedOptionEntity || '—'),
+      trow('old select.value', dnDiag.oldSelectValue || '—'),
+      trow('new select.value', dnDiag.newSelectValue || '—'),
+      trow('value changed', String(dnDiag.valueActuallyChanged)),
+      trow('events dispatched', String(dnDiag.eventsDispatched)),
+      trow('value after events', dnDiag.valueAfterEvents || '—'),
+      trow('ROOT CAUSE', dnDiag.rootCause || 'UNKNOWN', rootColor),
+    ].join(''));
+    /* Option list sub-table */
+    if (dnDiag.options.length > 0) {
+      secI += tsec('I.2 Popup Options (entity map)', dnDiag.options.map(o =>
+        trow(o.value, o.label + ' → ' + (o.entity || 'NO_ENTITY'))
+      ).join(''));
+    }
+  } else if (card.applied) {
+    secI = tsec('I. Denom Apply Debug (MSG121)', [
+      trow('status', 'no diagnostic captured (denomination apply was not triggered or candidateId was empty)'),
+    ].join(''));
+  }
+
   return `<div style="margin-top:12px;">
     <button type="button" id="wip01-trace-toggle" style="border:1px solid rgba(255,255,255,.15);
       border-radius:8px;padding:6px 14px;background:rgba(99,102,241,.1);color:#a5b4fc;
@@ -1636,7 +1765,7 @@ function renderAiTraceBlock(card, session) {
       ▼ AI Trace / Debug</button>
     <div style="margin-top:6px;padding:12px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.08);
       border-radius:10px;max-height:500px;overflow-y:auto;">
-      ${secA}${secB}${secC}${secD}${secE}${secF}${secG}${secH}
+      ${secA}${secB}${secC}${secD}${secE}${secF}${secG}${secH}${secI}
     </div>
   </div>`;
 }
