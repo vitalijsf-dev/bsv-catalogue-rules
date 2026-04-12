@@ -152,16 +152,125 @@ function regionsCanonicallyEqual(a, b) {
   return listA.join(',') === listB.join(',');
 }
 
-/* ── CANONICAL PRODUCT TYPE (bugfix MSG84) ───────────────────── */
-/* "Fortnite - Games" and "Games-Fortnite" are the same ProductType.
-   Canonicalize by: lowercase, split on separators, sort parts, join. */
+/* ── CANONICAL PRODUCT TYPE (MSG84 + MSG137 catalogue-driven) ── */
+/* Canonicalize by: lowercase, split on separators, sort parts, join.
+   This is the basic heuristic layer — catalogue resolver takes priority. */
 function canonicalProductType(v) {
   const s = String(v || '').toLowerCase().trim();
   if (!s) return '';
-  /* Split on common separators: " - ", " – ", "-", "_", "/" */
-  const parts = s.split(/\s*[-–/_]\s*/).map(p => p.trim()).filter(Boolean).sort();
+  /* Split on " - ", " – " (display separators), NOT on bare "-" (part of slugs/brand names) */
+  const parts = s.split(/\s+[-–]\s+/).map(p => p.trim()).filter(Boolean).sort();
   return parts.join('::');
 }
+
+/* MSG137: Catalogue-driven ProductType resolver.
+   Uses popup productTypeOptions as BSV catalogue source of truth.
+   The catalogue slug from backend (e.g. "games-ea-sports-fc") maps to a
+   display label in the popup (e.g. "EA Sports FC - Games").
+   Both refer to the same catalogue entity. */
+
+/* Normalize slug for comparison: lowercase, replace [-_] with spaces, collapse whitespace */
+function normSlug(s) {
+  return String(s || '').toLowerCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/* Find popup option that matches a candidate slug/id.
+   Returns {value, label} or null.
+   Match strategy: slug-normalized comparison of option labels. */
+function resolveProductTypeFromCatalogue(candidateId, options) {
+  if (!candidateId || !options || !options.length) return null;
+  const needle = normSlug(candidateId);
+  if (!needle) return null;
+  /* 1. Exact label match (norm) */
+  for (const opt of options) {
+    if (norm(opt.label) === norm(candidateId)) return opt;
+  }
+  /* 2. Slug-normalized match: "games-ea-sports-fc" ↔ "EA Sports FC - Games" */
+  for (const opt of options) {
+    if (normSlug(opt.label) === needle) return opt;
+  }
+  /* 3. Sorted-parts match: split both into words, sort, compare */
+  const needleParts = needle.split(/\s+/).sort().join(' ');
+  for (const opt of options) {
+    const optParts = normSlug(opt.label).split(/\s+/).sort().join(' ');
+    if (optParts === needleParts) return opt;
+  }
+  return null;
+}
+
+/* MSG137: Unified ProductType resolution state.
+   Compares current display label against recommended candidate,
+   using catalogue lookup when available. */
+function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleStatus) {
+  const state = {
+    currentRaw: currentLabel || '',
+    recommendedRaw: candidateId || '',
+    currentDisplay: currentLabel || '',
+    recommendedDisplay: candidateId || '',  /* default: show slug */
+    currentCanonical: canonicalProductType(currentLabel),
+    recommendedCanonical: canonicalProductType(candidateId),
+    semanticMatch: false,
+    catalogueResolved: false,
+    showHelper: false,
+    helperMode: 'none',       /* 'none' | 'replacement' | 'unresolved' */
+    uiStatus: 'yellow',       /* 'green' | 'yellow' | 'red' */
+  };
+
+  if (!candidateId) {
+    state.semanticMatch = true;
+    state.uiStatus = 'green';
+    return state;
+  }
+
+  /* Step 1: Try catalogue-driven resolution */
+  const catalogueMatch = resolveProductTypeFromCatalogue(candidateId, ptOptions || []);
+  if (catalogueMatch) {
+    state.catalogueResolved = true;
+    state.recommendedDisplay = catalogueMatch.label;
+    state.recommendedCanonical = canonicalProductType(catalogueMatch.label);
+  }
+
+  /* Step 2: Check semantic match */
+  /* Quick exact/norm check */
+  if (currentLabel === candidateId || norm(currentLabel) === norm(candidateId)) {
+    state.semanticMatch = true;
+  }
+  /* Canonical check (display labels) */
+  else if (state.currentCanonical && state.recommendedCanonical &&
+           state.currentCanonical === state.recommendedCanonical) {
+    state.semanticMatch = true;
+  }
+  /* Catalogue-resolved display label vs current */
+  else if (catalogueMatch && norm(currentLabel) === norm(catalogueMatch.label)) {
+    state.semanticMatch = true;
+  }
+  /* Catalogue-resolved: slug-normalized current vs resolved label */
+  else if (catalogueMatch && normSlug(currentLabel) === normSlug(catalogueMatch.label)) {
+    state.semanticMatch = true;
+  }
+  /* Backend says match */
+  else if (moduleStatus === 'match') {
+    state.semanticMatch = true;
+  }
+
+  /* Step 3: Determine UI state */
+  if (state.semanticMatch) {
+    state.uiStatus = 'green';
+    state.showHelper = false;
+    state.helperMode = 'none';
+  } else if (moduleStatus === 'mismatch') {
+    state.uiStatus = 'red';
+    state.showHelper = true;
+    state.helperMode = 'replacement';
+  } else {
+    state.uiStatus = 'yellow';
+    state.showHelper = true;
+    state.helperMode = 'replacement';
+  }
+
+  return state;
+}
+
 function productTypesCanonicallyEqual(current, recommended) {
   if (!current || !recommended) return false;
   if (current === recommended || norm(current) === norm(recommended)) return true;
@@ -1533,19 +1642,21 @@ function renderTicketContext(card) {
   /* ── Candidate comparisons (MUST be declared before evidence terms use them — MSG95 fix) ── */
   const ptCand = sel.product_type_candidate_id || '';
   const ptModStatus = ((raw.modules || {}).product_type || {}).status || '';
-  /* PT is resolved as confirmed if: backend says match OR canonical/semantic match (MSG110) */
-  const ptCanonMatch = !ptCand || ptModStatus === 'match' || productTypesCanonicallyEqual(pt, ptCand);
+  /* MSG137: Catalogue-driven ProductType resolution */
+  const ptOptions = b ? (b.productTypeOptions || []) : [];
+  const ptResolved = resolveProductTypeState(pt, ptCand, ptOptions, ptModStatus);
+  const ptCanonMatch = ptResolved.semanticMatch;
   const rgCand = sel.region_candidate_id || '';
   const rgMatch = regionsCanonicallyEqual(rg, rgCand);
   const dnCandTc = sel.denomination_candidate_id || '';
   const dnMatchTc = !dnCandTc || denominationsCanonicallyEqual(dn, dnCandTc);
 
-  /* ProductType hint — only shown when PT is genuinely unconfirmed (MSG110) */
+  /* ProductType hint — MSG137: use resolved display label, not raw slug */
   let ptHelper = '';
-  if (ptCand && !ptCanonMatch) {
+  if (ptResolved.showHelper && ptResolved.helperMode === 'replacement') {
     ptHelper = hintBox(
-      `Название/описание указывает на другой ProductType: <b>${esc(ptCand)}</b><br>` +
-      `В таблице есть ProductType: <b>${esc(ptCand)}</b>`);
+      `Название/описание указывает на другой ProductType: <b>${esc(ptResolved.recommendedDisplay)}</b><br>` +
+      `В таблице есть ProductType: <b>${esc(ptResolved.recommendedDisplay)}</b>`);
   }
 
   /* Region hint (MSG135: separate replacement vs evidence-warning modes) */
@@ -1604,12 +1715,14 @@ function renderTicketContext(card) {
     return terms;
   };
   const ptType = ptCanonMatch ? 'confirm' : 'replace';
-  /* PT terms: full name + parts + individual words */
+  /* PT terms: full name + parts + individual words.
+     MSG137: use resolved display label for evidence, not raw slug */
+  const ptDisplayForEvidence = ptResolved.recommendedDisplay || ptCand;
   if (pt && pt !== '—') {
     addEvidence(pt, 'confirm');
     splitPtTerms(pt).forEach(t => addEvidence(t, 'confirm'));
   }
-  if (ptCand) splitPtTerms(ptCand).forEach(t => addEvidence(t, ptType));
+  if (ptDisplayForEvidence) splitPtTerms(ptDisplayForEvidence).forEach(t => addEvidence(t, ptType));
   /* PT aliases: check which known aliases appear to be relevant */
   PT_ALIASES.forEach(alias => {
     const al = alias.toLowerCase();
@@ -1819,17 +1932,21 @@ function renderAiTraceBlock(card, session) {
     trow('manual_review.reason', mrM.reason || '—'),
   ].join(''));
 
-  /* E. Comparison Matrix */
+  /* E. Comparison Matrix (MSG137: catalogue-driven PT resolution) */
   const ptRec = sel.product_type_candidate_id || '';
+  const ptTraceOpts = b ? (b.productTypeOptions || []) : [];
+  const ptTraceRes = resolveProductTypeState(snapPt, ptRec, ptTraceOpts, (mods.product_type || {}).status);
   const ptExactEq = norm(snapPt) === norm(ptRec);
-  const ptCanonEq = productTypesCanonicallyEqual(snapPt, ptRec);
+  const ptCanonEq = ptTraceRes.semanticMatch;
   const secE = tsec('E. Comparison Matrix', [
     trow('PT current', snapPt),
-    trow('PT recommended', ptRec || '—'),
+    trow('PT recommended (raw)', ptRec || '—'),
+    trow('PT recommended (display)', ptTraceRes.recommendedDisplay || '—'),
+    trow('PT catalogue resolved', String(ptTraceRes.catalogueResolved)),
     trow('PT canonical current', canonicalProductType(snapPt) || '—'),
-    trow('PT canonical recommended', canonicalProductType(ptRec) || '—'),
+    trow('PT canonical recommended', canonicalProductType(ptTraceRes.recommendedDisplay || ptRec) || '—'),
     trow('PT exact match', snapPt && ptRec ? String(ptExactEq) : '—', ptExactEq ? '#4ade80' : '#fbbf24'),
-    trow('PT canonical match', snapPt && ptRec ? String(ptCanonEq) : '—', ptCanonEq ? '#4ade80' : '#f87171'),
+    trow('PT semantic match', snapPt && ptRec ? String(ptCanonEq) : '—', ptCanonEq ? '#4ade80' : '#f87171'),
     trow('RG current', snapRg),
     trow('RG recommended', rgCand || '—'),
     trow('RG canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
@@ -1987,17 +2104,20 @@ function renderDetailPanel(session) {
     { label: 'Совпадения', value: mrMod.reason || 'не найдено' },
   ]);
 
-  /* Block 3: ProductType (canonical — MSG84) */
+  /* Block 3: ProductType (MSG84 + MSG137 catalogue-driven) */
   const ptMod = mods.product_type || {};
   const ptCand3 = sel.product_type_candidate_id || '';
   const ptCur3 = pt2(b);
-  const ptCanonMatch3 = productTypesCanonicallyEqual(ptCur3, ptCand3);
-  const ptStatus = (ptCanonMatch3 || ptMod.status === 'match') ? 'green'
-    : ptMod.status === 'mismatch' ? 'red' : 'yellow';
+  const ptOpts3 = b ? (b.productTypeOptions || []) : [];
+  const ptRes3 = resolveProductTypeState(ptCur3, ptCand3, ptOpts3, ptMod.status);
+  const ptStatus = ptRes3.uiStatus;
+  const ptMatchLabel = ptRes3.semanticMatch
+    ? (ptRes3.catalogueResolved ? '(catalogue match)' : '(canonical match)')
+    : '';
   const sec3 = renderDetailSection('ProductType', 3, ptStatus, [
     { label: 'Текущий', value: ptCur3 },
-    { label: 'Рекомендованный', html: esc(ptCand3 || ptCur3) + (ptCanonMatch3 && ptCand3 ? ' <span style="color:#4ade80;font-size:11px;">(canonical match)</span>' : '') },
-    { label: 'Действие', value: ptCanonMatch3 ? 'ProductType подтверждён (canonical match).' : (ptMod.reason || '—') },
+    { label: 'Рекомендованный', html: esc(ptRes3.recommendedDisplay || ptCur3) + (ptRes3.semanticMatch && ptCand3 ? ` <span style="color:#4ade80;font-size:11px;">${ptMatchLabel}</span>` : '') },
+    { label: 'Действие', value: ptRes3.semanticMatch ? `ProductType подтверждён ${ptMatchLabel}.` : (ptMod.reason || '—') },
     { label: 'Источник', value: 'catalogue' },
   ]);
 
