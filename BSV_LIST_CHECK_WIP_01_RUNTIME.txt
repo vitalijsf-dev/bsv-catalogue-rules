@@ -1262,33 +1262,156 @@ function renderOverlay() {
   return el;
 }
 
-/* ── STARTUP ────────────────────────────────────────────────── */
-function renderStartup(count, onStart) {
+/* ── STARTUP (MSG129: card selection UI) ────────────────────── */
+function renderStartup(items, onStartWithItems) {
   _s.uiPhase = 'startup';
+  const count = items.length;
+  /* Track manual checkbox state per productId */
+  const checked = new Set();
+  let manualMode = false; /* true once operator toggles any checkbox */
+
+  function getEffectiveCount() {
+    if (manualMode && checked.size > 0) return checked.size;
+    const inp = $('wip01-scan-count');
+    let n = inp ? parseInt(inp.value, 10) : count;
+    if (isNaN(n) || n < 1) n = 1;
+    if (n > count) n = count;
+    return n;
+  }
+
+  function updateStartButton() {
+    const btn = $('wip01-start');
+    if (!btn) return;
+    const eff = getEffectiveCount();
+    const mode = (manualMode && checked.size > 0) ? ' выбрано' : '';
+    btn.textContent = 'Начать проверку (' + eff + ' карточ' + pluralCard(eff) + mode + ')';
+  }
+
+  function pluralCard(n) {
+    const m = n % 10, h = n % 100;
+    if (m === 1 && h !== 11) return 'ка';
+    if (m >= 2 && m <= 4 && (h < 12 || h > 14)) return 'ки';
+    return 'ек';
+  }
+
+  function updateCounter() {
+    const el = $('wip01-sel-counter');
+    if (!el) return;
+    if (manualMode && checked.size > 0) {
+      el.textContent = 'Выбрано вручную: ' + checked.size + ' из ' + count;
+      el.style.color = '#60a5fa';
+    } else {
+      el.textContent = '';
+    }
+  }
+
+  function toggleCheck(pid) {
+    manualMode = true;
+    if (checked.has(pid)) checked.delete(pid); else checked.add(pid);
+    /* Update checkbox visual */
+    const cb = $('wip01-cb-' + pid);
+    if (cb) cb.checked = checked.has(pid);
+    updateStartButton();
+    updateCounter();
+  }
+
+  function setAll(on) {
+    manualMode = true;
+    checked.clear();
+    if (on) items.forEach(it => checked.add(it.productId));
+    for (const it of items) {
+      const cb = $('wip01-cb-' + it.productId);
+      if (cb) cb.checked = on;
+    }
+    updateStartButton();
+    updateCounter();
+  }
+
+  /* Build card list HTML */
+  let listHtml = '';
+  for (const it of items) {
+    listHtml += `<label id="wip01-row-${esc(it.productId)}" style="display:flex;align-items:center;gap:8px;
+      padding:7px 10px;border-radius:8px;cursor:pointer;transition:background .15s;
+      border-bottom:1px solid rgba(255,255,255,.04);"
+      onmouseover="this.style.background='rgba(96,165,250,.08)'"
+      onmouseout="this.style.background='transparent'">
+      <input type="checkbox" id="wip01-cb-${esc(it.productId)}" data-pid="${esc(it.productId)}"
+        style="width:16px;height:16px;accent-color:#2563eb;cursor:pointer;flex-shrink:0;">
+      <span style="font-size:11px;color:#6b7280;min-width:52px;">#${esc(it.productId)}</span>
+      <span style="font-size:12px;color:#e5e7eb;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(it.productName)}</span>
+      <span style="font-size:10px;color:#64748b;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(it.productType)}</span>
+    </label>`;
+  }
+
   $('wip01-list').innerHTML = `
-    <div style="text-align:center;padding:28px 14px;">
-      <div style="font-size:13px;color:#94a3b8;">Товаров <b style="color:#a5b4fc;">Under Review</b> на странице:</div>
-      <div style="font-size:48px;font-weight:800;color:#60a5fa;margin:8px 0 16px;">${count}</div>
+    <div style="padding:14px 14px 0;">
+      <div style="font-size:13px;color:#94a3b8;text-align:center;">Товаров <b style="color:#a5b4fc;">Under Review</b> на странице:</div>
+      <div style="font-size:42px;font-weight:800;color:#60a5fa;margin:6px 0 12px;text-align:center;">${count}</div>
       ${count > 0 ? `
-        <div style="margin-bottom:14px;">
+        <div style="margin-bottom:10px;text-align:center;">
           <label style="font-size:13px;color:#94a3b8;">Сканировать первых:</label>
           <input id="wip01-scan-count" type="number" min="1" max="${count}" value="${count}"
             style="width:70px;margin-left:8px;padding:6px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.2);
             background:rgba(255,255,255,.07);color:#e5e7eb;font-size:16px;font-weight:700;text-align:center;">
           <span style="font-size:12px;color:#6b7280;margin-left:4px;">из ${count}</span>
         </div>
+        <div style="display:flex;gap:8px;margin-bottom:8px;justify-content:center;">
+          <button id="wip01-sel-all" type="button" style="border:1px solid rgba(255,255,255,.15);
+            border-radius:6px;padding:4px 12px;background:rgba(255,255,255,.05);color:#94a3b8;
+            font-size:11px;cursor:pointer;">Выбрать все</button>
+          <button id="wip01-sel-none" type="button" style="border:1px solid rgba(255,255,255,.15);
+            border-radius:6px;padding:4px 12px;background:rgba(255,255,255,.05);color:#94a3b8;
+            font-size:11px;cursor:pointer;">Снять все</button>
+        </div>
+        <div id="wip01-sel-counter" style="font-size:12px;text-align:center;margin-bottom:8px;min-height:16px;"></div>
+      ` : ''}
+    </div>
+    ${count > 0 ? `
+      <div style="flex:1;overflow-y:auto;padding:0 8px 8px;max-height:calc(100vh - 360px);">
+        ${listHtml}
+      </div>
+      <div style="padding:10px 14px;">
         <button id="wip01-start" type="button" style="border:none;border-radius:10px;padding:12px 24px;
           background:#2563eb;color:#fff;font-weight:700;font-size:15px;cursor:pointer;width:100%;">
-          Начать проверку</button>` : '<div style="color:#f59e0b;">Нет товаров Under Review.</div>'}
-    </div>`;
-  $('wip01-detail').innerHTML = '<div style="color:#6b7280;padding:24px;text-align:center;">Нажмите «Начать проверку» для запуска.</div>';
+          Начать проверку (${count} карточ${pluralCard(count)})</button>
+      </div>
+    ` : '<div style="padding:14px;color:#f59e0b;text-align:center;">Нет товаров Under Review.</div>'}`;
+
+  $('wip01-detail').innerHTML = '<div style="color:#6b7280;padding:24px;text-align:center;">Выберите карточки для проверки или нажмите «Начать проверку».</div>';
+
+  /* Bind checkbox events */
+  for (const it of items) {
+    const cb = $('wip01-cb-' + it.productId);
+    if (cb) cb.onchange = () => toggleCheck(it.productId);
+  }
+
+  /* Bind select all / deselect all */
+  const selAll = $('wip01-sel-all');
+  if (selAll) selAll.onclick = () => setAll(true);
+  const selNone = $('wip01-sel-none');
+  if (selNone) selNone.onclick = () => setAll(false);
+
+  /* Update button text when count input changes */
+  const scanInp = $('wip01-scan-count');
+  if (scanInp) scanInp.oninput = () => {
+    if (!manualMode || checked.size === 0) updateStartButton();
+  };
+
+  /* Bind start button */
   const startBtn = $('wip01-start');
   if (startBtn) startBtn.onclick = () => {
-    const inp = $('wip01-scan-count');
-    let n = inp ? parseInt(inp.value, 10) : count;
-    if (isNaN(n) || n < 1) n = 1;
-    if (n > count) n = count;
-    onStart(n);
+    let selectedItems;
+    if (manualMode && checked.size > 0) {
+      /* Manual selection mode: only checked items, in page order */
+      selectedItems = items.filter(it => checked.has(it.productId));
+    } else {
+      /* Count-based mode: first N items */
+      let n = scanInp ? parseInt(scanInp.value, 10) : count;
+      if (isNaN(n) || n < 1) n = 1;
+      if (n > count) n = count;
+      selectedItems = items.slice(0, n);
+    }
+    onStartWithItems(selectedItems);
   };
 }
 
@@ -2168,10 +2291,11 @@ async function main() {
 
   renderOverlay();
 
-  async function doScan(scanCount) {
+  /* MSG129: doScan now accepts an array of selected items, not a count */
+  async function doScan(selectedItems) {
     _s.aborted = false;
     _s.uiPhase = 'scanning';
-    const toScan = scanCount ? items.slice(0, scanCount) : items;
+    const toScan = selectedItems && selectedItems.length > 0 ? selectedItems : items;
     session.summary.totalFound = toScan.length;
     renderProgress(0, toScan.length, null);
 
@@ -2189,7 +2313,7 @@ async function main() {
     renderDashboard(session);
   }
 
-  renderStartup(items.length, doScan);
+  renderStartup(items, doScan);
 }
 
 main().catch(e => {
