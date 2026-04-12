@@ -193,6 +193,21 @@ function denominationsCanonicallyEqual(current, recommended) {
   const eRec = extractDenomEntity(recommended);
   return eCur && eRec && eCur === eRec;
 }
+/* Find denomination <option> by entity match (bugfix MSG119).
+   candidateId is in backend format (dn::TypeKey::value).
+   Options are in DOM format ([TypeKey][mode][Category][value]).
+   Uses extractDenomEntity for canonical matching. */
+function findDenominationOptionByEntity(selectEl, candidateId) {
+  if (!selectEl || !candidateId) return null;
+  const needleEntity = extractDenomEntity(candidateId);
+  if (!needleEntity) return null;
+  for (const opt of selectEl.options) {
+    if (!opt.value) continue;
+    const optEntity = extractDenomEntity(opt.textContent.trim());
+    if (optEntity && optEntity === needleEntity) return opt;
+  }
+  return null;
+}
 
 /* ── DATA MODEL ──────────────────────────────────────────────── */
 function makeSnap() {
@@ -577,8 +592,15 @@ function applyDenominationInPopup(win, candidateId) {
   try {
     const dSel = win.document.getElementById('denomination-select');
     if (!dSel) return { ok: false, error: 'DENOM_NO_SELECT: select не найден' };
-    const matched = findOptionByText(dSel, candidateId);
-    if (!matched) return { ok: false, error: 'DENOM_NO_MATCH: Denomination кандидат «' + candidateId + '» не найден' };
+    /* Check if current value already matches candidate canonically (MSG119) */
+    const currentOpt = dSel.options[dSel.selectedIndex];
+    if (currentOpt && denominationsCanonicallyEqual(currentOpt.textContent.trim(), candidateId)) {
+      return { ok: true, value: currentOpt.value, label: norm(currentOpt.textContent),
+               alreadyMatched: true };
+    }
+    /* Entity-based matching: dn::TypeKey::value ↔ [TypeKey][mode][Cat][value] (MSG119) */
+    const matched = findDenominationOptionByEntity(dSel, candidateId);
+    if (!matched) return { ok: false, error: 'DENOM_APPLY_NO_MATCH: Denomination кандидат «' + candidateId + '» не найден среди опций popup select' };
     dSel.value = matched.value;
     return { ok: true, value: matched.value, label: norm(matched.textContent) };
   } catch (_) {
@@ -671,7 +693,7 @@ async function applyRecommendations(card) {
     }
   }
 
-  /* ═══ STEP 3b: Apply Denomination ═══ */
+  /* ═══ STEP 3b: Apply Denomination (MSG119: entity-based matching) ═══ */
   const dStatus = (recs.denomination || {}).status;
   if (dStatus === 'mismatch' || dStatus === 'uncertain') {
     const dCandId = (recs.denomination || {}).candidateId || '';
@@ -680,6 +702,9 @@ async function applyRecommendations(card) {
       if (res.ok) {
         recs.denomination.resolvedDomValue = res.value;
         recs.denomination.resolvedDomLabel = res.label;
+        if (res.alreadyMatched) {
+          recs.denomination.alreadyMatched = true;
+        }
       } else {
         addError(res.error);
       }
@@ -1885,7 +1910,9 @@ function renderActionBar(session) {
       const ptChanged = (snapBefore.productTypeId !== snapAfter.productTypeId);
       const rgChanged = JSON.stringify((snapBefore.regions||[]).map(r=>r.id).sort()) !== JSON.stringify((snapAfter.regions||[]).map(r=>r.id).sort());
       const dnChanged = (snapBefore.denominationOptionId !== snapAfter.denominationOptionId);
-      if (!ptChanged && !rgChanged && !dnChanged && !freshSel.applyError) {
+      /* MSG119: alreadyMatched means denomination was already correct — not a failure */
+      const dnAlready = ((freshSel.recommendations || {}).denomination || {}).alreadyMatched === true;
+      if (!ptChanged && !rgChanged && !dnChanged && !dnAlready && !freshSel.applyError) {
         freshSel.applyError = (freshSel.applyError ? freshSel.applyError + '; ' : '') +
           'APPLY_NO_CHANGE: Popup открыт, но ни одно поле не изменилось. Проверьте рекомендации вручную.';
       }
