@@ -1803,8 +1803,7 @@ function renderTicketContext(card) {
     </div>`;
   };
 
-  /* Available options from popup snapshot */
-  const ptOptions = b ? (b.productTypeOptions || []) : [];
+  /* Available options from popup snapshot (ptOptions already declared above — MSG137) */
   const dnOptions = b ? (b.denominationOptions || []) : [];
 
   return `
