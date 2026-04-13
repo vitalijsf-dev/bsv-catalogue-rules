@@ -1,0 +1,17 @@
+{
+  "snapshot_type": "ai_trigger_words",
+  "snapshot_date": "2026-04-13",
+  "source": "Manual_Review_Words tab, spreadsheet 1WHjBo_88F8jD2rN5c7-QzyFj86M8gAa5qzx6L6kSvQM",
+  "note": "Only 1 entry exists in the source tab. The entry has status=inactive. The trigger word matching logic in v15.gs backend uses hardcoded trigger words, not this tab. This snapshot reflects the actual spreadsheet state as of 2026-04-13.",
+  "triggers": [
+    {
+      "pattern": "Account",
+      "status": "inactive",
+      "scope": "both",
+      "match_type": "token",
+      "decision_mode": "manual_review",
+      "notes": "",
+      "updated_at": "2026-04-06T01:59:52Z"
+    }
+  ]
+}
