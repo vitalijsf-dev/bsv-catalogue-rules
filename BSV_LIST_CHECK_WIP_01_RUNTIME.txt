@@ -24,8 +24,8 @@
 
 /* ── CONSTANTS ────────────────────────────────────────────────── */
 const NS              = '__BSV_LIST_CHECK_WIP_01__';
-const BACKEND_URL     = 'https://script.google.com/a/macros/buysellvouchers.com/s/AKfycbyd1_1TJ0-VT91nNtckB-PKnyVXaTEvitwu1B7lN7u7ZMQuPeUio3OamINAtxUC4BIv/exec';
-const POSTMESSAGE_SRC = 'AI_CORE_V1_MONOLITH';
+const BACKEND_URL     = 'https://bsv-ai-proxy.vitalijs-f.workers.dev/review';
+const POSTMESSAGE_SRC = 'AI_CORE_V1_WORKER';
 const BACKEND_TIMEOUT = 50000;   /* ms — Apps Script can be slow on cold start */
 const PAGE_LOAD_MS    = 25000;
 const NAV_TIMEOUT_MS  = 10000;
@@ -802,63 +802,30 @@ function readSnapshotFromPopup(win) {
   }
 }
 
-/* ── BACKEND CALLER (postmessage iframe transport) ───────────── */
-function callBackend(payload) {
-  return new Promise(resolve => {
-    const reqId  = 'wip01_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-    const iframe = document.createElement('iframe');
-    const form   = document.createElement('form');
-    iframe.name       = 'wip01_f_' + reqId;
-    iframe.style.display = 'none';
-    form.method       = 'POST';
-    form.action       = BACKEND_URL;
-    form.target       = iframe.name;
-    form.style.display = 'none';
-
-    const addInput = (n, v) => {
-      const i = document.createElement('input');
-      i.type = 'hidden'; i.name = n;
-      i.value = (v == null) ? '' : String(v);
-      form.appendChild(i);
-    };
-    addInput('transport',         'postmessage');
-    addInput('client_request_id', reqId);
-    addInput('payload_json',      JSON.stringify(payload || {}));
-
-    let settled = false;
-    const tId = setTimeout(() => {
-      if (settled) return;
-      settled = true; cleanup();
-      resolve({ ok: false, final_status: 'review', reason: 'AI Core timeout (50s)', _timeout: true });
-    }, BACKEND_TIMEOUT);
-
-    function cleanup() {
-      const fn = _s.msgHandlers.get(reqId);
-      if (fn) { window.removeEventListener('message', fn); _s.msgHandlers.delete(reqId); }
-      clearTimeout(tId);
-      setTimeout(() => {
-        try { form.remove();   } catch (_) {}
-        try { iframe.remove(); } catch (_) {}
-      }, 600);
+/* ── BACKEND CALLER (fetch transport → Cloudflare Worker) ────── */
+async function callBackend(payload) {
+  console.log('[LIST-CHECK] backend = cloudflare_worker | url =', BACKEND_URL);
+  const controller = new AbortController();
+  const tId = setTimeout(() => controller.abort(), BACKEND_TIMEOUT);
+  try {
+    const resp = await fetch(BACKEND_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+      signal: controller.signal,
+    });
+    clearTimeout(tId);
+    if (!resp.ok) {
+      return { ok: false, final_status: 'review', reason: 'AI Core HTTP ' + resp.status, _timeout: false };
     }
-
-    const handler = ev => {
-      const d = ev && ev.data;
-      if (!d || typeof d !== 'object') return;
-      if (d.source !== POSTMESSAGE_SRC) return;
-      if (String(d.client_request_id || '') !== reqId) return;
-      if (settled) return;
-      settled = true; cleanup(); resolve(d);
-    };
-    _s.msgHandlers.set(reqId, handler);
-    window.addEventListener('message', handler);
-    document.body.appendChild(iframe);
-    document.body.appendChild(form);
-    try { form.submit(); } catch (e) {
-      cleanup();
-      resolve({ ok: false, final_status: 'review', reason: 'Form submit error: ' + e.message });
+    return await resp.json();
+  } catch (e) {
+    clearTimeout(tId);
+    if (e.name === 'AbortError') {
+      return { ok: false, final_status: 'review', reason: 'AI Core timeout (50s)', _timeout: true };
     }
-  });
+    return { ok: false, final_status: 'review', reason: 'AI Core fetch error: ' + e.message, _timeout: false };
+  }
 }
 
 /* ── BACKEND RESULT MAPPER ───────────────────────────────────── */
