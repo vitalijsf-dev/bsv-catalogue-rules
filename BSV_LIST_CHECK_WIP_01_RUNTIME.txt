@@ -195,6 +195,12 @@ const _s = {
   uiPhase:         'startup',    /* 'startup' | 'scanning' | 'results' | 'empty' | 'error' */
   uiTraceOpen:     false,        /* AI trace block collapsed by default */
   onStartScan:     null,         /* set by main(), called by startup button */
+  /* MSG221: test-mode popup harness */
+  testMode:        false,        /* test mode enabled */
+  testPopupReady:  false,        /* popup bound and ready */
+  testPopupCardId: null,         /* card ID popup is currently showing */
+  testPopupUrl:    null,         /* current popup URL */
+  testPopupLastSeen: null,       /* ISO timestamp of last successful popup check */
 };
 
 window[NS] = {
@@ -208,6 +214,12 @@ window[NS] = {
     _s.msgHandlers.clear();
     if (_s.overlay) { try { _s.overlay.remove(); } catch (_) {} _s.overlay = null; }
     delete window[NS];
+  },
+  /* MSG221: test harness API for Chrome DevTools MCP */
+  testHarness: {
+    status: () => testPopupStatus(),
+    state: () => ({ testMode: _s.testMode, testPopupReady: _s.testPopupReady, testPopupCardId: _s.testPopupCardId, testPopupUrl: _s.testPopupUrl, testPopupLastSeen: _s.testPopupLastSeen, workerWinOpen: !!(_s.workerWin && !_s.workerWin.closed) }),
+    enableTestMode: () => { _s.testMode = true; return 'test mode enabled'; },
   },
 };
 
@@ -749,6 +761,55 @@ async function waitForWorkerReady(win, ms) {
     Math.round((ms || PAGE_LOAD_MS) / 1000) + 'с');
 }
 
+/* ── MSG221: TEST-MODE POPUP HARNESS ─────────────────────────── */
+function testPopupStatus() {
+  const w = _s.workerWin;
+  if (!w || w.closed) return { open: false, ready: false, url: null, cardId: null };
+  let url = null, cardId = null, hasForm = false;
+  try {
+    url = w.location.href;
+    const m = url.match(/[?&]id=(\d+)/);
+    cardId = m ? m[1] : null;
+    hasForm = !!w.document.querySelector('#product-form');
+  } catch (_) {}
+  return { open: true, ready: hasForm, url, cardId };
+}
+
+function updateTestPopupState() {
+  const st = testPopupStatus();
+  _s.testPopupReady = st.ready;
+  _s.testPopupCardId = st.cardId;
+  _s.testPopupUrl = st.url;
+  if (st.open) _s.testPopupLastSeen = isoNow();
+  return st;
+}
+
+/* Open test popup from user gesture (onclick handler).
+   Returns the window ref. Must be called from real click. */
+function openTestPopup() {
+  const firstCard = _s.session && _s.session.cards && _s.session.cards[0];
+  const url = firstCard ? firstCard.updateUrl : (BASE + '/xdm/product/admin');
+  const fullUrl = /^https?:\/\//i.test(url) ? url : (BASE + url);
+  if (_s.workerWin && !_s.workerWin.closed) {
+    /* reuse existing */
+    _s.testMode = true;
+    updateTestPopupState();
+    console.log('[TEST-HARNESS] reused existing popup | ' + JSON.stringify(testPopupStatus()));
+    return _s.workerWin;
+  }
+  const w = window.open(fullUrl, '__bsv_wip01_worker__',
+    'width=1100,height=760,left=80,top=80,scrollbars=yes,resizable=yes');
+  if (!w) {
+    console.log('[TEST-HARNESS] POPUP_BLOCKED');
+    return null;
+  }
+  _s.workerWin = w;
+  _s.isFirstCard = false;
+  _s.testMode = true;
+  console.log('[TEST-HARNESS] popup opened | url=' + fullUrl);
+  return w;
+}
+
 async function ensureWorkerAtUrl(url) {
   const fullUrl = /^https?:\/\//i.test(url) ? url : (BASE + url);
   if (_s.isFirstCard || !_s.workerWin || _s.workerWin.closed) {
@@ -1199,6 +1260,19 @@ async function applyRecommendations(card) {
   const dnAlreadyOk = (recs.denomination || {}).alreadyMatched === true;
   const anyFieldApplied = ptChanged || ptApplied || dnApplied || dnAlreadyOk;
   card.applied = anyFieldApplied || (!card.applyError);
+
+  /* MSG218: strict apply trace — proof of popup mutation */
+  const denomDiag = (recs.denomination || {}).applyDiag || {};
+  console.log('[LIST-CHECK] apply result | card=' + card.productId +
+    ' | ptChanged=' + ptChanged + ' | dnApplied=' + dnApplied +
+    ' | dnAlready=' + dnAlreadyOk +
+    ' | dnRootCause=' + (denomDiag.rootCause || 'N/A') +
+    ' | dnOldValue=' + (denomDiag.oldSelectValue || 'N/A') +
+    ' | dnNewValue=' + (denomDiag.newSelectValue || 'N/A') +
+    ' | dnValueChanged=' + (denomDiag.valueActuallyChanged || false) +
+    ' | applyError=' + (card.applyError || 'none') +
+    ' | applied=' + card.applied +
+    ' | blockingIssues=' + JSON.stringify(getCardBlockingIssues(card)));
   try { win.focus(); } catch (_) {}
 }
 
@@ -2682,6 +2756,8 @@ function renderActionBar(session) {
     btn('wip01-sheet1', 'В таблицу', !!sel, 'rgba(99,102,241,.15)', '#a5b4fc'),
     btn('wip01-sheetAll', 'В таблицу всё', yellowRedForSheet.length > 0, 'rgba(99,102,241,.08)', '#c4b5fd'),
     btn('wip01-ms', 'Mod Status', all.length > 0, 'rgba(168,85,247,.15)', '#c084fc'),
+    /* MSG221: test harness popup button */
+    btn('wip01-test-popup', _s.testMode ? ('🔗 Popup ' + (_s.workerWin && !_s.workerWin.closed ? '✓' : '✗')) : '🧪 Test Popup', true, 'rgba(251,191,36,.12)', '#fbbf24'),
   ].join('');
 
   /* Bind */
@@ -2694,7 +2770,8 @@ function renderActionBar(session) {
     if (!freshSel) return;
     if (freshSel.applied) { renderActionBar(session); return; }
     a1.disabled = true; a1.textContent = 'Применяю...';
-    _s.isFirstCard = true;
+    /* MSG221: reuse existing popup if available, only force new if truly no popup */
+    _s.isFirstCard = !(_s.workerWin && !_s.workerWin.closed);
     const snapBefore = freshSel.afterSnapshot || freshSel.beforeSnapshot;
     try { await applyRecommendations(freshSel); } catch (e) {
       freshSel.applyError = (freshSel.applyError ? freshSel.applyError + '; ' : '') + (e.message || String(e));
@@ -2714,6 +2791,24 @@ function renderActionBar(session) {
     /* MSG123 ACTION 2: APPLY_NO_CHANGE + applied=true is inconsistent */
     if (freshSel.applyError && freshSel.applyError.includes('APPLY_NO_CHANGE')) {
       freshSel.applied = false;
+    }
+    /* MSG221: test harness trace */
+    if (_s.testMode) {
+      updateTestPopupState();
+      const _dnDiag = ((freshSel.recommendations || {}).denomination || {}).applyDiag || {};
+      console.log('[TEST-HARNESS] apply done | card=' + freshSel.productId +
+        ' | applied=' + freshSel.applied +
+        ' | saveReady=' + isCardSaveReady(freshSel) +
+        ' | ptOld=' + (snapBefore ? snapBefore.productTypeId : 'N/A') +
+        ' | ptNew=' + (snapAfter ? snapAfter.productTypeId : 'N/A') +
+        ' | dnOld=' + (snapBefore ? snapBefore.denominationOptionId : 'N/A') +
+        ' | dnNew=' + (snapAfter ? snapAfter.denominationOptionId : 'N/A') +
+        ' | dnDiag.rootCause=' + (_dnDiag.rootCause || 'N/A') +
+        ' | dnDiag.oldVal=' + (_dnDiag.oldSelectValue || 'N/A') +
+        ' | dnDiag.newVal=' + (_dnDiag.newSelectValue || 'N/A') +
+        ' | dnDiag.changed=' + (_dnDiag.valueActuallyChanged || false) +
+        ' | applyError=' + (freshSel.applyError || 'none') +
+        ' | popupStatus=' + JSON.stringify(testPopupStatus()));
     }
     renderCardList(session); renderDetailPanel(session); renderActionBar(session);
   };
@@ -2787,6 +2882,22 @@ function renderActionBar(session) {
       await wait(200);
     }
     renderCardList(session); renderDetailPanel(session); renderActionBar(session);
+  };
+
+  /* MSG221: Test Popup harness button — MUST use onclick (not async) for user gesture */
+  const tp = b('wip01-test-popup');
+  if (tp) tp.onclick = () => {
+    const w = openTestPopup();
+    if (w) {
+      /* wait for popup to load, then update state */
+      setTimeout(() => {
+        updateTestPopupState();
+        console.log('[TEST-HARNESS] status after open | ' + JSON.stringify(testPopupStatus()));
+        renderActionBar(session);
+      }, 3000);
+    } else {
+      alert('Popup заблокирован браузером. Разрешите popup для этого сайта.');
+    }
   };
 }
 
