@@ -170,9 +170,22 @@ function checkBrandRegionInference(productName, description) {
   return { matched: false };
 }
 
-/* ── GUARD: must be on list page ─────────────────────────────── */
-if (!document.querySelector('table.items')) {
-  alert('BSV List Check WIP-01:\nОткройте страницу списка товаров (/xdm/product/admin).');
+/* ── PAGE CONTEXT DETECTOR (STARTUP-ROUTER-01) ──────────────── */
+function detectPageContext() {
+  const path = location.pathname;
+  if (document.querySelector('table.items') && path.includes('/xdm/product/admin')) {
+    return 'list';
+  }
+  if (document.querySelector('#product-form') && path.includes('/xdm/product/update')) {
+    return 'card';
+  }
+  return 'unknown';
+}
+
+const _pageContext = detectPageContext();
+
+if (_pageContext === 'unknown') {
+  alert('BSV List Check WIP-01:\nСтраница не распознана.\nОткройте список товаров (/xdm/product/admin)\nили карточку товара (/xdm/product/update?id=…).');
   return;
 }
 
@@ -2945,10 +2958,113 @@ async function main() {
   renderStartup(items, doScan);
 }
 
-main().catch(e => {
-  console.error('[BSV WIP01]', e);
-  const d = $('wip01-detail');
-  if (d) d.innerHTML = '<div style="color:#f87171;padding:16px;">Критическая ошибка: ' + esc(e.message || String(e)) + '</div>';
-});
+/* ── CARD MODE (STARTUP-ROUTER-01) ──────────────────────────────
+   Single-card review on /xdm/product/update?id=N page.
+   Reads current card fields, calls backend, shows inline result.
+   Additive path — does not touch list-mode logic. */
+async function mainCard() {
+  await loadAliasSnapshot();
+
+  const productId = new URLSearchParams(location.search).get('id') || '';
+  const nameEl    = document.querySelector('#product-form input[name="Product[name]"], #product-form [name="Product[name]"]');
+  const descEl    = document.querySelector('#product-form textarea[name="Product[description]"], #product-form [name="Product[description]"]');
+  const ptEl      = document.querySelector('#Product_product_type_id');
+  const denomEl   = document.querySelector('#denomination-select');
+
+  const productName = nameEl ? nameEl.value : '';
+  const description = descEl ? descEl.value : '';
+  const ptOption    = ptEl ? ptEl.options[ptEl.selectedIndex] : null;
+  const ptText      = ptOption ? ptOption.text : '';
+
+  /* Collect current regions from region container */
+  const regionEls   = document.querySelectorAll('#region-container .region-item, #region-container span');
+  const regionParts = [];
+  regionEls.forEach(el => {
+    const t = norm(el.textContent);
+    if (t && t !== '+' && t !== 'x') regionParts.push(t);
+  });
+  const regionText = regionParts.join(', ') || '';
+
+  const denomOption = denomEl ? denomEl.options[denomEl.selectedIndex] : null;
+  const denomText   = denomOption ? denomOption.text : '';
+
+  /* Build payload matching backend /review contract */
+  const payload = {
+    product_id:  productId,
+    name:        productName,
+    description: description,
+    current: {
+      product_type: ptText,
+      region:       regionText,
+      denomination: denomText,
+    },
+    mode: 'card',
+  };
+
+  /* Create minimal inline UI */
+  let container = document.getElementById('bsv-card-review-result');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'bsv-card-review-result';
+    container.style.cssText = 'margin:12px 0;padding:12px;border:2px solid #60a5fa;border-radius:8px;background:#f0f9ff;font-family:system-ui,sans-serif;font-size:13px;';
+    const form = document.querySelector('#product-form');
+    if (form) form.parentNode.insertBefore(container, form);
+    else document.body.prepend(container);
+  }
+  container.innerHTML = '<b>BSV AI Review:</b> Проверка… ⏳';
+
+  try {
+    const resp = await fetch(BACKEND_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(BACKEND_TIMEOUT),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+
+    const status = (data.final_status || 'unknown').toLowerCase();
+    const colors = { approve: '#22c55e', review: '#eab308', reject: '#ef4444' };
+    const labels = { approve: 'ОДОБРЕНО', review: 'ТРЕБУЕТСЯ ПРОВЕРКА', reject: 'ОТКЛОНЕНО' };
+    const color  = colors[status] || '#9ca3af';
+    const label  = labels[status] || status.toUpperCase();
+
+    let html = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
+      + '<b>BSV AI Review:</b>'
+      + '<span style="display:inline-block;padding:2px 10px;border-radius:4px;background:' + color + ';color:#fff;font-weight:600;">' + esc(label) + '</span>'
+      + '</div>';
+
+    /* Module details */
+    const modules = data.modules || {};
+    for (const key of ['manual_review', 'product_type', 'region', 'denomination']) {
+      const mod = modules[key];
+      if (!mod) continue;
+      const mStatus = mod.status || '';
+      const mColor  = mStatus === 'match' ? '#22c55e' : mStatus === 'mismatch' ? '#ef4444' : '#eab308';
+      html += '<div style="margin:2px 0;"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + mColor + ';margin-right:4px;"></span>'
+        + '<b>' + esc(key) + ':</b> ' + esc(mStatus);
+      if (mod.recommended) html += ' → рек.: ' + esc(mod.recommended);
+      html += '</div>';
+    }
+
+    container.innerHTML = html;
+  } catch (err) {
+    container.innerHTML = '<b>BSV AI Review:</b> <span style="color:#ef4444;">Ошибка: ' + esc(err.message || String(err)) + '</span>';
+  }
+}
+
+/* ── STARTUP ROUTER (STARTUP-ROUTER-01) ─────────────────────── */
+if (_pageContext === 'list') {
+  main().catch(e => {
+    console.error('[BSV WIP01]', e);
+    const d = $('wip01-detail');
+    if (d) d.innerHTML = '<div style="color:#f87171;padding:16px;">Критическая ошибка: ' + esc(e.message || String(e)) + '</div>';
+  });
+} else if (_pageContext === 'card') {
+  mainCard().catch(e => {
+    console.error('[BSV WIP01 CARD]', e);
+    alert('BSV Card Review: ошибка — ' + (e.message || String(e)));
+  });
+}
 
 })();
