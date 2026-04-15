@@ -1,1 +1,3313 @@
-RESTORING_FROM_ARCHIVE
+(async () => {
+'use strict';
+
+/* ═══════════════════════════════════════════════════════════════
+   BSV List Check WIP-01 Runtime — Stage 1
+   Feature : Проверка списка — Under Review mode only
+   Engine  : AI Core v1 Apps Script backend (postmessage transport)
+   Branch  : LIST-CHECK-WIP-01  (separate from LIST-STABLE-01)
+   Created : 2026-04-10 (MSG33)
+   DOM ref : 40_HTTP_PAGE_REFERENCES/HTTP_product_admin_*
+             40_HTTP_PAGE_REFERENCES/HTTP_product_update_id_153621_*
+   Stable fallback: BSV_v063_LIST_REVIEW_V3_RUNTIME.txt — UNTOUCHED
+   ═══════════════════════════════════════════════════════════════
+   MSG47 UI rebuild + business rules alignment:
+     ✓ Two-panel layout (list left, detail right) per approved mockup
+     ✓ 6 action buttons: Применить рек. / Применить для всех / Сохранить / В таблицу / В таблицу всё / Mod Status
+     ✓ Mod Status: green→published, yellow→no_change+sheet, red→rejected(reason 41)
+     ✓ Export → clipboard TSV + open Google Sheet for paste (backend gap for direct write)
+     ✓ Detail panel: 5 colored blocks (Result, Manual Review, ProductType, Region, Denomination)
+     ✓ Region hints: "В name найден другой регион" / "В таблице есть регион"
+     ✗ Published mode (Stage 2)
+     ✗ Multi-page crawl
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── CONSTANTS ────────────────────────────────────────────────── */
+const NS              = '__BSV_LIST_CHECK_WIP_01__';
+const BACKEND_URL     = 'https://bsv-ai-proxy.vitalijs-f.workers.dev/review';
+const POSTMESSAGE_SRC = 'AI_CORE_V1_WORKER';
+const BACKEND_TIMEOUT = 50000;   /* ms — Apps Script can be slow on cold start */
+const PAGE_LOAD_MS    = 25000;
+const NAV_TIMEOUT_MS  = 10000;
+const POLL_MS         = 300;
+const BASE            = location.origin;
+
+/* ── CONFIG: COLOR → MOD STATUS ──────────────────────────────────
+   Config-driven. MSG47 business rules:
+   green → published
+   yellow → no_change (yellow cards go to sheet, not mod status change)
+   red → rejected with reason 41 "product cant be listed currently"         */
+const MOD_STATUS_RULES = [
+  {
+    color:                   'green',
+    modStatus:               'published',
+    requiresRejectionReason: false,
+    rejectionReasonId:       null,
+    rejectionNote:           '',
+    _blocked:                false,
+  },
+  {
+    color:                   'yellow',
+    modStatus:               'no_change',
+    requiresRejectionReason: false,
+    rejectionReasonId:       null,
+    rejectionNote:           '',
+    _blocked:                false,
+  },
+  {
+    color:                   'red',
+    modStatus:               'rejected',
+    requiresRejectionReason: true,
+    rejectionReasonId:       41,
+    rejectionNote:           'product cant be listed currently',
+    _blocked:                false,
+  },
+];
+
+/* ── CONFIG: EXPORT DESTINATION ──────────────────────────────────
+   Stage 1.3.2: Export service DISABLED for security.
+   Token-in-public-JS is unsafe — service integration blocked until
+   a server-side auth architecture is implemented.
+   Current mode: clipboard TSV + open Google Sheet for manual paste. */
+const EXPORT_CONFIG = {
+  exportServiceUrl: '',              /* DISABLED — do not set in public runtime */
+  exportAuthToken:  '',              /* REMOVED — tokens must not be in public JS */
+  exportServiceSrc: 'LIST_CHECK_EXPORT_SERVICE_V1',
+  sheetUrl:         'https://docs.google.com/spreadsheets/d/13Gi-BpM2fpnBZYhs1h2uZa58tiSzeSu9I2gMTvu57oA/edit?gid=0#gid=0',
+  exportTab:        'LIST_CHECK_EXPORT',
+  batchesTab:       'LIST_CHECK_BATCHES',
+  serviceTimeout:   30000,
+};
+
+/* ── CONFIG: ALIAS SNAPSHOT (MSG158 → MSG173: CDN delivery) ──────
+   Runtime loads alias snapshot JSON from GitHub Pages CDN.
+   Falls back to embedded snapshot if CDN is unavailable. */
+const ALIAS_SNAPSHOT_CONFIG = {
+  enabled:  true,
+  url:      'https://vitalijsf-dev.github.io/bsv-catalogue-rules/LIST_CHECK_ALIAS_SNAPSHOT.json',
+  timeout:  6000,
+};
+
+/* ── EMBEDDED ALIAS SNAPSHOT FALLBACK (MSG158) ───────────────────
+   Stable snapshot of AI_Allowed_Aliases — used when live service
+   is unavailable. Updated manually when new aliases are confirmed.
+   Format mirrors service response rows. */
+const EMBEDDED_ALIAS_SNAPSHOT_FALLBACK = {
+  source: 'embedded_fallback',
+  version: '2026-04-15',
+  rows: [
+    /* Region aliases — full ISO 3166-1 parity with AI_Allowed_Aliases sheet (MSG257) */
+    { entity_type: 'region', canonical_id: 'EU', alias: 'European Union', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EU', alias: 'Europe', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'WW', alias: 'World', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'WW', alias: 'Worldwide', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'WW', alias: 'Global', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'US', alias: 'USA', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'US', alias: 'U.S.A', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'US', alias: 'U.S.', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'US', alias: 'United States of America', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GB', alias: 'UK', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AE', alias: 'UAE', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SA', alias: 'KSA', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EU', alias: 'regions that use the euro', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EU', alias: 'redeemed in regions that use the euro', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EU', alias: 'can only be redeemed in regions that use the euro', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EU', alias: 'countries using the euro', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EU', alias: 'euro zone', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EU', alias: 'eurozone', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EU', alias: 'euro area', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TR', alias: 'Turkiye', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TR', alias: 'Türkiye', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BR', alias: 'Brazil', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'RU', alias: 'Russian Federation', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EG', alias: 'Egypt', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AF', alias: 'Afghanistan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AL', alias: 'Albania', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'DZ', alias: 'Algeria', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AS', alias: 'American Samoa', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AD', alias: 'Andorra', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AO', alias: 'Angola', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AI', alias: 'Anguilla', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AQ', alias: 'Antarctica', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AG', alias: 'Antigua And Barbuda', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AR', alias: 'Argentina', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AM', alias: 'Armenia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AW', alias: 'Aruba', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AC', alias: 'Ascension Island', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AU', alias: 'Australia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AT', alias: 'Austria', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AZ', alias: 'Azerbaijan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BS', alias: 'Bahamas', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BH', alias: 'Bahrain', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BD', alias: 'Bangladesh', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BB', alias: 'Barbados', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BY', alias: 'Belarus', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BE', alias: 'Belgium', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BZ', alias: 'Belize', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BJ', alias: 'Benin', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BM', alias: 'Bermuda', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BT', alias: 'Bhutan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BO', alias: 'Bolivia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BA', alias: 'Bosnia And Herzegovina', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BW', alias: 'Botswana', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BN', alias: 'Brunei Darussalam', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BG', alias: 'Bulgaria', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BF', alias: 'Burkina Faso', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'BI', alias: 'Burundi', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KH', alias: 'Cambodia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CM', alias: 'Cameroon', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CA', alias: 'Canada', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CV', alias: 'Cape Verde', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KY', alias: 'Cayman Islands', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CF', alias: 'Central African Republic', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TD', alias: 'Chad', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CL', alias: 'Chile', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CN', alias: 'China', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CX', alias: 'Christmas Island', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CC', alias: 'Cocos (Keeling) Islands', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CO', alias: 'Colombia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KM', alias: 'Comoros', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CG', alias: 'Congo', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CD', alias: 'Congo, The Democratic Republic Of The', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CK', alias: 'Cook Islands', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CR', alias: 'Costa Rica', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'HR', alias: 'Croatia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CU', alias: 'Cuba', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CY', alias: 'Cyprus', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CZ', alias: 'Czech Republic', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'DK', alias: 'Denmark', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'DJ', alias: 'Djibouti', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'DM', alias: 'Dominica', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'DO', alias: 'Dominican Republic', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TL', alias: 'East Timor', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EC', alias: 'Ecuador', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SV', alias: 'El Salvador', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GQ', alias: 'Equatorial Guinea', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'ER', alias: 'Eritrea', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'EE', alias: 'Estonia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'ET', alias: 'Ethiopia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'FK', alias: 'Falkland Islands (Malvinas)', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'FO', alias: 'Faroe Islands', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'FJ', alias: 'Fiji', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'FI', alias: 'Finland', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'FR', alias: 'France', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GF', alias: 'French Guiana', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PF', alias: 'French Polynesia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GA', alias: 'Gabon', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GM', alias: 'Gambia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GE', alias: 'Georgia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'DE', alias: 'Germany', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GH', alias: 'Ghana', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GI', alias: 'Gibraltar', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GR', alias: 'Greece', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GL', alias: 'Greenland', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GD', alias: 'Grenada', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GP', alias: 'Guadeloupe', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GU', alias: 'Guam', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GT', alias: 'Guatemala', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GN', alias: 'Guinea', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GW', alias: 'Guinea-Bissau', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GY', alias: 'Guyana', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'HT', alias: 'Haiti', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'HN', alias: 'Honduras', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'HK', alias: 'Hong Kong', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'HU', alias: 'Hungary', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'IS', alias: 'Iceland', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'IN', alias: 'India', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'ID', alias: 'Indonesia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'IR', alias: 'Iran', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'IQ', alias: 'Iraq', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'IE', alias: 'Ireland', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'IL', alias: 'Israel', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'IT', alias: 'Italy', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CI', alias: 'Ivory Coast', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'JM', alias: 'Jamaica', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'JP', alias: 'Japan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'JO', alias: 'Jordan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KZ', alias: 'Kazakhstan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KE', alias: 'Kenya', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KI', alias: 'Kiribati', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KR', alias: 'Korea', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KP', alias: 'Korea, Democratic People\'s Republic Of', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'XK', alias: 'Kosovo', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KW', alias: 'Kuwait', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KG', alias: 'Kyrgyzstan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LA', alias: 'Laos', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LV', alias: 'Latvia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LB', alias: 'Lebanon', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LS', alias: 'Lesotho', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LR', alias: 'Liberia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LY', alias: 'Libyan Arab Jamahiriya', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LI', alias: 'Liechtenstein', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LT', alias: 'Lithuania', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LU', alias: 'Luxembourg', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MO', alias: 'Macao', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MK', alias: 'Macedonia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MG', alias: 'Madagascar', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MW', alias: 'Malawi', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MY', alias: 'Malaysia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MV', alias: 'Maldives', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'ML', alias: 'Mali', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MT', alias: 'Malta', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MH', alias: 'Marshall Islands', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MQ', alias: 'Martinique', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MR', alias: 'Mauritania', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MU', alias: 'Mauritius', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'YT', alias: 'Mayotte', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MX', alias: 'Mexico', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'FM', alias: 'Micronesia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MD', alias: 'Moldova', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MC', alias: 'Monaco', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MN', alias: 'Mongolia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'ME', alias: 'Montenegro', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MS', alias: 'Montserrat', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MA', alias: 'Morocco', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MZ', alias: 'Mozambique', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MM', alias: 'Myanmar', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NA', alias: 'Namibia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NR', alias: 'Nauru', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NP', alias: 'Nepal', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NL', alias: 'Netherlands', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AN', alias: 'Netherlands Antilles', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NC', alias: 'New Caledonia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NZ', alias: 'New Zealand', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NI', alias: 'Nicaragua', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NE', alias: 'Niger', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NG', alias: 'Nigeria', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NU', alias: 'Niue', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NF', alias: 'Norfolk Island', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'MP', alias: 'Northern Mariana Islands', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'NO', alias: 'Norway', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'OM', alias: 'Oman', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PK', alias: 'Pakistan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PW', alias: 'Palau', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PS', alias: 'Palestine', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PA', alias: 'Panama', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PG', alias: 'Papua New Guinea', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PY', alias: 'Paraguay', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PE', alias: 'Peru', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PH', alias: 'Philippines', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PL', alias: 'Poland', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PT', alias: 'Portugal', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PR', alias: 'Puerto Rico', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'QA', alias: 'Qatar', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'RE', alias: 'Reunion', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'RO', alias: 'Romania', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'RW', alias: 'Rwanda', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SH', alias: 'Saint Helena', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'KN', alias: 'Saint Kitts And Nevis', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LC', alias: 'Saint Lucia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'PM', alias: 'Saint Pierre And Miquelon', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'VC', alias: 'Saint Vincent And The Grenadines', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'WS', alias: 'Samoa', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SM', alias: 'San Marino', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'ST', alias: 'Sao Tome And Principe', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SA', alias: 'Saudi Arabia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SN', alias: 'Senegal', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'RS', alias: 'Serbia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SC', alias: 'Seychelles', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SL', alias: 'Sierra Leone', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SG', alias: 'Singapore', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SK', alias: 'Slovakia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SI', alias: 'Slovenia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SB', alias: 'Solomon Islands', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SO', alias: 'Somalia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'ZA', alias: 'South Africa', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'ES', alias: 'Spain', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'LK', alias: 'Sri Lanka', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SD', alias: 'Sudan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SR', alias: 'Suriname', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SZ', alias: 'Swaziland', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SE', alias: 'Sweden', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'CH', alias: 'Switzerland', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'SY', alias: 'Syrian Arab Republic', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TW', alias: 'Taiwan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TJ', alias: 'Tajikistan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TZ', alias: 'Tanzania', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TH', alias: 'Thailand', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TG', alias: 'Togo', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TK', alias: 'Tokelau', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TO', alias: 'Tonga', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TT', alias: 'Trinidad And Tobago', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TN', alias: 'Tunisia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TR', alias: 'Turkey', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TM', alias: 'Turkmenistan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TC', alias: 'Turks And Caicos Islands', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'TV', alias: 'Tuvalu', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'UG', alias: 'Uganda', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'UA', alias: 'Ukraine', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'AE', alias: 'United Arab Emirates', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'GB', alias: 'United Kingdom', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'US', alias: 'United States', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'UY', alias: 'Uruguay', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'UZ', alias: 'Uzbekistan', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'VU', alias: 'Vanuatu', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'VA', alias: 'Vatican City', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'VE', alias: 'Venezuela', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'VN', alias: 'Vietnam', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'VG', alias: 'Virgin Islands, British', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'VI', alias: 'Virgin Islands, U.S.', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'WF', alias: 'Wallis And Futuna', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'YE', alias: 'Yemen', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'ZM', alias: 'Zambia', scope: 'global' },
+    { entity_type: 'region', canonical_id: 'ZW', alias: 'Zimbabwe', scope: 'global' },
+    /* Product type aliases */
+    { entity_type: 'product_type', canonical_id: 'iTunes', alias: 'itunes', scope: 'global' },
+    { entity_type: 'product_type', canonical_id: 'PlayStation Network', alias: 'psn', scope: 'global' },
+    { entity_type: 'product_type', canonical_id: 'PlayStation Network', alias: 'playstation network', scope: 'global' },
+    { entity_type: 'product_type', canonical_id: 'LOL', alias: 'lol', scope: 'global' },
+    { entity_type: 'product_type', canonical_id: 'Currys', alias: 'currys', scope: 'global' },
+    { entity_type: 'product_type', canonical_id: 'PUBG', alias: 'PUBG', scope: 'global' },
+    { entity_type: 'product_type', canonical_id: 'PUBG Mobile', alias: 'PUBG Mobile', scope: 'global' },
+    { entity_type: 'product_type', canonical_id: 'Razer', alias: 'Razer', scope: 'global' },
+    { entity_type: 'product_type', canonical_id: 'Razer PIN', alias: 'Razer PIN', scope: 'global' },
+  ],
+};
+
+/* Runtime alias state — populated on startup by loadAliasSnapshot() */
+const _aliasState = {
+  source:    'not_loaded',   /* 'live' | 'embedded_fallback' | 'not_loaded' */
+  transport: 'none',         /* 'iframe-postmessage' | 'fallback' | 'none' (MSG166) */
+  status:    '',             /* LIVE_OK | LIVE_TIMEOUT | LIVE_TRANSPORT_ERROR | LIVE_RESPONSE_INVALID | FALLBACK_USED */
+  version:   '',
+  updatedAt: '',
+  rowCount:  0,
+  error:     '',
+  loaded:    false,
+  regionMap: {},             /* lowercase alias → lowercase canonical_id */
+  ptAliases: [],             /* product_type alias strings */
+};
+
+/* ── BRAND → REGION INFERENCE WHITELIST (MSG178) ────────────────
+   Approved brands that imply a specific region even when seller text
+   does not contain an explicit region token.
+   Priority: explicit text > brand inference > canonical alias > uncertain */
+const BRAND_REGION_WHITELIST = [
+  {
+    brandFamily: 'Yandex',
+    tokens: ['яндекс', 'yandex', 'яндекс лавка', 'яндекс еда',
+             'яндекс маркет', 'яндекс плюс', 'яндекс музыка', 'яндекс драйв'],
+    inferredRegion: 'RU',
+  },
+];
+
+/* Check if product name/description matches a whitelisted brand.
+   Returns { matched: true, brand, inferredRegion } or { matched: false }. */
+function checkBrandRegionInference(productName, description) {
+  const text = (String(productName || '') + ' ' + String(description || '')).toLowerCase();
+  for (const entry of BRAND_REGION_WHITELIST) {
+    for (const token of entry.tokens) {
+      if (text.includes(token)) {
+        return { matched: true, brand: entry.brandFamily, token, inferredRegion: entry.inferredRegion };
+      }
+    }
+  }
+  return { matched: false };
+}
+
+/* ── PAGE CONTEXT DETECTOR (STARTUP-ROUTER-01) ──────────────── */
+function detectPageContext() {
+  const path = location.pathname;
+  if (document.querySelector('table.items') && path.includes('/xdm/product/admin')) {
+    return 'list';
+  }
+  if (document.querySelector('#product-form') && path.includes('/xdm/product/update')) {
+    return 'card';
+  }
+  return 'unknown';
+}
+
+const _pageContext = detectPageContext();
+
+if (_pageContext === 'unknown') {
+  alert('BSV List Check WIP-01:\nСтраница не распознана.\nОткройте список товаров (/xdm/product/admin)\nили карточку товара (/xdm/product/update?id=…).');
+  return;
+}
+
+/* ── SINGLETON CLEANUP ───────────────────────────────────────── */
+if (window[NS] && typeof window[NS].cleanup === 'function') {
+  try { window[NS].cleanup(); } catch (_) {}
+}
+delete window[NS];
+
+/* ── RUNTIME STATE ───────────────────────────────────────────── */
+const _s = {
+  workerWin:       null,
+  navSeq:          0,
+  aborted:         false,
+  isFirstCard:     true,
+  msgHandlers:     new Map(),   /* reqId → handler fn */
+  overlay:         null,
+  session:         null,
+  uiSelectedId:    null,         /* product ID of card shown in detail panel */
+  uiPhase:         'startup',    /* 'startup' | 'scanning' | 'results' | 'empty' | 'error' */
+  uiTraceOpen:     false,        /* AI trace block collapsed by default */
+  onStartScan:     null,         /* set by main(), called by startup button */
+  /* MSG221: test-mode popup harness */
+  testMode:        false,        /* test mode enabled */
+  testPopupReady:  false,        /* popup bound and ready */
+  testPopupCardId: null,         /* card ID popup is currently showing */
+  testPopupUrl:    null,         /* current popup URL */
+  testPopupLastSeen: null,       /* ISO timestamp of last successful popup check */
+};
+
+window[NS] = {
+  cleanup() {
+    _s.aborted = true;
+    if (_s.workerWin && !_s.workerWin.closed) {
+      try { _s.workerWin.close(); } catch (_) {}
+    }
+    _s.workerWin = null;
+    _s.msgHandlers.forEach(fn => window.removeEventListener('message', fn));
+    _s.msgHandlers.clear();
+    if (_s.overlay) { try { _s.overlay.remove(); } catch (_) {} _s.overlay = null; }
+    delete window[NS];
+  },
+  /* MSG221: test harness API for Chrome DevTools MCP */
+  testHarness: {
+    status: () => testPopupStatus(),
+    state: () => ({ testMode: _s.testMode, testPopupReady: _s.testPopupReady, testPopupCardId: _s.testPopupCardId, testPopupUrl: _s.testPopupUrl, testPopupLastSeen: _s.testPopupLastSeen, workerWinOpen: !!(_s.workerWin && !_s.workerWin.closed) }),
+    enableTestMode: () => { _s.testMode = true; return 'test mode enabled'; },
+  },
+};
+
+/* ── UTILITIES ───────────────────────────────────────────────── */
+const wait   = ms => new Promise(r => setTimeout(r, ms));
+const norm   = v  => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+const esc    = s  => String(s ?? '').replace(/[&<>"]/g,
+                       m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]));
+const isoNow = () => new Date().toISOString();
+
+/* ── ALIAS SNAPSHOT LOADER (MSG158) ────────────────────────────
+   Loads alias snapshot from service or falls back to embedded.
+   Must be called before resolvers are used. */
+function buildAliasMapsFromRows(rows) {
+  const regionMap = {};
+  const ptAliases = [];
+  for (const row of rows) {
+    const type = String(row.entity_type || '').toLowerCase();
+    const canon = String(row.canonical_id || '').trim();
+    const alias = String(row.alias || '').trim();
+    if (!type || !canon || !alias) continue;
+    if (type === 'region') {
+      const canonLow = canon.toLowerCase();
+      regionMap[alias.toLowerCase()] = canonLow;
+      regionMap[canonLow] = canonLow;  /* self-mapping for canonical id */
+    } else if (type === 'product_type') {
+      ptAliases.push(alias.toLowerCase());
+    }
+  }
+  return { regionMap, ptAliases };
+}
+
+/* MSG173: CDN JSON fetch for alias snapshot.
+   GitHub Pages serves static JSON — no CORS issues, no postMessage needed.
+   Simple fetch with timeout + fallback to embedded snapshot. */
+async function loadAliasSnapshot() {
+  _aliasState.transport = 'none';
+
+  if (ALIAS_SNAPSHOT_CONFIG.enabled && ALIAS_SNAPSHOT_CONFIG.url) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), ALIAS_SNAPSHOT_CONFIG.timeout);
+      const resp = await fetch(ALIAS_SNAPSHOT_CONFIG.url, {
+        signal: ctrl.signal,
+        cache: 'no-cache',  /* always get latest version */
+      });
+      clearTimeout(timer);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data && data.ok && Array.isArray(data.rows)) {
+          const maps = buildAliasMapsFromRows(data.rows);
+          _aliasState.source = 'live_cdn_snapshot';
+          _aliasState.transport = 'cdn-json';
+          _aliasState.version = data.version || '';
+          _aliasState.updatedAt = data.updated_at || '';
+          _aliasState.rowCount = data.rows.length;
+          _aliasState.regionMap = maps.regionMap;
+          _aliasState.ptAliases = maps.ptAliases;
+          _aliasState.loaded = true;
+          _aliasState.error = '';
+          _aliasState.status = 'LIVE_OK';
+          return;
+        }
+        _aliasState.error = 'CDN_RESPONSE_INVALID: ' + JSON.stringify(data).slice(0, 200);
+        _aliasState.status = 'CDN_RESPONSE_INVALID';
+      } else {
+        _aliasState.error = 'CDN_HTTP_' + resp.status;
+        _aliasState.status = 'CDN_HTTP_ERROR';
+      }
+    } catch (e) {
+      const msg = e.message || String(e);
+      if (msg.includes('abort')) {
+        _aliasState.error = 'CDN_TIMEOUT: ' + ALIAS_SNAPSHOT_CONFIG.timeout + 'ms';
+        _aliasState.status = 'CDN_TIMEOUT';
+      } else {
+        _aliasState.error = 'CDN_FETCH_ERROR: ' + msg;
+        _aliasState.status = 'CDN_FETCH_ERROR';
+      }
+    }
+  } else {
+    _aliasState.error = 'CDN URL not configured';
+    _aliasState.status = 'CDN_NOT_CONFIGURED';
+  }
+
+  /* Fallback to embedded snapshot */
+  const maps = buildAliasMapsFromRows(EMBEDDED_ALIAS_SNAPSHOT_FALLBACK.rows);
+  _aliasState.source = 'embedded_fallback';
+  _aliasState.transport = 'fallback';
+  _aliasState.version = EMBEDDED_ALIAS_SNAPSHOT_FALLBACK.version;
+  _aliasState.updatedAt = '';
+  _aliasState.rowCount = EMBEDDED_ALIAS_SNAPSHOT_FALLBACK.rows.length;
+  _aliasState.regionMap = maps.regionMap;
+  _aliasState.ptAliases = maps.ptAliases;
+  _aliasState.loaded = true;
+  _aliasState.status = 'FALLBACK_USED';
+}
+
+/* ── CANONICAL REGION (MSG70 + MSG158: snapshot-driven) ──────── */
+/* Region alias map is populated from snapshot (_aliasState.regionMap).
+   REGION_ALIASES below serves as compile-time fallback until loadAliasSnapshot() runs. */
+const REGION_ALIASES = {
+  /* ISO 3166-1 alpha-2 convention — aligned with AI_Allowed_Aliases sheet (MSG255) */
+  'ww': 'ww', 'global': 'ww', 'worldwide': 'ww', 'world': 'ww',
+  'us': 'us', 'usa': 'us', 'united states': 'us', 'united states of america': 'us',
+  'u.s.': 'us', 'u.s.a': 'us', 'u.s.a.': 'us',
+  'gb': 'gb', 'uk': 'gb', 'united kingdom': 'gb', 'great britain': 'gb',
+  'eu': 'eu', 'europe': 'eu', 'european union': 'eu',
+  'ae': 'ae', 'uae': 'ae', 'united arab emirates': 'ae',
+  'sa': 'sa', 'ksa': 'sa', 'saudi arabia': 'sa',
+  'tr': 'tr', 'turkiye': 'tr', 'türkiye': 'tr', 'turkey': 'tr',
+  'br': 'br', 'brazil': 'br',
+  'ru': 'ru', 'russian federation': 'ru',
+  'in': 'in', 'india': 'in',
+  'de': 'de', 'germany': 'de',
+  'fr': 'fr', 'france': 'fr',
+  'jp': 'jp', 'japan': 'jp',
+  'au': 'au', 'australia': 'au',
+  'ca': 'ca', 'canada': 'ca',
+};
+function canonicalRegion(r) {
+  const k = String(r || '').toLowerCase().trim();
+  /* MSG158: prefer snapshot-driven map, fall back to compile-time map */
+  if (_aliasState.loaded && _aliasState.regionMap[k]) return _aliasState.regionMap[k];
+  return REGION_ALIASES[k] || k;
+}
+function regionsCanonicallyEqual(a, b) {
+  if (!a || !b) return false;
+  /* Compare comma-separated region lists */
+  const listA = String(a).split(',').map(s => canonicalRegion(s.trim())).filter(Boolean).sort();
+  const listB = String(b).split(',').map(s => canonicalRegion(s.trim())).filter(Boolean).sort();
+  return listA.join(',') === listB.join(',');
+}
+
+/* ── CANONICAL PRODUCT TYPE (MSG84 + MSG137 catalogue-driven) ── */
+/* Canonicalize by: lowercase, split on separators, sort parts, join.
+   This is the basic heuristic layer — catalogue resolver takes priority. */
+function canonicalProductType(v) {
+  const s = String(v || '').toLowerCase().trim();
+  if (!s) return '';
+  /* Split on " - ", " – " (display separators), NOT on bare "-" (part of slugs/brand names) */
+  const parts = s.split(/\s+[-–]\s+/).map(p => p.trim()).filter(Boolean).sort();
+  return parts.join('::');
+}
+
+/* MSG137: Catalogue-driven ProductType resolver.
+   Uses popup productTypeOptions as BSV catalogue source of truth.
+   The catalogue slug from backend (e.g. "games-ea-sports-fc") maps to a
+   display label in the popup (e.g. "EA Sports FC - Games").
+   Both refer to the same catalogue entity. */
+
+/* Normalize slug for comparison: lowercase, replace [-_] with spaces, collapse whitespace */
+function normSlug(s) {
+  return String(s || '').toLowerCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/* Find popup option that matches a candidate slug/id.
+   Returns {value, label} or null.
+   Match strategy: slug-normalized comparison of option labels. */
+function resolveProductTypeFromCatalogue(candidateId, options) {
+  if (!candidateId || !options || !options.length) return null;
+  const needle = normSlug(candidateId);
+  if (!needle) return null;
+  /* 1. Exact label match (norm) */
+  for (const opt of options) {
+    if (norm(opt.label) === norm(candidateId)) return opt;
+  }
+  /* 2. Slug-normalized match: "games-ea-sports-fc" ↔ "EA Sports FC - Games" */
+  for (const opt of options) {
+    if (normSlug(opt.label) === needle) return opt;
+  }
+  /* 3. Sorted-parts match: split both into words, sort, compare */
+  const needleParts = needle.split(/\s+/).sort().join(' ');
+  for (const opt of options) {
+    const optParts = normSlug(opt.label).split(/\s+/).sort().join(' ');
+    if (optParts === needleParts) return opt;
+  }
+  return null;
+}
+
+/* MSG137: Unified ProductType resolution state.
+   Compares current display label against recommended candidate,
+   using catalogue lookup when available. */
+/* MSG142: Signal classification for ProductType candidate validation.
+   Platform keywords alone must not override product identity signals. */
+const PT_PLATFORM_KEYWORDS = [
+  'xbox', 'playstation', 'psn', 'nintendo', 'steam', 'pc', 'mobile',
+  'switch', 'ps4', 'ps5', 'ps3', 'wii', 'ios', 'android',
+];
+const PT_GENERIC_FAMILIES = [
+  'gift_cards', 'gift-cards', 'gift cards', 'giftcards',
+  'top_up', 'top-up', 'topup',
+  'subscription', 'subscriptions',
+];
+/* Known game/brand identities that are strong product signals */
+const PT_IDENTITY_KEYWORDS = [
+  'ea sports fc', 'fc 24', 'fc 25', 'fc 26',
+  'fortnite', 'pubg', 'playerunknown', 'battlegrounds',
+  'apex legends', 'call of duty', 'cod', 'valorant', 'overwatch',
+  'minecraft', 'roblox', 'gta', 'grand theft auto',
+  'fifa', 'nba 2k', 'madden', 'nhl',
+  'diablo', 'world of warcraft', 'wow', 'starfield', 'cyberpunk',
+  'elden ring', 'hogwarts legacy', 'zelda', 'mario',
+  'razer', 'razer pin',
+  'spotify', 'netflix', 'disney',
+  'v-bucks', 'vbucks', 'robux',
+  'game key', 'game keys', 'cd key', 'cd keys',
+  'edition', 'deluxe', 'ultimate', 'standard', 'premium',
+  'icons edition', 'gold edition', 'special edition',
+];
+
+/* Check if candidate is a generic platform family (e.g., Gift_cards-Xbox) */
+function isGenericPlatformCandidate(candidateSlug) {
+  const s = normSlug(candidateSlug);
+  return PT_GENERIC_FAMILIES.some(fam => s.includes(fam)) &&
+         PT_PLATFORM_KEYWORDS.some(plat => s.includes(plat));
+}
+
+/* Check if text contains strong product identity signals */
+function findIdentitySignals(text) {
+  const t = String(text || '').toLowerCase();
+  return PT_IDENTITY_KEYWORDS.filter(kw => t.includes(kw));
+}
+
+/* Check if text's only relevant signal is a platform keyword */
+function findPlatformSignals(text) {
+  const t = String(text || '').toLowerCase();
+  return PT_PLATFORM_KEYWORDS.filter(kw => {
+    /* Match as whole word to avoid false positives (e.g., "switch" in "switching") */
+    const re = new RegExp('\\b' + kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b');
+    return re.test(t);
+  });
+}
+
+function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleStatus, productName) {
+  const state = {
+    currentRaw: currentLabel || '',
+    recommendedRaw: candidateId || '',
+    currentDisplay: currentLabel || '',
+    recommendedDisplay: candidateId || '',  /* default: show slug */
+    currentCanonical: canonicalProductType(currentLabel),
+    recommendedCanonical: canonicalProductType(candidateId),
+    semanticMatch: false,
+    catalogueResolved: false,
+    candidateSuspect: false,       /* MSG142: true if candidate looks like false platform match */
+    identitySignals: [],           /* MSG142: identity keywords found in product name */
+    platformSignals: [],           /* MSG142: platform keywords found in product name */
+    suspectReason: '',             /* MSG142: why candidate is suspect */
+    showHelper: false,
+    helperMode: 'none',       /* 'none' | 'replacement' | 'unresolved' */
+    uiStatus: 'yellow',       /* 'green' | 'yellow' | 'red' */
+  };
+
+  if (!candidateId) {
+    state.semanticMatch = true;
+    state.uiStatus = 'green';
+    return state;
+  }
+
+  /* Step 1: Try catalogue-driven resolution */
+  const catalogueMatch = resolveProductTypeFromCatalogue(candidateId, ptOptions || []);
+  if (catalogueMatch) {
+    state.catalogueResolved = true;
+    state.recommendedDisplay = catalogueMatch.label;
+    state.recommendedCanonical = canonicalProductType(catalogueMatch.label);
+  }
+
+  /* Step 2: Check semantic match */
+  /* Quick exact/norm check */
+  if (currentLabel === candidateId || norm(currentLabel) === norm(candidateId)) {
+    state.semanticMatch = true;
+  }
+  /* Canonical check (display labels) */
+  else if (state.currentCanonical && state.recommendedCanonical &&
+           state.currentCanonical === state.recommendedCanonical) {
+    state.semanticMatch = true;
+  }
+  /* Catalogue-resolved display label vs current */
+  else if (catalogueMatch && norm(currentLabel) === norm(catalogueMatch.label)) {
+    state.semanticMatch = true;
+  }
+  /* Catalogue-resolved: slug-normalized current vs resolved label */
+  else if (catalogueMatch && normSlug(currentLabel) === normSlug(catalogueMatch.label)) {
+    state.semanticMatch = true;
+  }
+  /* Backend says match */
+  else if (moduleStatus === 'match') {
+    state.semanticMatch = true;
+  }
+
+  /* Step 2b (MSG142): Candidate quality validation — identity vs platform signal priority.
+     If candidate is a generic platform family (e.g., Gift_cards-Xbox) but product name
+     contains strong identity signals (e.g., "EA Sports FC", "Edition"), the candidate
+     is likely a false positive driven by a platform keyword. */
+  if (!state.semanticMatch && productName) {
+    state.identitySignals = findIdentitySignals(productName);
+    state.platformSignals = findPlatformSignals(productName);
+    const candidateIsGenericPlatform = isGenericPlatformCandidate(candidateId);
+
+    if (candidateIsGenericPlatform && state.identitySignals.length > 0) {
+      /* Product has strong identity signals but candidate is generic platform → suspect */
+      state.candidateSuspect = true;
+      state.suspectReason = 'candidate is generic platform family (' +
+        (state.catalogueResolved ? state.recommendedDisplay : candidateId) +
+        ') but product name contains identity signals: ' +
+        state.identitySignals.join(', ') +
+        '. Platform keyword alone insufficient.';
+    }
+
+    /* Also check: if current PT already contains identity keywords that match product name,
+       and candidate is a completely different family, this strengthens suspicion */
+    if (!state.candidateSuspect && candidateIsGenericPlatform) {
+      const currentIdentity = findIdentitySignals(currentLabel);
+      const nameIdentity = findIdentitySignals(productName);
+      const overlap = currentIdentity.filter(kw => nameIdentity.includes(kw));
+      if (overlap.length > 0) {
+        state.candidateSuspect = true;
+        state.suspectReason = 'current PT shares identity signals with product name (' +
+          overlap.join(', ') + ') but candidate is generic platform family.';
+      }
+    }
+  }
+
+  /* Step 3: Determine UI state */
+  if (state.semanticMatch) {
+    state.uiStatus = 'green';
+    state.showHelper = false;
+    state.helperMode = 'none';
+  } else if (state.candidateSuspect) {
+    /* MSG142: suspect candidate → yellow but DO NOT show replacement helper.
+       Instead show unresolved/warning — operator should verify manually. */
+    state.uiStatus = 'yellow';
+    state.showHelper = true;
+    state.helperMode = 'unresolved';
+  } else if (moduleStatus === 'mismatch') {
+    state.uiStatus = 'red';
+    state.showHelper = true;
+    state.helperMode = 'replacement';
+  } else {
+    state.uiStatus = 'yellow';
+    state.showHelper = true;
+    state.helperMode = 'replacement';
+  }
+
+  return state;
+}
+
+function productTypesCanonicallyEqual(current, recommended) {
+  if (!current || !recommended) return false;
+  if (current === recommended || norm(current) === norm(recommended)) return true;
+  return canonicalProductType(current) === canonicalProductType(recommended);
+}
+
+/* ── CANONICAL DENOMINATION (bugfix MSG79) ───────────────────── */
+/* DOM select values use format: [TypeKey][mode][Category][value]
+   Backend candidate IDs use format: dn::TypeKey::value
+   Both refer to the same denomination entity.
+   Extract entity key for canonical comparison. */
+function extractDenomEntity(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  /* Format: dn::SomeKey::Value → key=SomeKey, val=Value */
+  const dnMatch = s.match(/^dn::(.+?)::(.+)$/i);
+  if (dnMatch) return (dnMatch[1] + '::' + dnMatch[2]).toLowerCase();
+  /* Format: [TypeKey][mode][Category][value] → key=TypeKey, val=value */
+  const brMatch = s.match(/^\[([^\]]+)\]\[([^\]]*)\]\[([^\]]*)\]\[([^\]]*)\]$/);
+  if (brMatch) return (brMatch[1] + '::' + brMatch[4]).toLowerCase();
+  /* Fallback: normalize */
+  return s.toLowerCase().replace(/[_\-\s]+/g, '_');
+}
+function denominationsCanonicallyEqual(current, recommended) {
+  if (!current || !recommended) return false;
+  /* Quick exact/norm check first */
+  if (current === recommended || norm(current) === norm(recommended)) return true;
+  /* Entity extraction */
+  const eCur = extractDenomEntity(current);
+  const eRec = extractDenomEntity(recommended);
+  return eCur && eRec && eCur === eRec;
+}
+/* Find denomination <option> by entity match (bugfix MSG119).
+   candidateId is in backend format (dn::TypeKey::value).
+   Options are in DOM format ([TypeKey][mode][Category][value]).
+   Uses extractDenomEntity for canonical matching. */
+function findDenominationOptionByEntity(selectEl, candidateId) {
+  if (!selectEl || !candidateId) return null;
+  const needleEntity = extractDenomEntity(candidateId);
+  if (!needleEntity) return null;
+  for (const opt of selectEl.options) {
+    if (!opt.value) continue;
+    const optEntity = extractDenomEntity(opt.textContent.trim());
+    if (optEntity && optEntity === needleEntity) return opt;
+  }
+  return null;
+}
+
+/* ── DATA MODEL ──────────────────────────────────────────────── */
+function makeSnap() {
+  return {
+    productTypeId: null, productTypeName: null,
+    productTypeOptions: [],    /* [{value, label}] — all available PT options from popup */
+    regions: [],               /* [{id, name, geoKeyword}] */
+    denominationOptionId: null, denominationLabel: null,
+    denominationOptions: [],   /* [{value, label}] — all available denom options from popup */
+    name: '', description: '',
+    capturedAt: null,
+  };
+}
+
+function makeCardResult(productId, productName, productType, updateUrl) {
+  const card = {
+    productId, productName, productType, updateUrl,
+    /* AI result */
+    aiVerdict: null, aiConfidence: null, aiReason: '', aiRaw: null,
+    recommendations: null,
+    /* Operator */
+    operatorOverride: null,
+    /* Before/After */
+    beforeSnapshot: null, afterSnapshot: null,
+    /* State flags */
+    applied: false, saved: false,
+    manuallyConfirmed: false,   /* Stage 1.2: operator confirmed manual fixes in popup */
+    exportedToSheet: false,     /* MSG47: card data sent to Google Sheet */
+    modStatusApplied: false, modStatusNew: null,
+    /* Errors */
+    scanError: null, applyError: null, saveError: null,
+  };
+  Object.defineProperty(card, 'finalColor', {
+    get() { return this.operatorOverride || this.aiVerdict || 'error'; },
+    enumerable: true,
+  });
+  return card;
+}
+
+function makeBatchSession(totalFound) {
+  const pageParam = (location.search.match(/[?&]Product_page=(\d+)/) || [])[1];
+  return {
+    sessionId:  String(Date.now()),
+    mode:       'under_review',
+    pageUrl:    location.href,
+    pageNumber: pageParam ? parseInt(pageParam, 10) : 1,
+    scannedAt:  isoNow(),
+    cards:      [],
+    summary:    { totalFound, processed: 0, green: 0, yellow: 0, red: 0, errors: 0 },
+  };
+}
+
+/* ── SAFETY GATES (Stage 1.1 + 1.2 patch) ───────────────────── */
+/* Blocking applyError patterns — these indicate unresolved manual steps.
+   Card with any of these MUST NOT be batch-saved without operator resolution.
+   Stage 1.2: manuallyConfirmed=true clears blocking issues after operator
+   explicitly confirms manual fixes via "Подтвердить ручные правки" action. */
+const BLOCKING_APPLY_PATTERNS = ['REGION_MANUAL', 'PT_NO_MATCH', 'DENOM_NO_MATCH'];
+
+function getCardBlockingIssues(card) {
+  const issues = [];
+  if (!card.applied) { issues.push('not_applied'); return issues; }
+  if (card.saved)    return [];   /* already saved — no blockers */
+  if (card.manuallyConfirmed) return [];   /* Stage 1.2: operator confirmed manual fixes */
+  if (card.applyError) {
+    for (const pat of BLOCKING_APPLY_PATTERNS) {
+      if (card.applyError.includes(pat)) issues.push(pat);
+    }
+  }
+  return issues;
+}
+
+function isCardSaveReady(card) {
+  return card.applied && !card.saved && getCardBlockingIssues(card).length === 0;
+}
+
+function getModStatusBlockingReason(card) {
+  /* green: mod status → published, allowed without save */
+  if (card.finalColor === 'green') return null;
+  /* red: mod status → rejected, allowed (reason 41 configured) */
+  if (card.finalColor === 'red') return null;
+  /* yellow: mod status = no_change, so always "allowed" (it's a no-op) */
+  if (card.finalColor === 'yellow') return null;
+  /* error: no mod status action */
+  if (card.finalColor === 'error') return 'error_card';
+  return null;
+}
+
+function isCardModStatusReady(card) {
+  const rule = getModStatusRule(card.finalColor);
+  if (!rule || rule._blocked || rule.modStatus === 'no_change') return false;
+  return getModStatusBlockingReason(card) === null;
+}
+
+/* ── LIST PAGE SCANNER ───────────────────────────────────────── */
+function scanUnderReviewRows() {
+  return [...document.querySelectorAll('table.items tr.odd, table.items tr.even')]
+    .map(tr => {
+      const tds = tr.querySelectorAll('td');
+      if (tds.length < 3) return null;
+      const modSel = tr.querySelector('select.mod-status-dropdown');
+      if (!modSel || modSel.value !== 'under_review') return null;
+      const updLink = tr.querySelector('a.upd[href*="/product/update?id="]');
+      if (!updLink) return null;
+      const productId   = norm(tds[0].textContent);
+      const productName = norm(tds[1].textContent);
+      const productType = norm(tds[2].textContent);
+      const updateUrl   = updLink.getAttribute('href');
+      if (!productId || !/^\d+$/.test(productId)) return null;
+      return { tr, productId, productName, productType, updateUrl };
+    })
+    .filter(Boolean);
+}
+
+/* ── POPUP MANAGER ───────────────────────────────────────────── */
+function openWorkerWindow(url) {
+  if (_s.workerWin && !_s.workerWin.closed) {
+    try { _s.workerWin.close(); } catch (_) {}
+  }
+  const w = window.open(url, '__bsv_wip01_worker__',
+    'width=1100,height=760,left=80,top=80,scrollbars=yes,resizable=yes');
+  if (!w) throw new Error(
+    'POPUP_BLOCKED: Браузер заблокировал popup-окно.\n' +
+    'Разрешите popup для этого сайта и перезапустите.'
+  );
+  _s.workerWin = w;
+  return w;
+}
+
+async function navigateWorkerWindow(win, url) {
+  const seq = ++_s.navSeq;
+  try { win.__bsv_nav_seq__ = seq; } catch (_) {}
+  win.location.href = url;
+  const deadline = Date.now() + NAV_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (win.closed) throw new Error('WORKER_CLOSED: Popup закрыт во время навигации');
+    try { if (win.__bsv_nav_seq__ !== seq) break; } catch (_) { break; }
+    await wait(100);
+  }
+  await wait(200);
+}
+
+async function waitForWorkerReady(win, ms) {
+  const deadline = Date.now() + (ms || PAGE_LOAD_MS);
+  while (Date.now() < deadline) {
+    if (win.closed) throw new Error('WORKER_CLOSED: Popup закрыт во время ожидания страницы');
+    try {
+      const doc = win.document;
+      if (doc && doc.readyState !== 'loading' && doc.querySelector('#product-form')) return;
+    } catch (_) {}
+    await wait(POLL_MS);
+  }
+  throw new Error('WORKER_PAGE_TIMEOUT: Страница не загрузилась за ' +
+    Math.round((ms || PAGE_LOAD_MS) / 1000) + 'с');
+}
+
+/* ── MSG221: TEST-MODE POPUP HARNESS ─────────────────────────── */
+function testPopupStatus() {
+  const w = _s.workerWin;
+  if (!w || w.closed) return { open: false, ready: false, url: null, cardId: null };
+  let url = null, cardId = null, hasForm = false;
+  try {
+    url = w.location.href;
+    const m = url.match(/[?&]id=(\d+)/);
+    cardId = m ? m[1] : null;
+    hasForm = !!w.document.querySelector('#product-form');
+  } catch (_) {}
+  return { open: true, ready: hasForm, url, cardId };
+}
+
+function updateTestPopupState() {
+  const st = testPopupStatus();
+  _s.testPopupReady = st.ready;
+  _s.testPopupCardId = st.cardId;
+  _s.testPopupUrl = st.url;
+  if (st.open) _s.testPopupLastSeen = isoNow();
+  return st;
+}
+
+/* Open test popup from user gesture (onclick handler).
+   Returns the window ref. Must be called from real click. */
+function openTestPopup() {
+  const firstCard = _s.session && _s.session.cards && _s.session.cards[0];
+  const url = firstCard ? firstCard.updateUrl : (BASE + '/xdm/product/admin');
+  const fullUrl = /^https?:\/\//i.test(url) ? url : (BASE + url);
+  if (_s.workerWin && !_s.workerWin.closed) {
+    /* reuse existing */
+    _s.testMode = true;
+    updateTestPopupState();
+    console.log('[TEST-HARNESS] reused existing popup | ' + JSON.stringify(testPopupStatus()));
+    return _s.workerWin;
+  }
+  const w = window.open(fullUrl, '__bsv_wip01_worker__',
+    'width=1100,height=760,left=80,top=80,scrollbars=yes,resizable=yes');
+  if (!w) {
+    console.log('[TEST-HARNESS] POPUP_BLOCKED');
+    return null;
+  }
+  _s.workerWin = w;
+  _s.isFirstCard = false;
+  _s.testMode = true;
+  console.log('[TEST-HARNESS] popup opened | url=' + fullUrl);
+  return w;
+}
+
+async function ensureWorkerAtUrl(url) {
+  const fullUrl = /^https?:\/\//i.test(url) ? url : (BASE + url);
+  if (_s.isFirstCard || !_s.workerWin || _s.workerWin.closed) {
+    openWorkerWindow(fullUrl);
+    _s.isFirstCard = false;
+  } else {
+    await navigateWorkerWindow(_s.workerWin, fullUrl);
+  }
+  await waitForWorkerReady(_s.workerWin, PAGE_LOAD_MS);
+  return _s.workerWin;
+}
+
+/* ── SNAPSHOT READER ─────────────────────────────────────────── */
+function readSnapshotFromPopup(win) {
+  try {
+    const doc   = win.document;
+    const typeEl  = doc.getElementById('Product_product_type_id');
+    const denomEl = doc.getElementById('denomination-select');
+    const nameEl  = doc.getElementById('Product_name');
+    const descEl  = doc.getElementById('Product_description');
+    const snap  = makeSnap();
+    snap.capturedAt      = isoNow();
+    snap.productTypeId   = typeEl  ? typeEl.value  : null;
+    snap.productTypeName = (typeEl && typeEl.selectedOptions && typeEl.selectedOptions[0])
+      ? norm(typeEl.selectedOptions[0].textContent) : null;
+    snap.regions = [...doc.querySelectorAll('#region-container .region-item')]
+      .map(el => ({
+        id:         parseInt(el.dataset.id, 10) || 0,
+        name:       norm((el.querySelector('.region-name') || {}).textContent || ''),
+        geoKeyword: el.dataset.geoKeyword || '',
+      })).filter(r => r.id);
+    snap.denominationOptionId = denomEl ? denomEl.value : null;
+    snap.denominationLabel    = (denomEl && denomEl.selectedOptions && denomEl.selectedOptions[0])
+      ? norm(denomEl.selectedOptions[0].textContent) : null;
+    /* Capture available options for operator dropdowns (MSG97) */
+    if (typeEl) {
+      snap.productTypeOptions = [...typeEl.options]
+        .filter(o => o.value)
+        .map(o => ({ value: o.value, label: norm(o.textContent) }));
+    }
+    if (denomEl) {
+      snap.denominationOptions = [...denomEl.options]
+        .filter(o => o.value)
+        .map(o => ({ value: o.value, label: norm(o.textContent) }));
+    }
+    snap.name        = nameEl ? norm(nameEl.value)          : '';
+    snap.description = descEl ? String(descEl.value || '').trim() : '';
+    return snap;
+  } catch (e) {
+    return null;
+  }
+}
+
+/* ── BACKEND CALLER (fetch transport → Cloudflare Worker) ────── */
+async function callBackend(payload) {
+  console.log('[LIST-CHECK] backend = cloudflare_worker | url =', BACKEND_URL);
+  const controller = new AbortController();
+  const tId = setTimeout(() => controller.abort(), BACKEND_TIMEOUT);
+  try {
+    const resp = await fetch(BACKEND_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+      signal: controller.signal,
+    });
+    clearTimeout(tId);
+    if (!resp.ok) {
+      return { ok: false, final_status: 'review', reason: 'AI Core HTTP ' + resp.status, _timeout: false };
+    }
+    return await resp.json();
+  } catch (e) {
+    clearTimeout(tId);
+    if (e.name === 'AbortError') {
+      return { ok: false, final_status: 'review', reason: 'AI Core timeout (50s)', _timeout: true };
+    }
+    return { ok: false, final_status: 'review', reason: 'AI Core fetch error: ' + e.message, _timeout: false };
+  }
+}
+
+/* ── BACKEND RESULT MAPPER ───────────────────────────────────── */
+/* Maps Apps Script response to internal card verdict + recommendations.
+   INTEGRATION NOTE: backend returns catalogue candidate_id keys (text),
+   not DOM select option values. resolvedDomValue is filled during apply
+   via best-effort text matching. If no match → applyError set, field not changed. */
+function mapBackendResult(raw) {
+  if (!raw || raw._timeout) {
+    return {
+      verdict: 'error',
+      confidence: null,
+      reason: raw ? raw.reason : 'Нет ответа от сервера',
+      recommendations: null,
+    };
+  }
+  const fs = String(raw.final_status || '').toLowerCase();
+  let verdict = 'error';
+  if (fs === 'approve') verdict = 'green';
+  else if (fs === 'review') verdict = 'yellow';
+  else if (fs === 'reject') verdict = 'red';
+
+  const sel     = raw.selection || {};
+  const modules = raw.modules   || {};
+
+  return {
+    verdict,
+    confidence:      raw.confidence != null ? Number(raw.confidence) : null,
+    reason:          norm(raw.reason || ''),
+    recommendations: {
+      productType: {
+        status:           (modules.product_type || {}).status || 'unknown',
+        candidateId:      sel.product_type_candidate_id || '',
+        resolvedDomValue: null,   /* filled during applyRecommendations() */
+        resolvedDomLabel: null,
+      },
+      region: {
+        status:      (modules.region || {}).status || 'unknown',
+        candidateId: sel.region_candidate_id || '',
+        /* Stage 1: region auto-apply not supported (needs candidate→region_id mapping).
+           Flagged as REGION_MANUAL in applyError if status !== 'match'. */
+      },
+      denomination: {
+        status:           (modules.denomination || {}).status || 'unknown',
+        candidateId:      sel.denomination_candidate_id || '',
+        resolvedDomValue: null,
+        resolvedDomLabel: null,
+      },
+    },
+  };
+}
+
+/* ── SUPPRESS PRODUCT TYPE AUTO-SUBMIT (W3) ──────────────────── */
+/* Clone-replace the select to remove all jQuery event listeners.
+   This prevents the page's auto-form-submit on ProductType change.
+   Must be called before setting .value on ProductType select in popup. */
+function suppressProductTypeAutoSubmit(win) {
+  try {
+    const doc = win.document;
+    const sel = doc.getElementById('Product_product_type_id');
+    if (!sel) return null;
+    const clone = sel.cloneNode(true);
+    sel.parentNode.replaceChild(clone, sel);
+    return clone;   /* caller sets clone.value */
+  } catch (_) {
+    return null;
+  }
+}
+
+/* ── BEST-EFFORT TEXT MATCH (for apply) ──────────────────────── */
+function findOptionByText(selectEl, candidateId) {
+  if (!selectEl || !candidateId) return null;
+  const needle = candidateId.toLowerCase().replace(/_/g, ' ').replace(/-/g, ' ').trim();
+  let best = null;
+  for (const opt of selectEl.options) {
+    if (!opt.value) continue;
+    const txt = opt.textContent.toLowerCase().trim();
+    if (txt === needle) return opt;                          /* exact match */
+    const parts = txt.split(/\s[-–]\s/);                    /* "Brand - Category" */
+    if (parts[0] && parts[0].trim() === needle) { best = opt; continue; }
+    if (txt.includes(needle) || needle.includes(parts[0] || '')) {
+      if (!best) best = opt;
+    }
+  }
+  return best;
+}
+
+/* ── PAYLOAD BUILDER (for re-check calls) ───────────────────── */
+function buildPayloadFromSnapshot(card, snap) {
+  return {
+    product_id:   card.productId,
+    name:         snap.name        || card.productName,
+    description:  snap.description || '',
+    current: {
+      product_type: snap.productTypeName || card.productType,
+      region:       (snap.regions || []).map(r => r.name).join(', '),
+      denomination: snap.denominationLabel || '',
+    },
+    mode: 'card',
+  };
+}
+
+/* ── APPLY SINGLE FIELD in popup DOM ────────────────────────── */
+function applyProductTypeInPopup(win, candidateId) {
+  if (!candidateId) return { ok: false, error: 'PT_EMPTY: Нет candidateId' };
+  const ptSel = suppressProductTypeAutoSubmit(win);
+  if (!ptSel) return { ok: false, error: 'PT_NO_SELECT: select не найден' };
+  const matched = findOptionByText(ptSel, candidateId);
+  if (!matched) return { ok: false, error: 'PT_NO_MATCH: ProductType кандидат «' + candidateId + '» не найден в select DOM' };
+  ptSel.value = matched.value;
+  return { ok: true, value: matched.value, label: norm(matched.textContent) };
+}
+
+function applyDenominationInPopup(win, candidateId) {
+  /* MSG121: full diagnostic instrumentation for denomination apply */
+  const diag = {
+    ts: isoNow(),
+    candidateRaw: candidateId || '',
+    candidateEntity: '',
+    selectFound: false,
+    optionCount: 0,
+    options: [],          /* [{value, label, entity}] — all popup options */
+    currentRaw: '',
+    currentEntity: '',
+    currentValue: '',
+    alreadyCanonEqual: false,
+    matchedOptionValue: '',
+    matchedOptionLabel: '',
+    matchedOptionEntity: '',
+    oldSelectValue: '',
+    newSelectValue: '',
+    valueActuallyChanged: false,
+    eventsDispatched: false,
+    valueAfterEvents: '',
+    rootCause: 'UNKNOWN',
+    ok: false,
+  };
+
+  if (!candidateId) {
+    diag.rootCause = 'DENOM_EMPTY';
+    return { ok: false, error: 'DENOM_EMPTY: Нет candidateId', diag };
+  }
+  diag.candidateEntity = extractDenomEntity(candidateId);
+
+  try {
+    const dSel = win.document.getElementById('denomination-select');
+    if (!dSel) {
+      diag.rootCause = 'SELECT_NOT_FOUND';
+      return { ok: false, error: 'DENOM_NO_SELECT: select не найден', diag };
+    }
+    diag.selectFound = true;
+    diag.optionCount = dSel.options.length;
+    /* Capture all options for diagnostic */
+    for (const opt of dSel.options) {
+      if (!opt.value) continue;
+      const lbl = opt.textContent.trim();
+      diag.options.push({
+        value: opt.value,
+        label: lbl,
+        entity: extractDenomEntity(lbl),
+      });
+    }
+
+    /* Current state */
+    const currentOpt = dSel.options[dSel.selectedIndex];
+    diag.currentRaw = currentOpt ? currentOpt.textContent.trim() : '';
+    diag.currentEntity = extractDenomEntity(diag.currentRaw);
+    diag.currentValue = dSel.value;
+    diag.oldSelectValue = dSel.value;
+
+    /* Check if current value already matches candidate canonically (MSG119) */
+    if (currentOpt && denominationsCanonicallyEqual(currentOpt.textContent.trim(), candidateId)) {
+      diag.alreadyCanonEqual = true;
+      diag.rootCause = 'ALREADY_MATCHED';
+      diag.ok = true;
+      return { ok: true, value: currentOpt.value, label: norm(currentOpt.textContent),
+               alreadyMatched: true, diag };
+    }
+
+    /* Entity-based matching: dn::TypeKey::value ↔ [TypeKey][mode][Cat][value] (MSG119) */
+    const matched = findDenominationOptionByEntity(dSel, candidateId);
+    if (!matched) {
+      diag.rootCause = 'OPTION_NOT_FOUND';
+      return { ok: false, error: 'DENOM_APPLY_NO_MATCH: Denomination кандидат «' + candidateId + '» не найден среди опций popup select', diag };
+    }
+    diag.matchedOptionValue = matched.value;
+    diag.matchedOptionLabel = matched.textContent.trim();
+    diag.matchedOptionEntity = extractDenomEntity(matched.textContent.trim());
+
+    /* Apply: set value */
+    dSel.value = matched.value;
+    diag.newSelectValue = dSel.value;
+    diag.valueActuallyChanged = (dSel.value === matched.value);
+
+    if (!diag.valueActuallyChanged) {
+      diag.rootCause = 'VALUE_SET_FAILED';
+      return { ok: false, error: 'DENOM_VALUE_SET_FAILED: select.value не изменился после присвоения', diag };
+    }
+
+    /* Dispatch change/input events so page JS reacts */
+    try {
+      dSel.dispatchEvent(new Event('change', { bubbles: true }));
+      dSel.dispatchEvent(new Event('input', { bubbles: true }));
+      diag.eventsDispatched = true;
+    } catch (_) { diag.eventsDispatched = false; }
+
+    /* Check if value survived event handlers (no automatic revert) */
+    diag.valueAfterEvents = dSel.value;
+    if (dSel.value !== matched.value) {
+      diag.rootCause = 'VALUE_REVERTED_AFTER_SET';
+      return { ok: false, error: 'DENOM_VALUE_REVERTED: значение вернулось к «' + dSel.value + '» после dispatch events', diag };
+    }
+
+    diag.rootCause = 'SUCCESS';
+    diag.ok = true;
+    return { ok: true, value: matched.value, label: norm(matched.textContent), diag };
+  } catch (e) {
+    diag.rootCause = 'EXCEPTION: ' + (e.message || String(e));
+    return { ok: false, error: 'DENOM_ERROR: ' + (e.message || e), diag };
+  }
+}
+
+/* ── APPLY RECOMMENDATIONS ENGINE (Stage 1.3 — iterative chain) ─
+   Iterative re-check: after changing ProductType → new backend call
+   to get fresh Region recommendation; after changing Region → new
+   backend call to get fresh Denomination recommendation.
+   Each step uses REAL backend re-validation, not cached AI response. */
+async function applyRecommendations(card) {
+  const win = await ensureWorkerAtUrl(card.updateUrl);
+  card.beforeSnapshot = readSnapshotFromPopup(win);
+  card.applyError = null;   /* reset for fresh apply */
+
+  const recs = card.recommendations;
+  if (!recs) {
+    card.applied = true;
+    return;
+  }
+
+  const addError = note => {
+    card.applyError = card.applyError ? card.applyError + '; ' + note : note;
+  };
+
+  let ptChanged = false;
+  let rgChanged = false;
+
+  /* ═══ STEP 1: ProductType ═══ */
+  const ptStatus = (recs.productType || {}).status;
+  if (ptStatus === 'mismatch' || ptStatus === 'uncertain') {
+    const candId = (recs.productType || {}).candidateId || '';
+    if (candId) {
+      const res = applyProductTypeInPopup(win, candId);
+      if (res.ok) {
+        recs.productType.resolvedDomValue = res.value;
+        recs.productType.resolvedDomLabel = res.label;
+        ptChanged = true;
+      } else {
+        addError(res.error + '. Выберите ProductType вручную в popup.');
+      }
+    }
+  }
+
+  /* ═══ STEP 2: Re-check after ProductType change → fresh Region ═══ */
+  let step2Recs = recs;   /* default: use original recs */
+  if (ptChanged) {
+    /* Re-read snapshot with new ProductType applied */
+    const freshSnap = readSnapshotFromPopup(win) || card.beforeSnapshot;
+    const payload2  = buildPayloadFromSnapshot(card, freshSnap);
+    try {
+      const raw2    = await callBackend(payload2);
+      const mapped2 = mapBackendResult(raw2);
+      step2Recs = mapped2.recommendations || recs;
+      /* Update card's stored recommendations with fresh data */
+      if (step2Recs.region) recs.region = step2Recs.region;
+      if (step2Recs.denomination) recs.denomination = step2Recs.denomination;
+      card.aiRaw = raw2;   /* keep latest raw */
+    } catch (e) {
+      addError('RECHECK_AFTER_PT: Повторный вызов backend после ProductType не удался: ' + (e.message || e));
+    }
+  }
+
+  /* ═══ STEP 2b: Apply Region (MSG178/185: brand whitelist suppresses manual) ═══ */
+  const rgApplyStatus = (recs.region || {}).status;
+  if (rgApplyStatus === 'mismatch' || rgApplyStatus === 'uncertain') {
+    const rgCand = (recs.region || {}).candidateId || '';
+    if (rgCand) {
+      /* MSG185: check brand whitelist before flagging as manual */
+      const curSnap2b = readSnapshotFromPopup(win) || card.beforeSnapshot;
+      const rgName2b = curSnap2b ? (curSnap2b.name || card.productName) : card.productName;
+      const rgDesc2b = curSnap2b ? (curSnap2b.description || '') : '';
+      const rgCurRegion2b = curSnap2b ? ((curSnap2b.regions || []).map(r => r.name).join(', ')) : '';
+      const brandInf2b = checkBrandRegionInference(rgName2b, rgDesc2b);
+      const brandConfirms2b = brandInf2b.matched &&
+        (regionsCanonicallyEqual(rgCurRegion2b, brandInf2b.inferredRegion) ||
+         regionsCanonicallyEqual(rgCand, brandInf2b.inferredRegion));
+      if (brandConfirms2b) {
+        /* Brand whitelist confirms region — no manual action needed */
+        if (!recs.region) recs.region = {};
+        recs.region.brandConfirmed = true;
+        recs.region.brandFamily = brandInf2b.brand;
+        recs.region.brandInferredRegion = brandInf2b.inferredRegion;
+      } else {
+        /* Region add/del requires server-side AJAX → still manual for now */
+        addError('REGION_MANUAL: Регион требует ручной проверки в popup. ' +
+          'Кандидат от AI: «' + rgCand + '».');
+      }
+    }
+  }
+
+  /* ═══ STEP 3: Re-check after Region → fresh Denomination ═══ */
+  let step3Recs = recs;
+  if (rgChanged || ptChanged) {
+    /* Even if region was not auto-applied, re-check denomination based on current state */
+    const freshSnap3 = readSnapshotFromPopup(win) || card.beforeSnapshot;
+    const payload3   = buildPayloadFromSnapshot(card, freshSnap3);
+    try {
+      const raw3    = await callBackend(payload3);
+      const mapped3 = mapBackendResult(raw3);
+      step3Recs = mapped3.recommendations || recs;
+      if (step3Recs.denomination) recs.denomination = step3Recs.denomination;
+    } catch (e) {
+      addError('RECHECK_AFTER_RG: Повторный вызов backend после Region не удался: ' + (e.message || e));
+    }
+  }
+
+  /* ═══ STEP 3b: Apply Denomination (MSG123: candidate+canonical trigger) ═══ */
+  /* Trigger rule: apply when candidate exists AND current differs canonically.
+     Do NOT rely solely on module status — AI may return status=match while
+     current and recommended are canonically different (MSG123 root cause). */
+  const dCandId = (recs.denomination || {}).candidateId || '';
+  let dnApplyTriggered = false;
+  if (dCandId) {
+    /* Read current denomination from popup for canonical comparison */
+    const curSnap = readSnapshotFromPopup(win) || card.beforeSnapshot;
+    const curDn = curSnap ? (curSnap.denominationLabel || curSnap.denominationOptionId || '') : '';
+    const dnCanonEq = denominationsCanonicallyEqual(curDn, dCandId);
+    if (dnCanonEq) {
+      /* Already correct — mark as alreadyMatched, no apply needed */
+      if (!recs.denomination) recs.denomination = {};
+      recs.denomination.alreadyMatched = true;
+      recs.denomination.applyDiag = {
+        ts: isoNow(), candidateRaw: dCandId,
+        candidateEntity: extractDenomEntity(dCandId),
+        currentRaw: curDn, currentEntity: extractDenomEntity(curDn),
+        alreadyCanonEqual: true, rootCause: 'ALREADY_MATCHED', ok: true,
+        selectFound: true, optionCount: 0, options: [],
+        matchedOptionValue: '', matchedOptionLabel: '', matchedOptionEntity: '',
+        oldSelectValue: '', newSelectValue: '', valueActuallyChanged: false,
+        eventsDispatched: false, valueAfterEvents: '', currentValue: '',
+      };
+    } else {
+      /* Canonical mismatch — apply denomination */
+      dnApplyTriggered = true;
+      const res = applyDenominationInPopup(win, dCandId);
+      if (res.diag) recs.denomination.applyDiag = res.diag;
+      if (res.ok) {
+        recs.denomination.resolvedDomValue = res.value;
+        recs.denomination.resolvedDomLabel = res.label;
+        if (res.alreadyMatched) {
+          recs.denomination.alreadyMatched = true;
+        }
+      } else {
+        addError(res.error);
+      }
+    }
+  }
+
+  card.afterSnapshot = readSnapshotFromPopup(win);
+  /* MSG123 ACTION 2: applied=true only if something actually changed or was alreadyMatched */
+  const ptApplied = (recs.productType || {}).resolvedDomValue != null;
+  const dnApplied = (recs.denomination || {}).resolvedDomValue != null;
+  const dnAlreadyOk = (recs.denomination || {}).alreadyMatched === true;
+  const anyFieldApplied = ptChanged || ptApplied || dnApplied || dnAlreadyOk;
+  card.applied = anyFieldApplied || (!card.applyError);
+
+  /* MSG218: strict apply trace — proof of popup mutation */
+  const denomDiag = (recs.denomination || {}).applyDiag || {};
+  console.log('[LIST-CHECK] apply result | card=' + card.productId +
+    ' | ptChanged=' + ptChanged + ' | dnApplied=' + dnApplied +
+    ' | dnAlready=' + dnAlreadyOk +
+    ' | dnRootCause=' + (denomDiag.rootCause || 'N/A') +
+    ' | dnOldValue=' + (denomDiag.oldSelectValue || 'N/A') +
+    ' | dnNewValue=' + (denomDiag.newSelectValue || 'N/A') +
+    ' | dnValueChanged=' + (denomDiag.valueActuallyChanged || false) +
+    ' | applyError=' + (card.applyError || 'none') +
+    ' | applied=' + card.applied +
+    ' | blockingIssues=' + JSON.stringify(getCardBlockingIssues(card)));
+  try { win.focus(); } catch (_) {}
+}
+
+/* ── CONFIRM MANUAL FIXES (Stage 1.2) ───────────────────────── */
+/* Operator has manually fixed fields in popup (e.g. region, ProductType).
+   This action re-reads the popup DOM, updates afterSnapshot, and sets
+   manuallyConfirmed=true — which clears blocking issues in safety gates.
+   Requires popup to be open on the correct card page. */
+async function confirmManualFixes(card) {
+  const win = await ensureWorkerAtUrl(card.updateUrl);
+  const freshSnap = readSnapshotFromPopup(win);
+  if (!freshSnap) throw new Error('CONFIRM_FAIL: Не удалось прочитать состояние popup');
+  card.afterSnapshot = freshSnap;
+  card.manuallyConfirmed = true;
+}
+
+/* ── APPROVE / SAVE ENGINE ───────────────────────────────────── */
+/* Controlled save: navigates popup to card URL, re-applies recommendations,
+   then submits the form. No auto-save. Must be explicitly triggered. */
+async function saveCard(card) {
+  /* Navigate popup to the card page (re-apply ensures form state is correct) */
+  await applyRecommendations(card);
+
+  const win = _s.workerWin;
+  if (!win || win.closed) throw new Error('WORKER_CLOSED: Popup недоступен для сохранения');
+
+  const doc     = win.document;
+  const saveBtn = doc.querySelector('input[name="yt0"]');
+  const form    = doc.getElementById('product-form');
+  if (!saveBtn && !form) throw new Error('SAVE_FORM_NOT_FOUND: Кнопка Save не найдена в popup');
+
+  /* Navigation sentinel before submit */
+  const seq = ++_s.navSeq;
+  try { win.__bsv_nav_seq__ = seq; } catch (_) {}
+
+  try {
+    if (saveBtn) saveBtn.click();
+    else form.submit();
+  } catch (e) {
+    throw new Error('SAVE_SUBMIT_ERROR: ' + e.message);
+  }
+
+  /* Wait for old page context destruction */
+  const deadline = Date.now() + NAV_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (win.closed) throw new Error('WORKER_CLOSED: Popup закрыт после submit');
+    try { if (win.__bsv_nav_seq__ !== seq) break; } catch (_) { break; }
+    await wait(100);
+  }
+  await wait(300);
+
+  /* Wait for new page (save redirects back to same page) */
+  await waitForWorkerReady(win, PAGE_LOAD_MS);
+  card.afterSnapshot = readSnapshotFromPopup(win);
+  card.saved = true;
+}
+
+/* ── MOD STATUS ENGINE ───────────────────────────────────────── */
+function getModStatusRule(color) {
+  return MOD_STATUS_RULES.find(r => r.color === color) || null;
+}
+
+/* Try to extract Yii1 CSRF token (W5 — UNKNOWN in DOM snapshot).
+   Yii1 embeds YII_CSRF_TOKEN as a meta tag or hidden input.
+   If not found, sends without token (works if Yii CSRF is disabled for XHR). */
+function extractCsrfToken() {
+  try {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    if (meta) return meta.getAttribute('content') || '';
+    const hidden = document.querySelector('input[name="YII_CSRF_TOKEN"]');
+    if (hidden) return hidden.value || '';
+  } catch (_) {}
+  return '';
+}
+
+async function applyModStatus(card) {
+  const rule = getModStatusRule(card.finalColor);
+  if (!rule) throw new Error('MOD_STATUS_NO_RULE: Нет правила для цвета «' + card.finalColor + '»');
+  if (rule._blocked) throw new Error('MOD_STATUS_BLOCKED: ' + rule._blockedReason);
+  if (rule.modStatus === 'no_change') return;   /* skip silently */
+
+  const csrfToken = extractCsrfToken();
+  const bodyParts = [
+    'product_id='    + encodeURIComponent(card.productId),
+    'mod_status='    + encodeURIComponent(rule.modStatus),
+    'rejection_note=' + encodeURIComponent(rule.rejectionNote || ''),
+  ];
+  if (rule.requiresRejectionReason && rule.rejectionReasonId) {
+    bodyParts.push('rejection_reason=' + encodeURIComponent(rule.rejectionReasonId));
+  }
+  if (csrfToken) bodyParts.push('YII_CSRF_TOKEN=' + encodeURIComponent(csrfToken));
+  const body = bodyParts.join('&');
+
+  const resp = await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/xdm/product/updateModStatus', true);
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+    if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
+    xhr.timeout = 15000;
+    xhr.onload  = () => {
+      try { resolve(JSON.parse(xhr.responseText)); }
+      catch (_) { resolve({ success: false, error: 'Parse error: ' + xhr.responseText.slice(0, 100) }); }
+    };
+    xhr.onerror   = () => reject(new Error('XHR network error'));
+    xhr.ontimeout = () => reject(new Error('XHR timeout 15s'));
+    xhr.send(body);
+  });
+
+  if (!resp || !resp.success) {
+    throw new Error('MOD_STATUS_FAIL: ' + ((resp && resp.error) ? resp.error : 'Сервер вернул ошибку'));
+  }
+
+  card.modStatusApplied = true;
+  card.modStatusNew     = rule.modStatus;
+
+  /* Update live dropdown on list page */
+  try {
+    const sel = document.querySelector(
+      'select.mod-status-dropdown[data-id="' + card.productId + '"],' +
+      '#mod_status_' + card.productId
+    );
+    if (sel) sel.value = rule.modStatus;
+  } catch (_) {}
+}
+
+/* ── EXPORT ENGINE ───────────────────────────────────────────── */
+/* BACKEND GAP: Apps Script→Sheets export requires v16.gs (new writeExportRows action).
+   Stage 1 interim: clipboard TSV.                                                      */
+function buildExportTsv(session, cards) {
+  const hdr = [
+    'sessionId', 'scannedAt', 'productId', 'productName',
+    'ptBefore', 'ptAfter', 'regionsBefore', 'regionsAfter',
+    'denomBefore', 'denomAfter',
+    'aiVerdict', 'aiConfidence', 'aiReason',
+    'operatorOverride', 'finalColor',
+    'applied', 'saved', 'manuallyConfirmed', 'modStatusChanged', 'modStatusNew',
+    'scanError', 'applyError', 'saveError',
+  ].join('\t');
+
+  const snap2pt  = s => s ? (s.productTypeName || s.productTypeId || '—') : '—';
+  const snap2reg = s => s ? ((s.regions || []).map(r => r.name).join(', ') || '—') : '—';
+  const snap2den = s => s ? (s.denominationLabel || s.denominationOptionId || '—') : '—';
+
+  const rows = cards.map(c => [
+    session.sessionId,          session.scannedAt,
+    c.productId,                c.productName,
+    snap2pt(c.beforeSnapshot),  snap2pt(c.afterSnapshot),
+    snap2reg(c.beforeSnapshot), snap2reg(c.afterSnapshot),
+    snap2den(c.beforeSnapshot), snap2den(c.afterSnapshot),
+    c.aiVerdict    || '—',
+    c.aiConfidence != null ? c.aiConfidence : '—',
+    c.aiReason     || '—',
+    c.operatorOverride || '—',  c.finalColor || '—',
+    c.applied  ? 'yes' : 'no', c.saved ? 'yes' : 'no',
+    c.manuallyConfirmed ? 'yes' : 'no',
+    c.modStatusApplied ? 'yes' : 'no', c.modStatusNew || '—',
+    c.scanError  || '—',
+    c.applyError || '—',
+    c.saveError  || '—',
+  ].map(v => String(v).replace(/\t|\n/g, ' ')).join('\t'));
+
+  return [hdr, ...rows].join('\n');
+}
+
+async function runExport(session, cards) {
+  if (!cards.length) { alert('Нет карточек для экспорта.'); return; }
+  const tsv = buildExportTsv(session, cards);
+  let method = 'clipboard';
+  try {
+    await navigator.clipboard.writeText(tsv);
+  } catch (_) {
+    /* Fallback: open in new tab */
+    method = 'window';
+    const w = window.open('', '_blank');
+    if (w) { w.document.write('<pre style="font:12px monospace;padding:16px">' + esc(tsv) + '</pre>'); }
+  }
+  if (EXPORT_CONFIG.backendGap) {
+    alert(
+      'Экспорт: ' + cards.length + ' строк → ' + method + '\n\n' +
+      'BACKEND GAP: Экспорт в Google Sheets (таб «' + EXPORT_CONFIG.exportTab + '») ' +
+      'недоступен в Stage 1.\n' +
+      'Требуется v16.gs с action=writeExportRows.'
+    );
+  } else {
+    alert('Экспорт: ' + cards.length + ' строк → ' + method);
+  }
+}
+
+/* ── EXPORT SERVICE CALLER ───────────────────────────────────── */
+/* Calls LIST_CHECK_EXPORT_SERVICE_v1 via postmessage iframe transport.
+   Same pattern as callBackend but different source identifier. */
+function callExportService(payload) {
+  if (!EXPORT_CONFIG.exportServiceUrl) return Promise.resolve(null);
+  return new Promise(resolve => {
+    const reqId  = 'exp_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    const iframe = document.createElement('iframe');
+    const form   = document.createElement('form');
+    iframe.name       = 'exp_f_' + reqId;
+    iframe.style.display = 'none';
+    form.method       = 'POST';
+    form.action       = EXPORT_CONFIG.exportServiceUrl;
+    form.target       = iframe.name;
+    form.style.display = 'none';
+    const addInput = (n, v) => {
+      const i = document.createElement('input');
+      i.type = 'hidden'; i.name = n; i.value = String(v ?? '');
+      form.appendChild(i);
+    };
+    addInput('transport',         'postmessage');
+    addInput('client_request_id', reqId);
+    const enriched = Object.assign({}, payload || {});
+    if (EXPORT_CONFIG.exportAuthToken) enriched.auth_token = EXPORT_CONFIG.exportAuthToken;
+    addInput('payload_json',      JSON.stringify(enriched));
+    let settled = false;
+    const tId = setTimeout(() => {
+      if (settled) return; settled = true; cleanup();
+      resolve({ ok: false, error: 'Export service timeout' });
+    }, EXPORT_CONFIG.serviceTimeout);
+    function cleanup() {
+      const fn = _s.msgHandlers.get(reqId);
+      if (fn) { window.removeEventListener('message', fn); _s.msgHandlers.delete(reqId); }
+      clearTimeout(tId);
+      setTimeout(() => { try { form.remove(); } catch(_){} try { iframe.remove(); } catch(_){} }, 600);
+    }
+    const handler = ev => {
+      const d = ev && ev.data;
+      if (!d || typeof d !== 'object') return;
+      if (d.source !== EXPORT_CONFIG.exportServiceSrc) return;
+      if (String(d.client_request_id || '') !== reqId) return;
+      if (settled) return;
+      settled = true; cleanup(); resolve(d);
+    };
+    _s.msgHandlers.set(reqId, handler);
+    window.addEventListener('message', handler);
+    document.body.appendChild(iframe);
+    document.body.appendChild(form);
+    try { form.submit(); } catch (e) { cleanup(); resolve({ ok: false, error: e.message }); }
+  });
+}
+
+/* ── SHEET EXPORT (Stage 1.3) ───────────────────────────────── */
+/* If export service is configured → direct write to Sheets.
+   If not → fallback to clipboard + open sheet in new tab. */
+function buildExportRows(session, cards) {
+  const snap2pt  = s => s ? (s.productTypeName || s.productTypeId || '') : '';
+  const snap2reg = s => s ? ((s.regions || []).map(r => r.name).join(', ') || '') : '';
+  const snap2den = s => s ? (s.denominationLabel || s.denominationOptionId || '') : '';
+  return cards.map(c => ({
+    sessionId:         session.sessionId,
+    scannedAt:         session.scannedAt,
+    productId:         c.productId,
+    productName:       c.productName,
+    ptBefore:          snap2pt(c.beforeSnapshot),
+    ptAfter:           snap2pt(c.afterSnapshot),
+    regionsBefore:     snap2reg(c.beforeSnapshot),
+    regionsAfter:      snap2reg(c.afterSnapshot),
+    denomBefore:       snap2den(c.beforeSnapshot),
+    denomAfter:        snap2den(c.afterSnapshot),
+    aiVerdict:         c.aiVerdict || '',
+    aiConfidence:      c.aiConfidence != null ? String(c.aiConfidence) : '',
+    aiReason:          c.aiReason || '',
+    operatorOverride:  c.operatorOverride || '',
+    finalColor:        c.finalColor || '',
+    applied:           c.applied ? 'yes' : 'no',
+    saved:             c.saved ? 'yes' : 'no',
+    manuallyConfirmed: c.manuallyConfirmed ? 'yes' : 'no',
+    modStatusChanged:  c.modStatusApplied ? 'yes' : 'no',
+    modStatusNew:      c.modStatusNew || '',
+    scanError:         c.scanError || '',
+    applyError:        c.applyError || '',
+    saveError:         c.saveError || '',
+  }));
+}
+
+async function exportToSheet(session, cards) {
+  if (!cards.length) { alert('Нет карточек для отправки в таблицу.'); return; }
+
+  const rows = buildExportRows(session, cards);
+
+  /* Try export service first */
+  if (EXPORT_CONFIG.exportServiceUrl) {
+    const resp = await callExportService({ action: 'writeExportRows', rows: rows });
+    if (resp && resp.ok) {
+      cards.forEach(c => { c.exportedToSheet = true; });
+      alert('В таблицу: ' + resp.written + ' строк записано в Google Sheet.');
+      return;
+    }
+    /* Service call failed — fall through to clipboard */
+    const errMsg = (resp && resp.error) ? resp.error : 'Нет ответа';
+    alert('Export service ошибка: ' + errMsg + '\nИспользую clipboard fallback.');
+  }
+
+  /* Fallback: clipboard + open sheet */
+  const tsv = buildExportTsv(session, cards);
+  try { await navigator.clipboard.writeText(tsv); } catch (_) {}
+  window.open(EXPORT_CONFIG.sheetUrl, '_blank');
+  cards.forEach(c => { c.exportedToSheet = true; });
+  alert(
+    'В таблицу: ' + cards.length + ' строк скопировано в буфер обмена.\n' +
+    'Google Sheet открыт — вставьте данные (Ctrl+V).\n\n' +
+    (EXPORT_CONFIG.exportServiceUrl
+      ? 'Export service вернул ошибку — использован clipboard fallback.'
+      : 'Export service не настроен (exportServiceUrl пуст). Установите URL после деплоя LIST_CHECK_EXPORT_SERVICE_v1.gs.')
+  );
+}
+
+/* ── SCAN LOOP ───────────────────────────────────────────────── */
+async function runScan(items, session, onProgress) {
+  _s.isFirstCard = true;
+
+  for (let i = 0; i < items.length; i++) {
+    if (_s.aborted) break;
+    const item = items[i];
+    const card = makeCardResult(item.productId, item.productName, item.productType, item.updateUrl);
+    session.cards.push(card);
+
+    try {
+      /* 1. Open popup → capture beforeSnapshot */
+      const win = await ensureWorkerAtUrl(item.updateUrl);
+      card.beforeSnapshot = readSnapshotFromPopup(win);
+
+      /* 2. Build payload from snapshot */
+      const snap = card.beforeSnapshot || makeSnap();
+      const payload = {
+        product_id:   item.productId,
+        name:         snap.name        || item.productName,
+        description:  snap.description || '',
+        current: {
+          product_type: snap.productTypeName || item.productType,
+          region:       (snap.regions || []).map(r => r.name).join(', '),
+          denomination: snap.denominationLabel || '',
+        },
+        mode: 'card',
+      };
+
+      /* 3. Call AI Core v1 backend (postmessage from list page window) */
+      const raw    = await callBackend(payload);
+      const mapped = mapBackendResult(raw);
+      card.aiVerdict       = mapped.verdict;
+      card.aiConfidence    = mapped.confidence;
+      card.aiReason        = mapped.reason;
+      card.aiRaw           = raw;
+      card.recommendations = mapped.recommendations;
+
+    } catch (e) {
+      card.aiVerdict = 'error';
+      card.scanError = e.message || String(e);
+      if (e.message && e.message.includes('POPUP_BLOCKED')) { _s.aborted = true; break; }
+    }
+
+    /* Update summary */
+    const v = card.aiVerdict;
+    session.summary.processed++;
+    if (v === 'green')  session.summary.green++;
+    else if (v === 'yellow') session.summary.yellow++;
+    else if (v === 'red')    session.summary.red++;
+    else                     session.summary.errors++;
+
+    onProgress(i + 1, items.length, card);
+    await wait(60);   /* breathing room */
+  }
+
+  /* Close worker after scan completes (will reopen for apply) */
+  if (_s.workerWin && !_s.workerWin.closed) {
+    try { _s.workerWin.close(); } catch (_) {}
+    _s.workerWin = null;
+    _s.isFirstCard = true;
+  }
+}
+
+/* ── UI: COLOR TOKENS ────────────────────────────────────────── */
+const CLR = {
+  green:  { border: '#22c55e', badge: '🟢', bg: 'rgba(34,197,94,.12)',  txt: '#4ade80', hdr: '#dcfce7', hdrTxt: '#14532d', label: 'ПОДТВЕРЖДЕНО' },
+  yellow: { border: '#eab308', badge: '🟡', bg: 'rgba(234,179,8,.12)',  txt: '#fcd34d', hdr: '#fef9c3', hdrTxt: '#713f12', label: 'ТРЕБУЕТСЯ ПРОВЕРКА' },
+  red:    { border: '#ef4444', badge: '🔴', bg: 'rgba(239,68,68,.12)',  txt: '#f87171', hdr: '#fecaca', hdrTxt: '#7f1d1d', label: 'КОНФЛИКТ / ОШИБКА' },
+  error:  { border: '#6b7280', badge: '⚠',  bg: 'rgba(107,114,128,.1)', txt: '#9ca3af', hdr: '#e5e7eb', hdrTxt: '#374151', label: 'ОШИБКА' },
+  gray:   { border: '#94a3b8', badge: '—',  bg: 'rgba(148,163,184,.1)', txt: '#94a3b8', hdr: '#f1f5f9', hdrTxt: '#475569', label: 'НЕЙТРАЛЬНО' },
+};
+const clr = v => CLR[v] || CLR.error;
+
+/* ══════════════════════════════════════════════════════════════
+   UI: Two-panel layout (MSG47 mockup rebuild)
+   Left panel  = card list + summary counters
+   Right panel = detail view of selected card
+   Top bar     = action buttons
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── UI HELPERS ─────────────────────────────────────────────── */
+function rebuildSummary(session) {
+  const s = session.summary, cards = session.cards;
+  s.green  = cards.filter(c => c.finalColor === 'green').length;
+  s.yellow = cards.filter(c => c.finalColor === 'yellow').length;
+  s.red    = cards.filter(c => c.finalColor === 'red').length;
+  s.errors = cards.filter(c => c.aiVerdict === 'error').length;
+}
+
+const $  = id => document.getElementById(id);
+const $$ = sel => [...document.querySelectorAll(sel)];
+
+/* ── OVERLAY SHELL ──────────────────────────────────────────── */
+function renderOverlay() {
+  const el = document.createElement('div');
+  el.id = 'bsv-wip01-overlay';
+  el.style.cssText = 'position:fixed;inset:0;z-index:2147483640;display:flex;flex-direction:column;' +
+    'background:#0a0f18;font:14px/1.5 Arial,Helvetica,sans-serif;color:#e5e7eb;';
+  el.innerHTML = `
+    <div id="wip01-topbar" style="display:flex;align-items:center;gap:8px;padding:10px 16px;
+      background:#0f1724;border-bottom:1px solid rgba(255,255,255,.1);flex-shrink:0;">
+      <div style="font-weight:800;font-size:18px;color:#f8d26a;margin-right:8px;">Проверка списка</div>
+      <span style="font-size:11px;background:rgba(245,158,11,.15);color:#fcd34d;
+        padding:3px 10px;border-radius:8px;font-weight:700;">Under Review</span>
+      <span style="flex:1;"></span>
+      <div id="wip01-actions" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"></div>
+      <button id="wip01-close" type="button" style="border:none;border-radius:8px;
+        padding:6px 12px;background:rgba(255,255,255,.08);color:#9ca3af;cursor:pointer;
+        font-size:15px;font-weight:700;margin-left:8px;">✕</button>
+    </div>
+    <div style="flex:1;display:flex;min-height:0;overflow:hidden;">
+      <aside id="wip01-left" style="width:380px;min-width:320px;border-right:1px solid rgba(255,255,255,.1);
+        background:#0b1220;display:flex;flex-direction:column;overflow:hidden;">
+        <div id="wip01-summary" style="padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.08);flex-shrink:0;"></div>
+        <div id="wip01-list" style="flex:1;overflow-y:auto;padding:8px;"></div>
+      </aside>
+      <main id="wip01-detail" style="flex:1;overflow-y:auto;padding:16px;background:#0f1724;"></main>
+    </div>`;
+  document.body.appendChild(el);
+  _s.overlay = el;
+  $('wip01-close').onclick = () => { if (window[NS]) window[NS].cleanup(); };
+  return el;
+}
+
+/* ── STARTUP (MSG129: card selection UI) ────────────────────── */
+function renderStartup(items, onStartWithItems) {
+  _s.uiPhase = 'startup';
+  const count = items.length;
+  /* Track manual checkbox state per productId */
+  const checked = new Set();
+  let manualMode = false; /* true once operator toggles any checkbox */
+
+  function getEffectiveCount() {
+    if (manualMode && checked.size > 0) return checked.size;
+    const inp = $('wip01-scan-count');
+    let n = inp ? parseInt(inp.value, 10) : count;
+    if (isNaN(n) || n < 1) n = 1;
+    if (n > count) n = count;
+    return n;
+  }
+
+  function updateStartButton() {
+    const btn = $('wip01-start');
+    if (!btn) return;
+    const eff = getEffectiveCount();
+    const mode = (manualMode && checked.size > 0) ? ' выбрано' : '';
+    btn.textContent = 'Начать проверку (' + eff + ' карточ' + pluralCard(eff) + mode + ')';
+  }
+
+  function pluralCard(n) {
+    const m = n % 10, h = n % 100;
+    if (m === 1 && h !== 11) return 'ка';
+    if (m >= 2 && m <= 4 && (h < 12 || h > 14)) return 'ки';
+    return 'ек';
+  }
+
+  function updateCounter() {
+    const el = $('wip01-sel-counter');
+    if (!el) return;
+    if (manualMode && checked.size > 0) {
+      el.textContent = 'Выбрано вручную: ' + checked.size + ' из ' + count;
+      el.style.color = '#60a5fa';
+    } else {
+      el.textContent = '';
+    }
+  }
+
+  function toggleCheck(pid) {
+    manualMode = true;
+    if (checked.has(pid)) checked.delete(pid); else checked.add(pid);
+    /* Update checkbox visual */
+    const cb = $('wip01-cb-' + pid);
+    if (cb) cb.checked = checked.has(pid);
+    updateStartButton();
+    updateCounter();
+  }
+
+  function setAll(on) {
+    manualMode = true;
+    checked.clear();
+    if (on) items.forEach(it => checked.add(it.productId));
+    for (const it of items) {
+      const cb = $('wip01-cb-' + it.productId);
+      if (cb) cb.checked = on;
+    }
+    updateStartButton();
+    updateCounter();
+  }
+
+  /* Build card list HTML */
+  let listHtml = '';
+  for (const it of items) {
+    listHtml += `<label id="wip01-row-${esc(it.productId)}" style="display:flex;align-items:center;gap:8px;
+      padding:7px 10px;border-radius:8px;cursor:pointer;transition:background .15s;
+      border-bottom:1px solid rgba(255,255,255,.04);"
+      onmouseover="this.style.background='rgba(96,165,250,.08)'"
+      onmouseout="this.style.background='transparent'">
+      <input type="checkbox" id="wip01-cb-${esc(it.productId)}" data-pid="${esc(it.productId)}"
+        style="width:16px;height:16px;accent-color:#2563eb;cursor:pointer;flex-shrink:0;">
+      <span style="font-size:11px;color:#6b7280;min-width:52px;">#${esc(it.productId)}</span>
+      <span style="font-size:12px;color:#e5e7eb;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(it.productName)}</span>
+      <span style="font-size:10px;color:#64748b;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(it.productType)}</span>
+    </label>`;
+  }
+
+  $('wip01-list').innerHTML = `
+    <div style="padding:14px 14px 0;">
+      <div style="font-size:13px;color:#94a3b8;text-align:center;">Товаров <b style="color:#a5b4fc;">Under Review</b> на странице:</div>
+      <div style="font-size:42px;font-weight:800;color:#60a5fa;margin:6px 0 12px;text-align:center;">${count}</div>
+      ${count > 0 ? `
+        <div style="margin-bottom:10px;text-align:center;">
+          <label style="font-size:13px;color:#94a3b8;">Сканировать первых:</label>
+          <input id="wip01-scan-count" type="number" min="1" max="${count}" value="${count}"
+            style="width:70px;margin-left:8px;padding:6px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.2);
+            background:rgba(255,255,255,.07);color:#e5e7eb;font-size:16px;font-weight:700;text-align:center;">
+          <span style="font-size:12px;color:#6b7280;margin-left:4px;">из ${count}</span>
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:8px;justify-content:center;">
+          <button id="wip01-sel-all" type="button" style="border:1px solid rgba(255,255,255,.15);
+            border-radius:6px;padding:4px 12px;background:rgba(255,255,255,.05);color:#94a3b8;
+            font-size:11px;cursor:pointer;">Выбрать все</button>
+          <button id="wip01-sel-none" type="button" style="border:1px solid rgba(255,255,255,.15);
+            border-radius:6px;padding:4px 12px;background:rgba(255,255,255,.05);color:#94a3b8;
+            font-size:11px;cursor:pointer;">Снять все</button>
+        </div>
+        <div id="wip01-sel-counter" style="font-size:12px;text-align:center;margin-bottom:8px;min-height:16px;"></div>
+      ` : ''}
+    </div>
+    ${count > 0 ? `
+      <div style="flex:1;overflow-y:auto;padding:0 8px 8px;max-height:calc(100vh - 360px);">
+        ${listHtml}
+      </div>
+      <div style="padding:10px 14px;">
+        <button id="wip01-start" type="button" style="border:none;border-radius:10px;padding:12px 24px;
+          background:#2563eb;color:#fff;font-weight:700;font-size:15px;cursor:pointer;width:100%;">
+          Начать проверку (${count} карточ${pluralCard(count)})</button>
+      </div>
+    ` : '<div style="padding:14px;color:#f59e0b;text-align:center;">Нет товаров Under Review.</div>'}`;
+
+  $('wip01-detail').innerHTML = '<div style="color:#6b7280;padding:24px;text-align:center;">Выберите карточки для проверки или нажмите «Начать проверку».</div>';
+
+  /* Bind checkbox events */
+  for (const it of items) {
+    const cb = $('wip01-cb-' + it.productId);
+    if (cb) cb.onchange = () => toggleCheck(it.productId);
+  }
+
+  /* Bind select all / deselect all */
+  const selAll = $('wip01-sel-all');
+  if (selAll) selAll.onclick = () => setAll(true);
+  const selNone = $('wip01-sel-none');
+  if (selNone) selNone.onclick = () => setAll(false);
+
+  /* Update button text when count input changes */
+  const scanInp = $('wip01-scan-count');
+  if (scanInp) scanInp.oninput = () => {
+    if (!manualMode || checked.size === 0) updateStartButton();
+  };
+
+  /* Bind start button */
+  const startBtn = $('wip01-start');
+  if (startBtn) startBtn.onclick = () => {
+    let selectedItems;
+    if (manualMode && checked.size > 0) {
+      /* Manual selection mode: only checked items, in page order */
+      selectedItems = items.filter(it => checked.has(it.productId));
+    } else {
+      /* Count-based mode: first N items */
+      let n = scanInp ? parseInt(scanInp.value, 10) : count;
+      if (isNaN(n) || n < 1) n = 1;
+      if (n > count) n = count;
+      selectedItems = items.slice(0, n);
+    }
+    onStartWithItems(selectedItems);
+  };
+}
+
+/* ── PROGRESS ───────────────────────────────────────────────── */
+function renderProgress(done, total, card) {
+  /* Guard: do NOT overwrite results/detail if scan already completed */
+  if (_s.uiPhase !== 'scanning') return;
+
+  const pct = total ? Math.round(done / total * 100) : 0;
+  $('wip01-list').innerHTML = `
+    <div style="padding:20px 14px;">
+      <div style="font-size:14px;color:#94a3b8;margin-bottom:8px;">Проверка: <b style="color:#93c5fd;">${done} / ${total}</b></div>
+      <div style="background:rgba(255,255,255,.07);border-radius:8px;height:10px;overflow:hidden;margin-bottom:12px;">
+        <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#3b82f6,#6366f1);border-radius:8px;transition:width .35s;"></div>
+      </div>
+      ${card ? `<div style="font-size:12px;color:#6b7280;">→ ${esc(card.productId)} — ${esc(card.productName)}</div>` : ''}
+      <button id="wip01-cancel" type="button" style="margin-top:14px;border:none;border-radius:9px;padding:9px 16px;
+        background:#7f1d1d;color:#fca5a5;font-weight:700;font-size:13px;cursor:pointer;width:100%;">Отмена</button>
+    </div>`;
+  const dp = $('wip01-detail');
+  if (dp) dp.innerHTML = `<div style="color:#94a3b8;padding:24px;text-align:center;">
+    <div style="font-size:14px;margin-bottom:6px;">Сканирование...</div>
+    <div style="font-size:12px;color:#6b7280;">Проверено: ${done} из ${total}</div>
+    ${card ? `<div style="font-size:12px;color:#6b7280;margin-top:4px;">→ ${esc(card.productName)}</div>` : ''}
+  </div>`;
+  const cb = $('wip01-cancel');
+  if (cb) cb.onclick = () => { _s.aborted = true; };
+}
+
+/* ── LEFT PANEL: CARD LIST ──────────────────────────────────── */
+function renderCardList(session) {
+  rebuildSummary(session);
+  const s = session.summary;
+  const pill = (lbl, val, bg, txt) => `<span style="background:${bg};color:${txt};padding:3px 9px;border-radius:14px;font-size:12px;font-weight:700;">${lbl} ${val}</span>`;
+  $('wip01-summary').innerHTML = `
+    <div style="display:flex;gap:5px;flex-wrap:wrap;">
+      ${pill('Всего', s.totalFound, '#1e293b', '#94a3b8')}
+      ${pill('🟢', s.green, 'rgba(34,197,94,.12)', '#4ade80')}
+      ${pill('🟡', s.yellow, 'rgba(234,179,8,.12)', '#fcd34d')}
+      ${pill('🔴', s.red, 'rgba(239,68,68,.12)', '#f87171')}
+      ${pill('⚠', s.errors, 'rgba(107,114,128,.1)', '#9ca3af')}
+    </div>`;
+
+  const selected = _s.uiSelectedId;
+  $('wip01-list').innerHTML = session.cards.map(card => {
+    const c = clr(card.finalColor);
+    const active = card.productId === selected;
+    const badges = [
+      card.applied ? '<span style="color:#a5b4fc;font-size:10px;">Applied</span>' : '',
+      card.saved ? '<span style="color:#4ade80;font-size:10px;">Saved</span>' : '',
+      card.exportedToSheet ? '<span style="color:#38bdf8;font-size:10px;">Sheet</span>' : '',
+      card.modStatusApplied ? '<span style="color:#fcd34d;font-size:10px;">MS</span>' : '',
+    ].filter(Boolean).join(' · ');
+    return `
+      <div data-card-select="${esc(card.productId)}" style="margin-bottom:4px;padding:10px 12px;border-radius:12px;
+        border:1px solid ${active ? 'rgba(255,255,255,.2)' : c.border + '44'};cursor:pointer;
+        background:${active ? 'rgba(255,255,255,.08)' : 'rgba(255,255,255,.02)'};transition:all .15s;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:16px;">${c.badge}</span>
+          <div style="flex:1;min-width:0;">
+            <div style="font-size:11px;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.1em;">ID ${esc(card.productId)}</div>
+            <div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(card.productName)}</div>
+          </div>
+          ${card.aiConfidence != null ? `<span style="font-size:11px;color:#6b7280;">${card.aiConfidence}%</span>` : ''}
+        </div>
+        ${badges ? `<div style="margin-top:4px;font-size:10px;">${badges}</div>` : ''}
+        <div style="margin-top:4px;font-size:11px;color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(card.aiReason || '—')}</div>
+      </div>`;
+  }).join('');
+
+  $$('[data-card-select]').forEach(el => {
+    el.onclick = () => {
+      _s.uiSelectedId = el.dataset.cardSelect;
+      renderCardList(session);
+      renderDetailPanel(session);
+    };
+  });
+}
+
+/* ── RIGHT PANEL: DETAIL VIEW ───────────────────────────────── */
+function renderDetailSection(title, idx, status, fields) {
+  const c = clr(status);
+  const rows = fields.map(f =>
+    `<div style="display:grid;grid-template-columns:140px 1fr;border-bottom:1px solid rgba(255,255,255,.06);padding:0;">
+      <div style="padding:6px 10px;font-weight:700;color:#ffd54d;font-size:13px;border-right:1px solid rgba(255,255,255,.06);">${esc(f.label)}</div>
+      <div style="padding:6px 10px;font-size:13px;color:rgba(255,255,255,.9);">${f.html || esc(f.value || '—')}</div>
+    </div>`
+  ).join('');
+  return `
+    <div style="border:2px solid ${c.border};border-radius:14px;overflow:hidden;margin-bottom:8px;">
+      <div style="background:${c.hdr};color:${c.hdrTxt};padding:6px 12px;font-weight:800;font-size:14px;">
+        ${idx}. ${esc(title)}</div>
+      <div style="background:#04153f;">
+        <div style="padding:6px 10px;">
+          <span style="display:inline-flex;align-items:center;gap:5px;border:1px solid ${c.border};
+            background:${c.bg};color:${c.txt};padding:3px 10px;border-radius:12px;font-size:12px;font-weight:700;">
+            ${c.badge} ${c.label}</span>
+        </div>
+        ${rows}
+      </div>
+    </div>`;
+}
+
+/* ── TICKET CONTEXT BLOCK ───────────────────────────────────── */
+function renderTicketContext(card) {
+  const b   = card.beforeSnapshot;
+  const raw = card.aiRaw || {};
+  const sel = raw.selection || {};
+  const pt  = b ? (b.productTypeName || b.productTypeId || '—') : card.productType || '—';
+  const rg  = b ? ((b.regions || []).map(r => r.name).join(', ') || '—') : '—';
+  const dn  = b ? (b.denominationLabel || b.denominationOptionId || '—') : '—';
+  const nm  = b ? (b.name || card.productName) : card.productName;
+  const desc = b ? (b.description || '') : '';
+
+  /* Replacement hint builder (unified pattern — MSG81) */
+  const hintBox = lines => `<div style="margin-top:3px;padding:4px 8px;background:#fef3c7;border:1px solid #f59e0b;border-radius:4px;font-size:12px;color:#92400e;">${lines}</div>`;
+
+  /* ── Candidate comparisons (MUST be declared before evidence terms use them — MSG95 fix) ── */
+  const ptCand = sel.product_type_candidate_id || '';
+  const ptModStatus = ((raw.modules || {}).product_type || {}).status || '';
+  /* MSG137: Catalogue-driven ProductType resolution */
+  const ptOptions = b ? (b.productTypeOptions || []) : [];
+  const ptResolved = resolveProductTypeState(pt, ptCand, ptOptions, ptModStatus, nm);
+  const ptCanonMatch = ptResolved.semanticMatch;
+  const rgCand = sel.region_candidate_id || '';
+  const rgMatch = regionsCanonicallyEqual(rg, rgCand);
+  const dnCandTc = sel.denomination_candidate_id || '';
+  const dnMatchTc = !dnCandTc || denominationsCanonicallyEqual(dn, dnCandTc);
+
+  /* ProductType hint — MSG137/142: use resolved display label, handle suspect candidates */
+  let ptHelper = '';
+  if (ptResolved.showHelper && ptResolved.helperMode === 'replacement') {
+    ptHelper = hintBox(
+      `Название/описание указывает на другой ProductType: <b>${esc(ptResolved.recommendedDisplay)}</b><br>` +
+      `В таблице есть ProductType: <b>${esc(ptResolved.recommendedDisplay)}</b>`);
+  } else if (ptResolved.showHelper && ptResolved.helperMode === 'unresolved') {
+    /* MSG142: suspect candidate — warn operator, don't suggest replacement */
+    ptHelper = hintBox(
+      `AI предложил ProductType: <b>${esc(ptResolved.recommendedDisplay)}</b>, но это может быть ложное совпадение по platform keyword.<br>` +
+      `Требуется ручная проверка ProductType.`);
+  }
+
+  /* Region hint (MSG135 + MSG178: brand inference whitelist) */
+  const rgModTc = (raw.modules || {}).region || {};
+  const rgUncertainTc = rgModTc.status === 'uncertain';
+  const rgBrandInfTc = checkBrandRegionInference(nm, desc);
+  const rgBrandConfirmsTc = rgBrandInfTc.matched &&
+    (regionsCanonicallyEqual(rg, rgBrandInfTc.inferredRegion) ||
+     regionsCanonicallyEqual(rgCand, rgBrandInfTc.inferredRegion));
+  let rgHelper = '';
+  if (rgCand && !rgMatch && !rgBrandConfirmsTc) {
+    /* Replacement case: canonical mismatch, no brand inference */
+    rgHelper = hintBox(
+      `В name найден другой регион: <b>${esc(rgCand)}</b><br>` +
+      `В таблице есть регион: <b>${esc(rgCand)}</b>`);
+  } else if (rgCand && rgMatch && rgUncertainTc && !rgBrandConfirmsTc) {
+    /* Evidence-warning case: canonical match but no text evidence and no brand inference (MSG135) */
+    rgHelper = hintBox(
+      `Регион совпадает с candidate (canonical match), но seller text не подтверждает. Требуется проверка.`);
+  }
+  /* MSG178: brand inference does NOT show replacement/warning helper — it's a green-path */
+
+  /* Denomination hint (MSG135 + MSG178: brand inference unblocks region) */
+  const dnModTc = (raw.modules || {}).denomination || {};
+  const dnUncertainTc = dnModTc.status === 'uncertain';
+  const rgStillUncertainTc = rgUncertainTc && !rgBrandConfirmsTc;
+  let dnHelper = '';
+  if (dnCandTc && !dnMatchTc) {
+    /* Replacement case */
+    dnHelper = hintBox(
+      `В name/description найден другой denomination: <b>${esc(dnCandTc)}</b><br>` +
+      `В таблице есть denomination: <b>${esc(dnCandTc)}</b>`);
+  } else if (dnCandTc && dnMatchTc && (dnUncertainTc || rgStillUncertainTc)) {
+    /* Evidence-warning case: canonical match but evidence missing or region unconfirmed (MSG135) */
+    const reason = rgStillUncertainTc ? 'регион не подтверждён seller text' : 'text evidence отсутствует';
+    dnHelper = hintBox(
+      `Denomination совпадает с candidate, но ${reason}. Автоподтверждение заблокировано.`);
+  }
+
+  /* Evidence highlighting (MSG89/97/103): collect terms that influenced the decision */
+  /* MSG158: PT aliases from snapshot, with embedded fallback list */
+  const PT_ALIASES_EMBEDDED = ['itunes','apple','psn','playstation network','lol','pubg','pubg mobile',
+    'razer','razer pin','currys','google play','spotify','fortnite','xbox','steam','nintendo',
+    'gift card','gift cards','subscription','game key','game keys'];
+  const PT_ALIASES = _aliasState.loaded && _aliasState.ptAliases.length > 0
+    ? [...new Set([..._aliasState.ptAliases, ...PT_ALIASES_EMBEDDED])]
+    : PT_ALIASES_EMBEDDED;
+  const evidenceTerms = [];   /* [{term, type:'confirm'|'replace'}] */
+  const addEvidence = (term, type) => {
+    if (!term || term === '—' || term.length < 2) return;
+    if (evidenceTerms.some(e => e.term.toLowerCase() === term.toLowerCase())) return;
+    evidenceTerms.push({ term, type });
+  };
+  /* Helper: split compound PT name into individual meaningful words */
+  const splitPtTerms = (s) => {
+    if (!s) return [];
+    const terms = [];
+    /* Split on separators first */
+    s.split(/[-–_/,]/).forEach(chunk => {
+      const t = chunk.trim();
+      if (t.length >= 3) terms.push(t);
+      /* Also split multi-word chunks into individual words ≥3 chars */
+      t.split(/\s+/).forEach(w => { if (w.length >= 3 && w !== t) terms.push(w); });
+    });
+    return terms;
+  };
+  const ptType = ptCanonMatch ? 'confirm' : 'replace';
+  /* PT terms: full name + parts + individual words.
+     MSG137: use resolved display label for evidence, not raw slug */
+  const ptDisplayForEvidence = ptResolved.recommendedDisplay || ptCand;
+  if (pt && pt !== '—') {
+    addEvidence(pt, 'confirm');
+    splitPtTerms(pt).forEach(t => addEvidence(t, 'confirm'));
+  }
+  if (ptDisplayForEvidence) splitPtTerms(ptDisplayForEvidence).forEach(t => addEvidence(t, ptType));
+  /* PT aliases: check which known aliases appear to be relevant */
+  PT_ALIASES.forEach(alias => {
+    const al = alias.toLowerCase();
+    if ((pt && pt.toLowerCase().includes(al)) || (ptCand && ptCand.toLowerCase().includes(al))) {
+      addEvidence(alias, ptType);
+    }
+  });
+  /* Region (MSG132: canonical match → confirm, not replace) */
+  if (rg && rg !== '—') rg.split(',').forEach(r => addEvidence(r.trim(), 'confirm'));
+  if (rgCand && rgCand.length < 30) addEvidence(rgCand, rgMatch ? 'confirm' : 'replace');
+  /* Denomination */
+  if (dn && dn !== '—' && dn.length < 60) addEvidence(dn, 'confirm');
+  if (dnCandTc && !dnMatchTc && dnCandTc.length < 60) addEvidence(dnCandTc, 'replace');
+  if (dnCandTc) {
+    const dnParts = dnCandTc.match(/^dn::(.+?)::(.+)$/i);
+    if (dnParts) addEvidence(dnParts[2], dnMatchTc ? 'confirm' : 'replace');
+  }
+
+  /* Build highlight function — single-pass to avoid nested HTML corruption (MSG103 fix) */
+  function highlightEvidence(text) {
+    if (!text || !evidenceTerms.length) return esc(text);
+    /* Work on raw text, not pre-escaped */
+    const raw = String(text);
+    /* Build combined regex from all terms, longest first */
+    const sorted = [...evidenceTerms].sort((a, b) => b.term.length - a.term.length);
+    const patterns = sorted.map(ev => ev.term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    if (!patterns.length) return esc(text);
+    const combinedRe = new RegExp('(' + patterns.join('|') + ')', 'gi');
+    /* Split text into parts: matched vs unmatched */
+    const parts = raw.split(combinedRe);
+    return parts.map(part => {
+      const ev = sorted.find(e => e.term.toLowerCase() === part.toLowerCase());
+      if (ev) {
+        const style = ev.type === 'confirm'
+          ? 'background:#dcfce7;color:#14532d;padding:0 3px;border-radius:3px;font-weight:600'
+          : 'background:#fef3c7;color:#92400e;padding:0 3px;border-radius:3px;font-weight:600';
+        return '<span style="' + style + '">' + esc(part) + '</span>';
+      }
+      return esc(part);
+    }).join('');
+  }
+
+  const toneStyles = {
+    neutral: 'border:1px solid #d1d5db;background:#fff;color:#1e293b;',
+    green:   'border:1px solid #86efac;background:#f0fdf4;color:#14532d;',
+    yellow:  'border:1px solid #fcd34d;background:#fefce8;color:#713f12;',
+    red:     'border:1px solid #fca5a5;background:#fef2f2;color:#7f1d1d;',
+  };
+  const field = (label, value, tone, helper) => {
+    const ts = toneStyles[tone] || toneStyles.neutral;
+    return `<div style="display:grid;grid-template-columns:160px 1fr;border-bottom:1px solid #e5e7eb;">
+      <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#475569;border-right:1px solid #e5e7eb;">${esc(label)}</div>
+      <div style="padding:8px 12px;">
+        <div style="padding:7px 10px;font-size:14px;border-radius:4px;${ts}">${esc(value)}</div>
+        ${helper || ''}
+      </div>
+    </div>`;
+  };
+  /* Dropdown field — shows real options from popup snapshot (MSG97 + MSG100) */
+  const selectField = (label, currentVal, options, recommended, canonMatch, tone, helper) => {
+    const ts = toneStyles[tone] || toneStyles.neutral;
+    if (!options || !options.length) return field(label, currentVal, tone, helper);
+    const showRec = recommended && !canonMatch;   /* hide recommendation when canonical match */
+    const opts = options.map(o => {
+      const isCurrent = (o.value === currentVal || o.label === currentVal);
+      const isRec = showRec && (o.label.toLowerCase().includes(recommended.toLowerCase()) ||
+        o.value.toLowerCase().includes(recommended.toLowerCase()));
+      const mark = isCurrent && isRec ? ' \u2713 (текущий + рек.)' : isCurrent ? ' \u2713 (текущий)' : isRec ? ' \u2605 (рекомендован)' : '';
+      return `<option value="${esc(o.value)}"${isCurrent ? ' selected' : ''}>${esc(o.label)}${mark}</option>`;
+    }).join('');
+    return `<div style="display:grid;grid-template-columns:160px 1fr;border-bottom:1px solid #e5e7eb;">
+      <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#475569;border-right:1px solid #e5e7eb;">${esc(label)}</div>
+      <div style="padding:8px 12px;">
+        <select style="width:100%;padding:7px 10px;font-size:14px;border-radius:4px;appearance:auto;cursor:pointer;${ts}">${opts}</select>
+        ${showRec ? `<div style="margin-top:2px;font-size:11px;color:#6b7280;">Рекомендация AI: <b>${esc(recommended)}</b></div>` : ''}
+        ${helper || ''}
+      </div>
+    </div>`;
+  };
+
+  /* Available options from popup snapshot (ptOptions already declared above — MSG137) */
+  const dnOptions = b ? (b.denominationOptions || []) : [];
+
+  return `
+    <div style="margin-bottom:12px;border:1px solid #d1d5db;border-radius:12px;overflow:hidden;background:#fff;">
+      <div style="padding:10px 14px;border-bottom:1px solid #e5e7eb;font-size:16px;font-weight:800;color:#1e293b;
+        background:#f8fafc;">Ticket Context</div>
+      <div style="background:#f9fafb;">
+        ${field('Price', (raw.input_card || {}).price || '—', 'neutral')}
+        ${ptOptions.length > 0
+          ? selectField('Product Type', b ? (b.productTypeId || '') : '', ptOptions, ptCand, ptCanonMatch, (ptCand && !ptCanonMatch) ? 'yellow' : 'neutral', ptHelper)
+          : field('Product Type', pt, (ptCand && !ptCanonMatch) ? 'yellow' : 'neutral', ptHelper)}
+        ${field('Product nominal', (raw.input_card || {}).nominal || '—', 'neutral')}
+        ${field('Region', rg, (rgCand && !rgMatch) ? 'yellow' : 'neutral', rgHelper)}
+        ${dnOptions.length > 0
+          ? selectField('Denomination', b ? (b.denominationOptionId || '') : '', dnOptions, dnCandTc, dnMatchTc, (dnCandTc && !dnMatchTc) ? 'yellow' : 'neutral', dnHelper)
+          : field('Denomination', dn, (dnCandTc && !dnMatchTc) ? 'yellow' : 'neutral', dnHelper)}
+        ${field('Currency', (raw.input_card || {}).currency || '—', 'neutral')}
+        <div style="display:grid;grid-template-columns:160px 1fr;border-bottom:1px solid #e5e7eb;">
+          <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#475569;border-right:1px solid #e5e7eb;">Name</div>
+          <div style="padding:8px 12px;">
+            <div style="border:1px solid #93c5fd;background:#eff6ff;padding:7px 10px;
+              font-size:14px;color:#1e293b;border-radius:4px;word-break:break-word;">${highlightEvidence(nm)}</div>
+          </div>
+        </div>
+        ${desc ? `<div style="display:grid;grid-template-columns:160px 1fr;">
+          <div style="padding:8px 12px;font-weight:700;font-size:14px;color:#475569;border-right:1px solid #e5e7eb;">Description</div>
+          <div style="padding:8px 12px;">
+            <div style="border:1px solid #d1d5db;background:#fff;padding:7px 10px;
+              font-size:13px;color:#334155;border-radius:4px;white-space:pre-line;">${highlightEvidence(desc)}</div>
+          </div>
+        </div>` : ''}
+      </div>
+    </div>`;
+}
+
+/* ── AI TRACE / DEBUG BLOCK (MSG74) ──────────────────────────── */
+function renderAiTraceBlock(card, session) {
+  if (!_s.uiTraceOpen) {
+    return `<div style="margin-top:12px;">
+      <button type="button" id="wip01-trace-toggle" style="border:1px solid rgba(255,255,255,.1);
+        border-radius:8px;padding:6px 14px;background:rgba(255,255,255,.04);color:#6b7280;
+        font-size:12px;font-weight:700;cursor:pointer;width:100%;">
+        ▶ AI Trace / Debug</button></div>`;
+  }
+
+  const raw  = card.aiRaw || {};
+  const mods = raw.modules || {};
+  const sel  = raw.selection || {};
+  const inp  = raw.input_card || {};
+  const b    = card.beforeSnapshot;
+  const a    = card.afterSnapshot;
+
+  const trow = (k, v, color) => {
+    const vc = color ? ` style="color:${color};"` : '';
+    return `<tr><td style="padding:2px 8px;color:#6b7280;font-size:11px;white-space:nowrap;vertical-align:top;">${esc(k)}</td>` +
+      `<td${vc} style="padding:2px 8px;font-size:11px;word-break:break-all;">${esc(String(v ?? '—'))}</td></tr>`;
+  };
+  const tsec = (title, rows) =>
+    `<div style="margin-bottom:8px;">
+      <div style="font-size:11px;font-weight:800;color:#60a5fa;margin-bottom:2px;text-transform:uppercase;letter-spacing:.08em;">${esc(title)}</div>
+      <table style="width:100%;border-collapse:collapse;font-family:monospace,monospace;">${rows}</table>
+    </div>`;
+
+  /* A. Input snapshot */
+  const snapPt  = b ? (b.productTypeName || b.productTypeId || '') : '';
+  const snapRg  = b ? ((b.regions || []).map(r => r.name).join(', ')) : '';
+  const snapDn  = b ? (b.denominationLabel || b.denominationOptionId || '') : '';
+  const snapNm  = b ? b.name : card.productName;
+  const snapDesc = b ? (b.description || '').slice(0, 200) : '';
+  const secA = tsec('A. Input Snapshot', [
+    trow('ProductType (raw)', snapPt),
+    trow('Region (raw)', snapRg),
+    trow('Denomination (raw)', snapDn),
+    trow('Name', snapNm),
+    trow('Description', snapDesc + (snapDesc.length >= 200 ? '...' : '')),
+  ].join(''));
+
+  /* B. Normalization */
+  const rgCand = sel.region_candidate_id || '';
+  const rgCurCanon = snapRg ? snapRg.split(',').map(s => canonicalRegion(s.trim())).join(', ') : '—';
+  const rgRecCanon = rgCand ? canonicalRegion(rgCand) : '—';
+  const rgCanonEq = regionsCanonicallyEqual(snapRg, rgCand);
+  const dnCurNorm = norm(snapDn);
+  const dnRecRaw = sel.denomination_candidate_id || '';
+  const dnRecNorm = norm(dnRecRaw);
+  const dnExactEq = dnCurNorm === dnRecNorm;
+  const dnEntityCur = extractDenomEntity(snapDn);
+  const dnEntityRec = extractDenomEntity(dnRecRaw);
+  const dnCanonEq = denominationsCanonicallyEqual(snapDn, dnRecRaw);
+  const secB = tsec('B. Normalization', [
+    trow('Region current → canonical', snapRg + ' → ' + rgCurCanon),
+    trow('Region recommended → canonical', rgCand + ' → ' + rgRecCanon),
+    trow('Region canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
+    trow('Denom current (raw)', snapDn || '—'),
+    trow('Denom recommended (raw)', dnRecRaw || '—'),
+    trow('Denom exact/raw match', String(dnExactEq), dnExactEq ? '#4ade80' : '#fbbf24'),
+    trow('Denom entity current', dnEntityCur || '—'),
+    trow('Denom entity recommended', dnEntityRec || '—'),
+    trow('Denom canonical/entity match', String(dnCanonEq), dnCanonEq ? '#4ade80' : '#f87171'),
+  ].join(''));
+
+  /* C. AI Output */
+  const secC = tsec('C. AI Output', [
+    trow('final_status', raw.final_status || '—'),
+    trow('confidence', raw.confidence != null ? raw.confidence : '—'),
+    trow('reason', raw.reason || '—'),
+    trow('selection.product_type', sel.product_type_candidate_id || '—'),
+    trow('selection.region', sel.region_candidate_id || '—'),
+    trow('selection.denomination', sel.denomination_candidate_id || '—'),
+  ].join(''));
+
+  /* D. Module Statuses */
+  const ptM = mods.product_type || {};
+  const rgM = mods.region || {};
+  const dnM = mods.denomination || {};
+  const mrM = mods.manual_review || {};
+  const secD = tsec('D. Module Statuses', [
+    trow('product_type.status', ptM.status || '—', ptM.status === 'match' ? '#4ade80' : '#fbbf24'),
+    trow('product_type.reason', ptM.reason || '—'),
+    trow('region.status', rgM.status || '—', rgM.status === 'match' ? '#4ade80' : '#fbbf24'),
+    trow('region.reason', rgM.reason || '—'),
+    trow('denomination.status', dnM.status || '—', dnM.status === 'match' ? '#4ade80' : '#fbbf24'),
+    trow('denomination.reason', dnM.reason || '—'),
+    trow('manual_review.status', mrM.status || '—', mrM.status === 'match' ? '#f87171' : '#4ade80'),
+    trow('manual_review.reason', mrM.reason || '—'),
+  ].join(''));
+
+  /* E. Comparison Matrix (MSG137: catalogue-driven PT resolution) */
+  const ptRec = sel.product_type_candidate_id || '';
+  const ptTraceOpts = b ? (b.productTypeOptions || []) : [];
+  const ptTraceName = b ? (b.name || card.productName) : card.productName;
+  const ptTraceRes = resolveProductTypeState(snapPt, ptRec, ptTraceOpts, (mods.product_type || {}).status, ptTraceName);
+  const ptExactEq = norm(snapPt) === norm(ptRec);
+  const ptCanonEq = ptTraceRes.semanticMatch;
+  /* MSG178: brand inference for trace */
+  const rgTraceDesc = b ? (b.description || '') : '';
+  const rgTraceBrand = checkBrandRegionInference(ptTraceName, rgTraceDesc);
+  const secE = tsec('E. Comparison Matrix', [
+    trow('PT current', snapPt),
+    trow('PT recommended (raw)', ptRec || '—'),
+    trow('PT recommended (display)', ptTraceRes.recommendedDisplay || '—'),
+    trow('PT catalogue resolved', String(ptTraceRes.catalogueResolved)),
+    trow('PT canonical current', canonicalProductType(snapPt) || '—'),
+    trow('PT canonical recommended', canonicalProductType(ptTraceRes.recommendedDisplay || ptRec) || '—'),
+    trow('PT exact match', snapPt && ptRec ? String(ptExactEq) : '—', ptExactEq ? '#4ade80' : '#fbbf24'),
+    trow('PT semantic match', snapPt && ptRec ? String(ptCanonEq) : '—', ptCanonEq ? '#4ade80' : '#f87171'),
+    trow('PT identity signals', (ptTraceRes.identitySignals || []).join(', ') || 'none'),
+    trow('PT platform signals', (ptTraceRes.platformSignals || []).join(', ') || 'none'),
+    trow('PT candidate suspect', String(ptTraceRes.candidateSuspect), ptTraceRes.candidateSuspect ? '#f59e0b' : '#4ade80'),
+    trow('PT suspect reason', ptTraceRes.suspectReason || '—'),
+    trow('RG current', snapRg),
+    trow('RG recommended', rgCand || '—'),
+    trow('RG canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
+    trow('RG brand inference', rgTraceBrand.matched ? rgTraceBrand.brand + ' → ' + rgTraceBrand.inferredRegion : 'none',
+      rgTraceBrand.matched ? '#a78bfa' : '#6b7280'),
+    trow('DN current', snapDn),
+    trow('DN recommended', dnRecRaw || '—'),
+    trow('DN exact match', String(dnExactEq), dnExactEq ? '#4ade80' : '#fbbf24'),
+    trow('DN canonical match', String(dnCanonEq), dnCanonEq ? '#4ade80' : '#f87171'),
+    trow('AI verdict (card)', card.aiVerdict || '—'),
+    trow('operator override', card.operatorOverride || 'none'),
+    trow('card.finalColor', card.finalColor, clr(card.finalColor).txt),
+  ].join(''));
+
+  /* F. Iterative Chain Log */
+  const recs = card.recommendations || {};
+  const ptRes = recs.productType || {};
+  const rgRes = recs.region || {};
+  const dnRes = recs.denomination || {};
+  const secF = tsec('F. Iterative Chain', [
+    trow('1. Initial scan', card.aiVerdict || '—'),
+    trow('2. PT apply', ptRes.resolvedDomLabel ? 'applied → ' + ptRes.resolvedDomLabel : (ptRes.status || 'no change')),
+    trow('3. Backend re-call after PT', ptRes.resolvedDomLabel ? 'yes' : 'skipped'),
+    trow('4. Region', rgRes.brandConfirmed
+      ? 'BRAND_WHITELIST: ' + (rgRes.brandFamily || '?') + ' → ' + (rgRes.brandInferredRegion || '?')
+      : (rgRes.status === 'mismatch' || rgRes.status === 'uncertain'
+        ? 'REGION_MANUAL: ' + (rgRes.candidateId || '?')
+        : (rgRes.status || 'no change'))),
+    trow('5. Backend re-call after RG', 'depends on PT change'),
+    trow('6. Denomination', dnRes.resolvedDomLabel ? 'applied → ' + dnRes.resolvedDomLabel : (dnRes.status || 'no change')),
+    trow('7. Final applied', String(card.applied)),
+    trow('8. Final saved', String(card.saved)),
+  ].join(''));
+
+  /* G. Blocking Reasons */
+  const issues = getCardBlockingIssues(card);
+  const msBlock = getModStatusBlockingReason(card);
+  const secG = tsec('G. Blocking Reasons', [
+    trow('save blocking issues', issues.length ? issues.join(', ') : 'none', issues.length ? '#fb923c' : '#4ade80'),
+    trow('isCardSaveReady', String(isCardSaveReady(card)), isCardSaveReady(card) ? '#4ade80' : '#fb923c'),
+    trow('modStatus blocking', msBlock || 'none', msBlock ? '#fb923c' : '#4ade80'),
+    trow('isCardModStatusReady', String(isCardModStatusReady(card))),
+    trow('manuallyConfirmed', String(card.manuallyConfirmed)),
+    trow('applyError', card.applyError || 'none'),
+    trow('scanError', card.scanError || 'none'),
+    trow('saveError', card.saveError || 'none'),
+  ].join(''));
+
+  /* H. Session / Export */
+  const secH = tsec('H. Session / Export', [
+    trow('sessionId', session.sessionId),
+    trow('productId', card.productId),
+    trow('scannedAt', session.scannedAt),
+    trow('applied', String(card.applied)),
+    trow('saved', String(card.saved)),
+    trow('manuallyConfirmed', String(card.manuallyConfirmed)),
+    trow('exportedToSheet', String(card.exportedToSheet)),
+    trow('modStatusApplied', String(card.modStatusApplied)),
+    trow('modStatusNew', card.modStatusNew || '—'),
+  ].join(''));
+
+  /* I. Denomination Apply Debug (MSG121 diagnostic) */
+  const dnDiag = ((card.recommendations || {}).denomination || {}).applyDiag;
+  let secI = '';
+  if (dnDiag) {
+    const optSummary = (dnDiag.options || []).map(o =>
+      o.label + ' → entity:' + (o.entity || 'NONE')
+    ).join('\n');
+    const rootColor = dnDiag.ok ? '#4ade80' : '#f87171';
+    secI = tsec('I. Denom Apply Debug (MSG121)', [
+      trow('timestamp', dnDiag.ts || '—'),
+      trow('candidate raw', dnDiag.candidateRaw || '—'),
+      trow('candidate entity', dnDiag.candidateEntity || '—'),
+      trow('select found', String(dnDiag.selectFound)),
+      trow('option count', String(dnDiag.optionCount)),
+      trow('current raw', dnDiag.currentRaw || '—'),
+      trow('current entity', dnDiag.currentEntity || '—'),
+      trow('current value', dnDiag.currentValue || '—'),
+      trow('already canon equal', String(dnDiag.alreadyCanonEqual)),
+      trow('matched option value', dnDiag.matchedOptionValue || '—'),
+      trow('matched option label', dnDiag.matchedOptionLabel || '—'),
+      trow('matched option entity', dnDiag.matchedOptionEntity || '—'),
+      trow('old select.value', dnDiag.oldSelectValue || '—'),
+      trow('new select.value', dnDiag.newSelectValue || '—'),
+      trow('value changed', String(dnDiag.valueActuallyChanged)),
+      trow('events dispatched', String(dnDiag.eventsDispatched)),
+      trow('value after events', dnDiag.valueAfterEvents || '—'),
+      trow('ROOT CAUSE', dnDiag.rootCause || 'UNKNOWN', rootColor),
+    ].join(''));
+    /* Option list sub-table */
+    if (dnDiag.options.length > 0) {
+      secI += tsec('I.2 Popup Options (entity map)', dnDiag.options.map(o =>
+        trow(o.value, o.label + ' → ' + (o.entity || 'NO_ENTITY'))
+      ).join(''));
+    }
+  } else if (card.applied) {
+    secI = tsec('I. Denom Apply Debug (MSG121)', [
+      trow('status', 'no diagnostic captured (denomination apply was not triggered or candidateId was empty)'),
+    ].join(''));
+  }
+
+  /* J. Alias Snapshot (MSG173: CDN delivery) */
+  const srcColor = _aliasState.source === 'live_cdn_snapshot' ? '#4ade80'
+    : _aliasState.source === 'embedded_fallback' ? '#fbbf24' : '#f87171';
+  const statusColor = _aliasState.status === 'LIVE_OK' ? '#4ade80'
+    : _aliasState.status === 'FALLBACK_USED' ? '#fbbf24' : '#f87171';
+  const secJ = tsec('J. Alias Snapshot (MSG173)', [
+    trow('source', _aliasState.source, srcColor),
+    trow('transport', _aliasState.transport || 'none'),
+    trow('status', _aliasState.status || '—', statusColor),
+    trow('version', _aliasState.version || '—'),
+    trow('updated_at', _aliasState.updatedAt || '—'),
+    trow('row_count', String(_aliasState.rowCount)),
+    trow('loaded', String(_aliasState.loaded), _aliasState.loaded ? '#4ade80' : '#f87171'),
+    trow('region aliases', String(Object.keys(_aliasState.regionMap).length)),
+    trow('pt aliases', String(_aliasState.ptAliases.length)),
+    trow('error', _aliasState.error || 'none', _aliasState.error ? '#f87171' : '#4ade80'),
+  ].join(''));
+
+  return `<div style="margin-top:12px;">
+    <button type="button" id="wip01-trace-toggle" style="border:1px solid rgba(255,255,255,.15);
+      border-radius:8px;padding:6px 14px;background:rgba(99,102,241,.1);color:#a5b4fc;
+      font-size:12px;font-weight:700;cursor:pointer;width:100%;">
+      ▼ AI Trace / Debug</button>
+    <div style="margin-top:6px;padding:12px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.08);
+      border-radius:10px;max-height:500px;overflow-y:auto;">
+      ${secA}${secB}${secC}${secD}${secE}${secF}${secG}${secH}${secI}${secJ}
+    </div>
+  </div>`;
+}
+
+function renderDetailPanel(session) {
+  const detail = $('wip01-detail');
+  if (!detail) return;
+
+  /* Phase guard: don't render results if we're still in startup/scanning */
+  if (_s.uiPhase === 'scanning') return;   /* progress handler owns right panel */
+  if (_s.uiPhase === 'startup') {
+    detail.innerHTML = '<div style="color:#6b7280;padding:24px;text-align:center;">Нажмите «Начать проверку» для запуска.</div>';
+    return;
+  }
+  if (_s.uiPhase === 'empty') {
+    detail.innerHTML = '<div style="color:#6b7280;padding:24px;text-align:center;">Нет результатов для отображения.</div>';
+    return;
+  }
+
+  /* Phase = results: find active card with fallback to first */
+  let card = session.cards.find(c => c.productId === _s.uiSelectedId);
+  if (!card && session.cards.length > 0) {
+    card = session.cards[0];
+    _s.uiSelectedId = card.productId;
+  }
+  if (!card) {
+    _s.uiPhase = 'empty';
+    detail.innerHTML = '<div style="color:#6b7280;padding:24px;text-align:center;">Нет результатов для отображения.</div>';
+    return;
+  }
+  const c   = clr(card.finalColor);
+  const raw = card.aiRaw || {};
+  const mods = raw.modules || {};
+  const sel  = raw.selection || {};
+  const recs = card.recommendations || {};
+  const b = card.beforeSnapshot, a = card.afterSnapshot;
+  const pt2  = s => s ? (s.productTypeName || s.productTypeId || '—') : '—';
+  const reg2 = s => s ? ((s.regions || []).map(r => r.name).join(', ') || '—') : '—';
+  const den2 = s => s ? (s.denominationLabel || s.denominationOptionId || '—') : '—';
+
+  /* Ticket Context form block (above analysis) */
+  const ticketCtx = renderTicketContext(card);
+
+  /* ── Compute child block statuses FIRST, then aggregate for Block 1 ── */
+
+  /* Block 2: Manual Review Words */
+  const mrMod = mods.manual_review || {};
+  const mrStatus = mrMod.status === 'match' ? 'red' : 'green';
+  const sec2 = renderDetailSection('Manual Review Words', 2, mrStatus, [
+    { label: 'Статус', value: mrMod.status === 'match' ? 'Найдены стоп-слова' : 'Стоп-слова не найдены.' },
+    { label: 'Источник', value: 'manual_review_words' },
+    { label: 'Совпадения', value: mrMod.reason || 'не найдено' },
+  ]);
+
+  /* Block 3: ProductType (MSG84 + MSG137 catalogue-driven) */
+  const ptMod = mods.product_type || {};
+  const ptCand3 = sel.product_type_candidate_id || '';
+  const ptCur3 = pt2(b);
+  const ptOpts3 = b ? (b.productTypeOptions || []) : [];
+  const ptName3 = b ? (b.name || card.productName) : card.productName;
+  const ptRes3 = resolveProductTypeState(ptCur3, ptCand3, ptOpts3, ptMod.status, ptName3);
+  const ptStatus = ptRes3.uiStatus;
+  const ptMatchLabel = ptRes3.semanticMatch
+    ? (ptRes3.catalogueResolved ? '(catalogue match)' : '(canonical match)')
+    : '';
+  let ptAction3;
+  if (ptRes3.semanticMatch) {
+    ptAction3 = `ProductType подтверждён ${ptMatchLabel}.`;
+  } else if (ptRes3.candidateSuspect) {
+    ptAction3 = 'AI candidate может быть ложным (platform keyword). Требуется ручная проверка.';
+  } else {
+    ptAction3 = ptMod.reason || '—';
+  }
+  const sec3 = renderDetailSection('ProductType', 3, ptStatus, [
+    { label: 'Текущий', value: ptCur3 },
+    { label: 'Рекомендованный', html: esc(ptRes3.recommendedDisplay || ptCur3) +
+      (ptRes3.semanticMatch && ptCand3 ? ` <span style="color:#4ade80;font-size:11px;">${ptMatchLabel}</span>` : '') +
+      (ptRes3.candidateSuspect ? ' <span style="color:#f59e0b;font-size:11px;">(suspect — platform keyword)</span>' : '') },
+    { label: 'Действие', value: ptAction3 },
+    { label: 'Источник', value: 'catalogue' },
+  ]);
+
+  /* Block 4: Регион (MSG70 + MSG135 + MSG178: brand inference whitelist) */
+  const rgMod = mods.region || {};
+  const rgCand2 = sel.region_candidate_id || '';
+  const rgCurrent = reg2(b);
+  const rgCanonMatch = regionsCanonicallyEqual(rgCurrent, rgCand2);
+  const rgTextConfirmed = rgMod.status === 'match';
+  const rgUncertain = rgMod.status === 'uncertain';
+  /* MSG178: brand → region inference check */
+  const rgProductName = b ? (b.name || card.productName) : card.productName;
+  const rgProductDesc = b ? (b.description || '') : '';
+  const rgBrandInf = checkBrandRegionInference(rgProductName, rgProductDesc);
+  /* Brand inference is valid when: brand matches, inferred region matches candidate or current,
+     and there is no explicit contradicting region signal from another country */
+  const rgBrandConfirms = rgBrandInf.matched &&
+    (regionsCanonicallyEqual(rgCurrent, rgBrandInf.inferredRegion) ||
+     regionsCanonicallyEqual(rgCand2, rgBrandInf.inferredRegion));
+  let rgStatus;
+  let rgSource = 'uncertain';  /* explicit_text | brand_region_whitelist | canonical_alias | uncertain */
+  if (rgCanonMatch && rgTextConfirmed) {
+    rgStatus = 'green'; rgSource = 'explicit_text';
+  } else if (rgBrandConfirms && rgCanonMatch) {
+    rgStatus = 'green'; rgSource = 'brand_region_whitelist';
+  } else if (rgBrandConfirms && rgUncertain) {
+    rgStatus = 'green'; rgSource = 'brand_region_whitelist';
+  } else if (rgCanonMatch && rgUncertain) {
+    rgStatus = 'yellow'; rgSource = 'canonical_alias';
+  } else if (rgCanonMatch && !rgUncertain) {
+    rgStatus = 'green'; rgSource = 'canonical_alias';
+  } else if (rgTextConfirmed) {
+    rgStatus = 'green'; rgSource = 'explicit_text';
+  } else if (rgMod.status === 'mismatch') {
+    rgStatus = 'red';
+  } else {
+    rgStatus = 'yellow';
+  }
+  /* Hints */
+  let rgHints = '';
+  if (rgCand2 && !rgCanonMatch && !rgBrandConfirms) {
+    rgHints = `<div style="margin-top:4px;font-size:12px;color:#fbbf24;">В name найден другой регион: <b>${esc(rgCand2)}</b></div>` +
+              `<div style="font-size:12px;color:#fbbf24;">В таблице есть регион: <b>${esc(rgCand2)}</b></div>`;
+  } else if (rgCanonMatch && rgUncertain && !rgBrandConfirms) {
+    rgHints = `<div style="margin-top:4px;font-size:12px;color:#fbbf24;">Canonical match, но seller text не подтверждает регион. Автоподтверждение запрещено.</div>`;
+  }
+  let rgAction;
+  if (rgSource === 'explicit_text') {
+    rgAction = 'Регион подтверждён (text evidence' + (rgCanonMatch ? ' + canonical match' : '') + ').';
+  } else if (rgSource === 'brand_region_whitelist') {
+    rgAction = 'Регион подтверждён правилом brand → region whitelist: ' + rgBrandInf.brand + ' → ' + rgBrandInf.inferredRegion + '.';
+  } else if (rgSource === 'canonical_alias' && rgStatus === 'green') {
+    rgAction = 'Регион подтверждён (canonical match).';
+  } else if (rgSource === 'canonical_alias' && rgStatus === 'yellow') {
+    rgAction = rgMod.reason || 'Canonical match, но seller text не подтверждает. Требуется ручная проверка.';
+  } else {
+    rgAction = rgMod.reason || '—';
+  }
+  const rgSourceLabel = rgSource === 'brand_region_whitelist'
+    ? ` <span style="color:#a78bfa;font-size:11px;">(brand whitelist: ${esc(rgBrandInf.brand)} → ${esc(rgBrandInf.inferredRegion)})</span>`
+    : (rgCanonMatch && rgCand2 ? ' <span style="color:#4ade80;font-size:11px;">(canonical match)</span>' : '');
+  const sec4 = renderDetailSection('Регион', 4, rgStatus, [
+    { label: 'Текущий', value: rgCurrent },
+    { label: 'Рекомендованный', html: esc(rgCand2 || '—') + rgSourceLabel + rgHints },
+    { label: 'Действие', value: rgAction },
+    { label: 'Источник', value: rgSource === 'brand_region_whitelist' ? 'brand whitelist' : 'catalogue' },
+  ]);
+
+  /* Block 5: Denomination (MSG87 + MSG135: text-evidence gate)
+     Rules (see LIST_CHECK_STATUS_RULES_REGISTRY):
+       green   = recommended found AND current canonically equals recommended AND text evidence confirmed
+       yellow  = recommended found but current differs OR text evidence missing OR region unconfirmed
+       red     = explicit mismatch / no valid candidate
+       neutral = ONLY if no recommended candidate exists at all */
+  const dnMod = mods.denomination || {};
+  const dnCand = sel.denomination_candidate_id || '';
+  const dnCurrent = den2(b);
+  const dnCanonMatch = denominationsCanonicallyEqual(dnCurrent, dnCand);
+  /* MSG135: text-evidence gate for denomination */
+  const dnTextConfirmed = dnMod.status === 'match';
+  const dnUncertain = dnMod.status === 'uncertain';
+  /* MSG135 + MSG178: denomination depends on resolved region status, not raw module status.
+     Brand inference can resolve region to green even when module says uncertain. */
+  const dnRegionBlocked = rgStatus === 'yellow' || rgStatus === 'red';
+  let dnStatus;
+  if (dnCand && dnCanonMatch && dnTextConfirmed && !dnRegionBlocked) {
+    dnStatus = 'green';                      /* canonical + text evidence + region OK */
+  } else if (dnCand && dnCanonMatch && (dnUncertain || dnRegionBlocked)) {
+    dnStatus = 'yellow';                     /* canonical OK but evidence missing or region blocked */
+  } else if (dnCand && dnCanonMatch) {
+    dnStatus = 'green';                      /* canonical match, no uncertainty flags */
+  } else if (dnCand && !dnCanonMatch) {
+    dnStatus = 'yellow';                     /* recommended found, current differs → apply needed */
+  } else if (dnMod.status === 'mismatch') {
+    dnStatus = 'red';                        /* explicit conflict */
+  } else if (!dnCand && dnTextConfirmed) {
+    dnStatus = 'green';                      /* match without specific candidate (backend confirmed) */
+  } else if (!dnCand) {
+    dnStatus = 'gray';                       /* no candidate, no conflict → truly neutral */
+  } else {
+    dnStatus = 'yellow';                     /* fallback: candidate exists → needs review */
+  }
+  let dnAction;
+  if (dnStatus === 'green') {
+    dnAction = dnMod.reason || 'Denomination подтверждён.';
+  } else if (dnCanonMatch && dnRegionBlocked) {
+    dnAction = 'Denomination совпадает с candidate, но регион не подтверждён seller text. Автоподтверждение denomination заблокировано.';
+  } else if (dnCanonMatch && dnUncertain) {
+    dnAction = dnMod.reason || 'Denomination совпадает с candidate, но text evidence отсутствует. Требуется ручная проверка.';
+  } else if (dnStatus === 'yellow') {
+    dnAction = 'Рекомендованный denomination найден, но текущее значение в карточке отличается. Нужно применить замену.';
+  } else if (dnStatus === 'red') {
+    dnAction = dnMod.reason || 'Конфликт denomination.';
+  } else {
+    dnAction = dnMod.reason || '—';
+  }
+  const sec5 = renderDetailSection('Denomination', 5, dnStatus, [
+    { label: 'Текущий', value: dnCurrent },
+    { label: 'Режим', value: dnMod.mode || 'numeric' },
+    { label: 'Рекомендованный', value: dnCand || dnCurrent },
+    { label: 'Действие', value: dnAction },
+    { label: 'Источник', value: 'catalogue' },
+  ]);
+
+  /* Block 1: Итоговый результат (aggregated from child blocks — MSG77) */
+  const childStatuses = [mrStatus, ptStatus, rgStatus, dnStatus];
+  const hasRed    = childStatuses.includes('red');
+  const hasYellow = childStatuses.includes('yellow');
+  const aggStatus = hasRed ? 'red' : hasYellow ? 'yellow' : 'green';
+  const aggC = clr(aggStatus);
+  const aggAction = aggStatus === 'green' ? 'можно сохранить без ручной проверки'
+    : aggStatus === 'red' ? 'отклонить или исправить вручную'
+    : 'проверить рекомендации и применить';
+  const sec1 = renderDetailSection('Итоговый результат', 1, aggStatus, [
+    { label: 'Название', value: card.productName },
+    { label: 'Итоговый статус', value: aggC.label },
+    { label: 'Главная причина', value: card.aiReason || '—' },
+    { label: 'Необходимо', value: aggAction },
+  ]);
+
+  /* Block 6: State badges + errors + manual confirm */
+  const blockIssues = getCardBlockingIssues(card);
+  let stateHtml = '<div style="margin-top:8px;">';
+  if (card.applied) stateHtml += '<span style="background:rgba(99,102,241,.25);color:#a5b4fc;padding:3px 8px;border-radius:6px;font-size:12px;margin-right:4px;">Applied</span>';
+  if (card.saved) stateHtml += '<span style="background:rgba(34,197,94,.2);color:#4ade80;padding:3px 8px;border-radius:6px;font-size:12px;margin-right:4px;">Saved</span>';
+  if (card.exportedToSheet) stateHtml += '<span style="background:rgba(56,189,248,.2);color:#38bdf8;padding:3px 8px;border-radius:6px;font-size:12px;margin-right:4px;">В таблице</span>';
+  if (card.modStatusApplied) stateHtml += '<span style="background:rgba(245,158,11,.2);color:#fcd34d;padding:3px 8px;border-radius:6px;font-size:12px;">MS:' + esc(card.modStatusNew || '?') + '</span>';
+  if (card.manuallyConfirmed) stateHtml += '<div style="color:#4ade80;margin-top:6px;font-size:12px;">✓ Ручные правки подтверждены</div>';
+  if (card.scanError) stateHtml += '<div style="color:#f87171;margin-top:4px;font-size:12px;">⚠ scan: ' + esc(card.scanError) + '</div>';
+  if (card.applyError) stateHtml += '<div style="color:#fb923c;margin-top:4px;font-size:12px;">⚠ apply: ' + esc(card.applyError) + '</div>';
+  if (card.saveError) stateHtml += '<div style="color:#f87171;margin-top:4px;font-size:12px;">⚠ save: ' + esc(card.saveError) + '</div>';
+  if (blockIssues.length > 0 && !card.manuallyConfirmed) {
+    stateHtml += `<div style="margin-top:8px;">
+      <button type="button" data-confirm-detail="${esc(card.productId)}" style="border:none;border-radius:8px;
+        padding:8px 16px;background:#d97706;color:#fff;font-size:13px;font-weight:700;cursor:pointer;">
+        Подтвердить ручные правки</button>
+      <span style="font-size:11px;color:#9ca3af;margin-left:8px;">Исправьте поля в popup, затем нажмите</span>
+    </div>`;
+  }
+  stateHtml += '</div>';
+
+  /* Color override */
+  const ovHtml = ['green','yellow','red'].map(col => {
+    const active = card.operatorOverride === col;
+    return `<button type="button" data-ov-detail="${col}" style="border:none;border-radius:6px;padding:4px 10px;
+      cursor:pointer;font-size:14px;opacity:${active ? '1' : '.35'};
+      background:${active ? 'rgba(255,255,255,.15)' : 'transparent'};">${clr(col).badge}</button>`;
+  }).join('');
+
+  detail.innerHTML = `
+    <div style="border:1px solid rgba(255,255,255,.1);border-radius:20px;background:#021132;overflow:hidden;">
+      <div style="padding:16px 20px;border-bottom:1px solid rgba(255,255,255,.1);">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+          <div>
+            <div style="font-size:11px;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.15em;">Detail View</div>
+            <div style="font-size:20px;font-weight:800;margin-top:2px;">${esc(card.productName)}</div>
+            <div style="font-size:12px;color:rgba(255,255,255,.5);margin-top:3px;">ID ${esc(card.productId)} · ${esc(card.aiReason || '')}</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="display:inline-flex;align-items:center;gap:5px;border:1px solid ${c.border};
+              background:${c.bg};color:${c.txt};padding:4px 12px;border-radius:14px;font-size:13px;font-weight:700;">
+              ${c.badge} ${c.label}</span>
+            <div style="display:flex;gap:2px;">${ovHtml}</div>
+          </div>
+        </div>
+      </div>
+      <div style="padding:14px 18px;">
+        ${ticketCtx}
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          <div style="grid-column:1/-1;">${sec1}</div>
+          ${sec2}
+          ${sec3}
+          ${sec4}
+          ${sec5}
+        </div>
+        ${stateHtml}
+        ${renderAiTraceBlock(card, session)}
+      </div>
+    </div>`;
+
+  /* Bind trace toggle */
+  const traceToggle = $('wip01-trace-toggle');
+  if (traceToggle) traceToggle.onclick = () => {
+    _s.uiTraceOpen = !_s.uiTraceOpen;
+    renderDetailPanel(session);
+  };
+
+  /* Bind detail-level buttons */
+  $$('[data-confirm-detail]').forEach(btn => {
+    btn.onclick = async () => {
+      btn.disabled = true; btn.textContent = 'Проверяю popup...';
+      try { await confirmManualFixes(card); } catch (e) {
+        card.saveError = (card.saveError ? card.saveError + '; ' : '') + (e.message || String(e));
+      }
+      renderCardList(session); renderDetailPanel(session);
+    };
+  });
+  $$('[data-ov-detail]').forEach(btn => {
+    btn.onclick = () => {
+      const col = btn.dataset.ovDetail;
+      card.operatorOverride = (card.operatorOverride === col) ? null : col;
+      rebuildSummary(session); renderCardList(session); renderDetailPanel(session);
+      renderActionBar(session);
+    };
+  });
+}
+
+/* ── TOP ACTION BAR ─────────────────────────────────────────── */
+function renderActionBar(session) {
+  const all   = session.cards;
+  const sel   = _s.uiSelectedId ? all.find(c => c.productId === _s.uiSelectedId) : null;
+  const yellows     = all.filter(c => c.finalColor === 'yellow' || c.finalColor === 'red');
+  const applyable   = all.filter(c => (c.finalColor === 'yellow' || c.finalColor === 'red') && !c.applied);
+  const saveReady   = all.filter(c => isCardSaveReady(c));
+  const yellowRedForSheet = all.filter(c => (c.finalColor === 'yellow' || c.finalColor === 'red') && !c.exportedToSheet);
+
+  const btn = (id, label, enabled, bg, col) =>
+    `<button type="button" id="${id}" ${enabled ? '' : 'disabled'} style="border:none;border-radius:10px;
+      padding:8px 14px;font-size:12px;font-weight:700;cursor:${enabled ? 'pointer' : 'default'};
+      background:${enabled ? bg : 'rgba(255,255,255,.05)'};color:${enabled ? col : '#4b5563'};
+      transition:background .15s;">${label}</button>`;
+
+  $('wip01-actions').innerHTML = [
+    btn('wip01-apply1', 'Применить рекомендации', !!sel && !sel.applied && sel.recommendations, 'rgba(56,189,248,.15)', '#38bdf8'),
+    btn('wip01-applyAll', 'Применить для всех', applyable.length > 0, 'rgba(56,189,248,.08)', '#7dd3fc'),
+    btn('wip01-save', 'Сохранить изменения', saveReady.length > 0, 'rgba(34,197,94,.15)', '#4ade80'),
+    btn('wip01-sheet1', 'В таблицу', !!sel, 'rgba(99,102,241,.15)', '#a5b4fc'),
+    btn('wip01-sheetAll', 'В таблицу всё', yellowRedForSheet.length > 0, 'rgba(99,102,241,.08)', '#c4b5fd'),
+    btn('wip01-ms', 'Mod Status', all.length > 0, 'rgba(168,85,247,.15)', '#c084fc'),
+    /* MSG221: test harness popup button */
+    btn('wip01-test-popup', _s.testMode ? ('🔗 Popup ' + (_s.workerWin && !_s.workerWin.closed ? '✓' : '✗')) : '🧪 Test Popup', true, 'rgba(251,191,36,.12)', '#fbbf24'),
+  ].join('');
+
+  /* Bind */
+  const b = id => $(id);
+
+  /* Применить рекомендации — одна выбранная карточка (MSG89: always use fresh sel) */
+  const a1 = b('wip01-apply1');
+  if (a1 && !a1.disabled) a1.onclick = async () => {
+    const freshSel = _s.uiSelectedId ? all.find(c => c.productId === _s.uiSelectedId) : null;
+    if (!freshSel) return;
+    if (freshSel.applied) { renderActionBar(session); return; }
+    a1.disabled = true; a1.textContent = 'Применяю...';
+    /* MSG221: reuse existing popup if available, only force new if truly no popup */
+    _s.isFirstCard = !(_s.workerWin && !_s.workerWin.closed);
+    const snapBefore = freshSel.afterSnapshot || freshSel.beforeSnapshot;
+    try { await applyRecommendations(freshSel); } catch (e) {
+      freshSel.applyError = (freshSel.applyError ? freshSel.applyError + '; ' : '') + (e.message || String(e));
+    }
+    /* Verify that something actually changed (MSG123: consistent applied state) */
+    const snapAfter = freshSel.afterSnapshot;
+    if (snapBefore && snapAfter) {
+      const ptChanged2 = (snapBefore.productTypeId !== snapAfter.productTypeId);
+      const rgChanged2 = JSON.stringify((snapBefore.regions||[]).map(r=>r.id).sort()) !== JSON.stringify((snapAfter.regions||[]).map(r=>r.id).sort());
+      const dnChanged2 = (snapBefore.denominationOptionId !== snapAfter.denominationOptionId);
+      const dnAlready2 = ((freshSel.recommendations || {}).denomination || {}).alreadyMatched === true;
+      if (!ptChanged2 && !rgChanged2 && !dnChanged2 && !dnAlready2 && !freshSel.applyError) {
+        freshSel.applyError = (freshSel.applyError ? freshSel.applyError + '; ' : '') +
+          'APPLY_NO_CHANGE: Popup открыт, но ни одно поле не изменилось. Проверьте рекомендации вручную.';
+      }
+    }
+    /* MSG123 ACTION 2: APPLY_NO_CHANGE + applied=true is inconsistent */
+    if (freshSel.applyError && freshSel.applyError.includes('APPLY_NO_CHANGE')) {
+      freshSel.applied = false;
+    }
+    /* MSG221: test harness trace */
+    if (_s.testMode) {
+      updateTestPopupState();
+      const _dnDiag = ((freshSel.recommendations || {}).denomination || {}).applyDiag || {};
+      console.log('[TEST-HARNESS] apply done | card=' + freshSel.productId +
+        ' | applied=' + freshSel.applied +
+        ' | saveReady=' + isCardSaveReady(freshSel) +
+        ' | ptOld=' + (snapBefore ? snapBefore.productTypeId : 'N/A') +
+        ' | ptNew=' + (snapAfter ? snapAfter.productTypeId : 'N/A') +
+        ' | dnOld=' + (snapBefore ? snapBefore.denominationOptionId : 'N/A') +
+        ' | dnNew=' + (snapAfter ? snapAfter.denominationOptionId : 'N/A') +
+        ' | dnDiag.rootCause=' + (_dnDiag.rootCause || 'N/A') +
+        ' | dnDiag.oldVal=' + (_dnDiag.oldSelectValue || 'N/A') +
+        ' | dnDiag.newVal=' + (_dnDiag.newSelectValue || 'N/A') +
+        ' | dnDiag.changed=' + (_dnDiag.valueActuallyChanged || false) +
+        ' | applyError=' + (freshSel.applyError || 'none') +
+        ' | popupStatus=' + JSON.stringify(testPopupStatus()));
+    }
+    renderCardList(session); renderDetailPanel(session); renderActionBar(session);
+  };
+
+  /* Применить для всех */
+  const aa = b('wip01-applyAll');
+  if (aa && !aa.disabled) aa.onclick = async () => {
+    aa.disabled = true; aa.textContent = 'Применяю...';
+    _s.isFirstCard = true;
+    for (const card of applyable) {
+      if (_s.aborted) break;
+      try { await applyRecommendations(card); } catch (e) {
+        card.applyError = (card.applyError ? card.applyError + '; ' : '') + (e.message || String(e));
+      }
+      renderCardList(session);
+      await wait(150);
+    }
+    renderCardList(session); renderDetailPanel(session); renderActionBar(session);
+  };
+
+  /* Сохранить изменения */
+  const sv = b('wip01-save');
+  if (sv && !sv.disabled) sv.onclick = async () => {
+    sv.disabled = true; sv.textContent = 'Сохраняю...';
+    _s.isFirstCard = true;
+    for (const card of saveReady) {
+      if (_s.aborted) break;
+      if (!isCardSaveReady(card)) {
+        card.saveError = 'SAVE_BLOCKED: ' + (getCardBlockingIssues(card).join(', ') || 'not ready');
+        continue;
+      }
+      try { await saveCard(card); } catch (e) { card.saveError = e.message || String(e); }
+      renderCardList(session);
+      await wait(300);
+    }
+    renderCardList(session); renderDetailPanel(session); renderActionBar(session);
+  };
+
+  /* В таблицу — одна карточка */
+  const s1 = b('wip01-sheet1');
+  if (s1 && !s1.disabled) s1.onclick = async () => {
+    if (!sel) return;
+    await exportToSheet(session, [sel]);
+    renderCardList(session); renderDetailPanel(session); renderActionBar(session);
+  };
+
+  /* В таблицу всё — yellow + red */
+  const sa = b('wip01-sheetAll');
+  if (sa && !sa.disabled) sa.onclick = async () => {
+    await exportToSheet(session, yellowRedForSheet);
+    renderCardList(session); renderDetailPanel(session); renderActionBar(session);
+  };
+
+  /* Mod Status */
+  const ms = b('wip01-ms');
+  if (ms && !ms.disabled) ms.onclick = async () => {
+    /* Yellow → send to sheet (no mod status change), green → published, red → rejected */
+    const yellowCards = all.filter(c => c.finalColor === 'yellow' && !c.exportedToSheet);
+    if (yellowCards.length > 0) {
+      await exportToSheet(session, yellowCards);
+    }
+    for (const card of all) {
+      if (_s.aborted) break;
+      const rule = getModStatusRule(card.finalColor);
+      if (!rule || rule.modStatus === 'no_change') continue;
+      if (card.modStatusApplied) continue;
+      try { await applyModStatus(card); } catch (e) {
+        card.saveError = (card.saveError ? card.saveError + '; ' : '') + 'modStatus: ' + (e.message || String(e));
+      }
+      renderCardList(session);
+      await wait(200);
+    }
+    renderCardList(session); renderDetailPanel(session); renderActionBar(session);
+  };
+
+  /* MSG221: Test Popup harness button — MUST use onclick (not async) for user gesture */
+  const tp = b('wip01-test-popup');
+  if (tp) tp.onclick = () => {
+    const w = openTestPopup();
+    if (w) {
+      /* wait for popup to load, then update state */
+      setTimeout(() => {
+        updateTestPopupState();
+        console.log('[TEST-HARNESS] status after open | ' + JSON.stringify(testPopupStatus()));
+        renderActionBar(session);
+      }, 3000);
+    } else {
+      alert('Popup заблокирован браузером. Разрешите popup для этого сайта.');
+    }
+  };
+}
+
+/* ── FULL DASHBOARD RENDER ──────────────────────────────────── */
+function renderDashboard(session) {
+  renderCardList(session);
+  renderDetailPanel(session);
+  renderActionBar(session);
+}
+
+/* ── MAIN ────────────────────────────────────────────────────── */
+async function main() {
+  /* MSG158: load alias snapshot before anything else */
+  await loadAliasSnapshot();
+
+  const items   = scanUnderReviewRows();
+  const session = makeBatchSession(items.length);
+  _s.session    = session;
+  _s.uiSelectedId = null;
+
+  renderOverlay();
+
+  /* MSG129: doScan now accepts an array of selected items, not a count */
+  async function doScan(selectedItems) {
+    _s.aborted = false;
+    _s.uiPhase = 'scanning';
+    const toScan = selectedItems && selectedItems.length > 0 ? selectedItems : items;
+    session.summary.totalFound = toScan.length;
+    renderProgress(0, toScan.length, null);
+
+    await runScan(toScan, session, (done, total, card) => {
+      renderProgress(done, total, card);
+    });
+
+    /* ── PHASE TRANSITION: scanning → results/empty ── */
+    if (session.cards.length > 0) {
+      _s.uiSelectedId = session.cards[0].productId;
+      _s.uiPhase = 'results';
+    } else {
+      _s.uiPhase = 'empty';
+    }
+    renderDashboard(session);
+  }
+
+  renderStartup(items, doScan);
+}
+
+/* ── CARD MODE (STARTUP-ROUTER-01) ──────────────────────────────
+   Single-card review on /xdm/product/update?id=N page.
+   Reads current card fields, calls backend, shows inline result.
+   Additive path — does not touch list-mode logic. */
+async function mainCard() {
+  await loadAliasSnapshot();
+
+  const productId = new URLSearchParams(location.search).get('id') || '';
+  const nameEl    = document.querySelector('#product-form input[name="Product[name]"], #product-form [name="Product[name]"]');
+  const descEl    = document.querySelector('#product-form textarea[name="Product[description]"], #product-form [name="Product[description]"]');
+  const ptEl      = document.querySelector('#Product_product_type_id');
+  const denomEl   = document.querySelector('#denomination-select');
+
+  const productName = nameEl ? nameEl.value : '';
+  const description = descEl ? descEl.value : '';
+  const ptOption    = ptEl ? ptEl.options[ptEl.selectedIndex] : null;
+  const ptText      = ptOption ? ptOption.text : '';
+
+  /* Collect current regions from region container */
+  const regionEls   = document.querySelectorAll('#region-container .region-item, #region-container span');
+  const regionParts = [];
+  regionEls.forEach(el => {
+    const t = norm(el.textContent);
+    if (t && t !== '+' && t !== 'x') regionParts.push(t);
+  });
+  const regionText = regionParts.join(', ') || '';
+
+  const denomOption = denomEl ? denomEl.options[denomEl.selectedIndex] : null;
+  const denomText   = denomOption ? denomOption.text : '';
+
+  /* Build payload matching backend /review contract */
+  const payload = {
+    product_id:  productId,
+    name:        productName,
+    description: description,
+    current: {
+      product_type: ptText,
+      region:       regionText,
+      denomination: denomText,
+    },
+    mode: 'card',
+  };
+
+  /* Create minimal inline UI */
+  let container = document.getElementById('bsv-card-review-result');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'bsv-card-review-result';
+    container.style.cssText = 'margin:12px 0;padding:12px;border:2px solid #60a5fa;border-radius:8px;background:#f0f9ff;font-family:system-ui,sans-serif;font-size:13px;';
+    const form = document.querySelector('#product-form');
+    if (form) form.parentNode.insertBefore(container, form);
+    else document.body.prepend(container);
+  }
+  container.innerHTML = '<b>BSV AI Review:</b> Проверка… ⏳';
+
+  try {
+    const resp = await fetch(BACKEND_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(BACKEND_TIMEOUT),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+
+    const status = (data.final_status || 'unknown').toLowerCase();
+    const colors = { approve: '#22c55e', review: '#eab308', reject: '#ef4444' };
+    const labels = { approve: 'ОДОБРЕНО', review: 'ТРЕБУЕТСЯ ПРОВЕРКА', reject: 'ОТКЛОНЕНО' };
+    const color  = colors[status] || '#9ca3af';
+    const label  = labels[status] || status.toUpperCase();
+
+    let html = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
+      + '<b>BSV AI Review:</b>'
+      + '<span style="display:inline-block;padding:2px 10px;border-radius:4px;background:' + color + ';color:#fff;font-weight:600;">' + esc(label) + '</span>'
+      + '</div>';
+
+    /* Module details */
+    const modules = data.modules || {};
+    for (const key of ['manual_review', 'product_type', 'region', 'denomination']) {
+      const mod = modules[key];
+      if (!mod) continue;
+      const mStatus = mod.status || '';
+      const mColor  = mStatus === 'match' ? '#22c55e' : mStatus === 'mismatch' ? '#ef4444' : '#eab308';
+      html += '<div style="margin:2px 0;"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + mColor + ';margin-right:4px;"></span>'
+        + '<b>' + esc(key) + ':</b> ' + esc(mStatus);
+      if (mod.recommended) html += ' → рек.: ' + esc(mod.recommended);
+      html += '</div>';
+    }
+
+    container.innerHTML = html;
+  } catch (err) {
+    container.innerHTML = '<b>BSV AI Review:</b> <span style="color:#ef4444;">Ошибка: ' + esc(err.message || String(err)) + '</span>';
+  }
+}
+
+/* ── STARTUP ROUTER (STARTUP-ROUTER-01) ─────────────────────── */
+if (_pageContext === 'list') {
+  main().catch(e => {
+    console.error('[BSV WIP01]', e);
+    const d = $('wip01-detail');
+    if (d) d.innerHTML = '<div style="color:#f87171;padding:16px;">Критическая ошибка: ' + esc(e.message || String(e)) + '</div>';
+  });
+} else if (_pageContext === 'card') {
+  mainCard().catch(e => {
+    console.error('[BSV WIP01 CARD]', e);
+    alert('BSV Card Review: ошибка — ' + (e.message || String(e)));
+  });
+}
+
+})();
