@@ -660,12 +660,13 @@ const PT_GENERIC_FAMILIES = [
   'gift_cards', 'gift-cards', 'gift cards', 'giftcards',
   'top_up', 'top-up', 'topup',
   'subscription', 'subscriptions',
+  'game pass', 'game_pass', 'gamepass',  /* MSG325: platform subscription passes */
 ];
 /* Known game/brand identities that are strong product signals */
 const PT_IDENTITY_KEYWORDS = [
   'ea sports fc', 'fc 24', 'fc 25', 'fc 26',
   'fortnite', 'pubg', 'playerunknown', 'battlegrounds',
-  'apex legends', 'call of duty', 'cod', 'valorant', 'overwatch',
+  'apex legends', 'call of duty', 'cod', 'black ops', 'valorant', 'overwatch',
   'minecraft', 'roblox', 'gta', 'grand theft auto',
   'fifa', 'nba 2k', 'madden', 'nhl',
   'diablo', 'world of warcraft', 'wow', 'starfield', 'cyberpunk',
@@ -677,6 +678,60 @@ const PT_IDENTITY_KEYWORDS = [
   'edition', 'deluxe', 'ultimate', 'standard', 'premium',
   'icons edition', 'gold edition', 'special edition',
 ];
+
+/* MSG354: Extract entity anchor and type family from a display label.
+   BSV catalogue labels follow format "Entity - TypeFamily" (space-dash-space separator).
+   Returns {entity, type, parsed: true} or {entity: '', type: '', parsed: false} on failure.
+   Safe fallback: if split fails, parsed=false signals caller to skip entity/type gating. */
+function extractEntityAndType(displayLabel) {
+  const s = String(displayLabel || '').trim();
+  if (!s) return { entity: '', type: '', parsed: false };
+  /* Split on last " - " or " – " (display separator with spaces).
+     Use lastIndexOf to handle entity names that contain " - " (rare but defensive). */
+  const dashIdx = s.lastIndexOf(' - ');
+  const enDashIdx = s.lastIndexOf(' – ');
+  const idx = Math.max(dashIdx, enDashIdx);
+  if (idx <= 0 || idx >= s.length - 3) return { entity: '', type: '', parsed: false };
+  const sepLen = (idx === enDashIdx) ? 3 : 3; /* " - " = 3 chars, " – " = 3 chars */
+  const entity = s.substring(0, idx).trim();
+  const type = s.substring(idx + sepLen).trim();
+  if (!entity || !type) return { entity: '', type: '', parsed: false };
+  /* Filter out "(deleted)" suffix from type if present */
+  const cleanType = type.replace(/\s*\(deleted\)\s*$/i, '').trim();
+  return { entity: entity, type: cleanType || type, parsed: true };
+}
+
+/* MSG354: Compare entity anchors (normalized, case-insensitive).
+   Returns 'confirmed' | 'conflict' | 'uncertain'. */
+function compareEntityAnchors(currentEntity, recommendedEntity) {
+  if (!currentEntity || !recommendedEntity) return 'uncertain';
+  const a = normSlug(currentEntity);
+  const b = normSlug(recommendedEntity);
+  if (!a || !b) return 'uncertain';
+  if (a === b) return 'confirmed';
+  /* Check containment: "Steam Gift Cards" entity contains "Steam" */
+  if (a.includes(b) || b.includes(a)) return 'confirmed';
+  return 'conflict';
+}
+
+/* MSG354: Compare type families (normalized, case-insensitive).
+   Returns 'confirmed' | 'conflict' | 'uncertain'. */
+function compareTypeFamilies(currentType, recommendedType) {
+  if (!currentType || !recommendedType) return 'uncertain';
+  const a = normSlug(currentType);
+  const b = normSlug(recommendedType);
+  if (!a || !b) return 'uncertain';
+  if (a === b) return 'confirmed';
+  /* Normalize common variants */
+  const normalize = (t) => t
+    .replace(/gift\s*cards?/g, 'gift cards')
+    .replace(/prepaid\s*vouchers?/g, 'prepaid vouchers')
+    .replace(/vouchers?/g, 'vouchers')
+    .replace(/subscriptions?/g, 'subscriptions')
+    .trim();
+  if (normalize(a) === normalize(b)) return 'confirmed';
+  return 'conflict';
+}
 
 /* Check if candidate is a generic platform family (e.g., Gift_cards-Xbox) */
 function isGenericPlatformCandidate(candidateSlug) {
@@ -715,6 +770,14 @@ function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleSta
     identitySignals: [],           /* MSG142: identity keywords found in product name */
     platformSignals: [],           /* MSG142: platform keywords found in product name */
     suspectReason: '',             /* MSG142: why candidate is suspect */
+    /* MSG354: entity/type split layer (additive — does not replace semantic match) */
+    entityAnchorCurrent: '',       /* entity extracted from current display label */
+    entityAnchorRecommended: '',   /* entity extracted from recommended display label */
+    typeFamilyCurrent: '',         /* type family extracted from current display label */
+    typeFamilyRecommended: '',     /* type family extracted from recommended display label */
+    entityMatch: 'uncertain',      /* 'confirmed' | 'conflict' | 'uncertain' */
+    typeMatch: 'uncertain',        /* 'confirmed' | 'conflict' | 'uncertain' */
+    entityTypeParsed: false,       /* true if both labels were successfully parsed */
     showHelper: false,
     helperMode: 'none',       /* 'none' | 'replacement' | 'unresolved' */
     uiStatus: 'yellow',       /* 'green' | 'yellow' | 'red' */
@@ -789,6 +852,50 @@ function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleSta
       }
     }
   }
+
+  /* Step 2c (MSG325): If candidate is suspect AND current PT shares identity signals
+     with product name, promote to semantic match (green). The current PT is already correct
+     for this product — the generic candidate is a false positive, not a real replacement.
+     Example: "Call of Duty Black Ops 7 (Game Pass)" with current PT "Call of Duty - Games"
+     → candidate "xbox-game-pass-gift-cards" is suspect AND current PT shares "call of duty"
+     → treat as confirmed match, not just suspect/unresolved. */
+  if (state.candidateSuspect && !state.semanticMatch) {
+    const currentIdentity = findIdentitySignals(currentLabel);
+    const nameIdentity = state.identitySignals;
+    const sharedIdentity = currentIdentity.filter(kw => nameIdentity.includes(kw));
+    if (sharedIdentity.length > 0) {
+      state.semanticMatch = true;
+      state.candidateSuspect = false;  /* no longer suspect — confirmed via identity */
+      state.suspectReason = '';
+    }
+  }
+
+  /* Step 2d (MSG354): Entity/type split layer.
+     Additive gate: even if semanticMatch=true, if entity is confirmed but type conflicts,
+     green is forbidden (PT-BLOCK-SPEC-01 §9). Safe fallback: if parsing fails, skip gate. */
+  const etCurrent = extractEntityAndType(state.currentDisplay);
+  const etRecommended = extractEntityAndType(state.recommendedDisplay);
+  if (etCurrent.parsed) {
+    state.entityAnchorCurrent = etCurrent.entity;
+    state.typeFamilyCurrent = etCurrent.type;
+  }
+  if (etRecommended.parsed) {
+    state.entityAnchorRecommended = etRecommended.entity;
+    state.typeFamilyRecommended = etRecommended.type;
+  }
+  if (etCurrent.parsed && etRecommended.parsed) {
+    state.entityTypeParsed = true;
+    state.entityMatch = compareEntityAnchors(etCurrent.entity, etRecommended.entity);
+    state.typeMatch = compareTypeFamilies(etCurrent.type, etRecommended.type);
+    /* Gate: entity confirmed + type conflict → green forbidden, even if semanticMatch=true.
+       This catches cases like "Steam Gift Cards - Gift cards" vs "Steam - Games" where
+       canonical match might pass but type family actually differs. */
+    if (state.semanticMatch && state.entityMatch === 'confirmed' && state.typeMatch === 'conflict') {
+      state.semanticMatch = false;
+    }
+  }
+  /* If parsing failed for either label, entityTypeParsed=false → gate skipped,
+     existing semantic match logic governs (safe fallback). */
 
   /* Step 3: Determine UI state */
   if (state.semanticMatch) {
@@ -2557,6 +2664,13 @@ function renderAiTraceBlock(card, session) {
     trow('PT platform signals', (ptTraceRes.platformSignals || []).join(', ') || 'none'),
     trow('PT candidate suspect', String(ptTraceRes.candidateSuspect), ptTraceRes.candidateSuspect ? '#f59e0b' : '#4ade80'),
     trow('PT suspect reason', ptTraceRes.suspectReason || '—'),
+    trow('PT entity/type parsed', String(ptTraceRes.entityTypeParsed)),
+    trow('PT entity current', ptTraceRes.entityAnchorCurrent || '—'),
+    trow('PT entity recommended', ptTraceRes.entityAnchorRecommended || '—'),
+    trow('PT entity match', ptTraceRes.entityMatch, ptTraceRes.entityMatch === 'confirmed' ? '#4ade80' : ptTraceRes.entityMatch === 'conflict' ? '#f87171' : '#fbbf24'),
+    trow('PT type current', ptTraceRes.typeFamilyCurrent || '—'),
+    trow('PT type recommended', ptTraceRes.typeFamilyRecommended || '—'),
+    trow('PT type match', ptTraceRes.typeMatch, ptTraceRes.typeMatch === 'confirmed' ? '#4ade80' : ptTraceRes.typeMatch === 'conflict' ? '#f87171' : '#fbbf24'),
     trow('RG current', snapRg),
     trow('RG recommended', rgCand || '—'),
     trow('RG canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
@@ -2752,6 +2866,11 @@ function renderDetailPanel(session) {
   let ptAction3;
   if (ptRes3.semanticMatch) {
     ptAction3 = `ProductType подтверждён ${ptMatchLabel}.`;
+  } else if (ptRes3.entityTypeParsed && ptRes3.entityMatch === 'confirmed' && ptRes3.typeMatch === 'conflict') {
+    /* MSG354: entity confirmed but type family conflicts — specific reason */
+    ptAction3 = 'Сущность ' + (ptRes3.entityAnchorCurrent || '?') + ' подтверждена, но тип ' +
+      (ptRes3.typeFamilyRecommended || '?') + ' не соответствует каталогу (' +
+      (ptRes3.typeFamilyCurrent || '?') + '). Требуется проверка.';
   } else if (ptRes3.candidateSuspect) {
     ptAction3 = 'AI candidate может быть ложным (platform keyword). Требуется ручная проверка.';
   } else {
