@@ -701,6 +701,55 @@ function extractEntityAndType(displayLabel) {
   return { entity: entity, type: cleanType || type, parsed: true };
 }
 
+/* MSG388: Extract entity and type from a backend slug when catalogue resolution failed.
+   Slug format: "type-entity" e.g. "gift-cards-nintendo-switch-online", "games-fortnite".
+   Uses known type family prefixes to split slug into entity + type.
+   Returns same shape as extractEntityAndType: {entity, type, parsed}. */
+const SLUG_TYPE_PREFIXES = [
+  'gift_cards', 'gift-cards',
+  'prepaid_vouchers', 'prepaid-vouchers',
+  'games',
+  'software',
+  'entertainment',
+  'mobile_communications', 'mobile-communications',
+  'top_up', 'top-up',
+  'voip',
+  'fashion',
+  'food',
+  'travel',
+  'home_and_garden', 'home-and-garden',
+  'retail_and_online_shopping', 'retail-and-online-shopping',
+  'virtual_credit_cards', 'virtual-credit-cards',
+  'restaurants',
+];
+
+function extractEntityAndTypeFromSlug(slug) {
+  if (!slug) return { entity: '', type: '', parsed: false };
+  const s = String(slug).toLowerCase().trim();
+  if (!s) return { entity: '', type: '', parsed: false };
+  /* Try each known prefix — longest match first */
+  const sorted = SLUG_TYPE_PREFIXES.slice().sort((a, b) => b.length - a.length);
+  for (const prefix of sorted) {
+    /* Slug starts with type prefix followed by separator (type-first format) */
+    if (s.startsWith(prefix + '-') || s.startsWith(prefix + '_')) {
+      const entityPart = s.substring(prefix.length + 1).trim();
+      if (!entityPart) continue;
+      const entity = entityPart.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
+      const type = prefix.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
+      if (entity && type) return { entity: entity, type: type, parsed: true };
+    }
+    /* Slug ends with type suffix preceded by separator (entity-first format) */
+    if (s.endsWith('-' + prefix) || s.endsWith('_' + prefix)) {
+      const entityPart = s.substring(0, s.length - prefix.length - 1).trim();
+      if (!entityPart) continue;
+      const entity = entityPart.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
+      const type = prefix.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
+      if (entity && type) return { entity: entity, type: type, parsed: true };
+    }
+  }
+  return { entity: '', type: '', parsed: false };
+}
+
 /* MSG354: Compare entity anchors (normalized, case-insensitive).
    Returns 'confirmed' | 'conflict' | 'uncertain'. */
 function compareEntityAnchors(currentEntity, recommendedEntity) {
@@ -946,7 +995,15 @@ function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleSta
      Additive gate: even if semanticMatch=true, if entity is confirmed but type conflicts,
      green is forbidden (PT-BLOCK-SPEC-01 §9). Safe fallback: if parsing fails, skip gate. */
   const etCurrent = extractEntityAndType(state.currentDisplay);
-  const etRecommended = extractEntityAndType(state.recommendedDisplay);
+  /* MSG388: If recommended display is a raw slug (no " - " separator),
+     try extracting entity/type from slug format. This handles cases where
+     catalogue resolution failed because the slug maps to a different type family
+     than any popup option (e.g., "nintendo-switch-online-gift-cards" when popup
+     only has "Nintendo Switch Online - Games"). */
+  let etRecommended = extractEntityAndType(state.recommendedDisplay);
+  if (!etRecommended.parsed && state.recommendedRaw) {
+    etRecommended = extractEntityAndTypeFromSlug(state.recommendedRaw);
+  }
   if (etCurrent.parsed) {
     state.entityAnchorCurrent = etCurrent.entity;
     state.typeFamilyCurrent = etCurrent.type;
