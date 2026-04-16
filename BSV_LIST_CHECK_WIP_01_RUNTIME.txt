@@ -931,8 +931,17 @@ function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleSta
   };
 
   if (!candidateId) {
-    state.semanticMatch = true;
-    state.uiStatus = 'green';
+    /* MSG404+MSG405: No-candidate guard.
+       Green only when backend explicitly confirmed AND current PT is not a placeholder.
+       "Other"/"Other - Other" is a placeholder — auto-green is ALWAYS forbidden for it. */
+    const isOtherEarly = /^other(\s*-\s*other)?$/i.test(norm(currentLabel));
+    if (moduleStatus === 'match' && !isOtherEarly) {
+      state.semanticMatch = true;
+      state.uiStatus = 'green';
+    } else {
+      state.semanticMatch = false;
+      state.uiStatus = 'yellow';
+    }
     return state;
   }
 
@@ -1073,6 +1082,14 @@ function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleSta
   }
   /* If parsing failed for either label, entityTypeParsed=false → gate skipped,
      existing semantic match logic governs (safe fallback). */
+
+  /* MSG404: "Other" guard — current PT = "Other" or "Other - Other" should never auto-green.
+     If the current PT is a generic placeholder, auto-confirmation is unsafe regardless of
+     what the candidate says — the product needs manual ProductType assignment. */
+  const isOtherPT = /^other(\s*-\s*other)?$/i.test(norm(state.currentDisplay));
+  if (isOtherPT && state.semanticMatch) {
+    state.semanticMatch = false;
+  }
 
   /* Step 3: Determine UI state */
   if (state.semanticMatch) {
