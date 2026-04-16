@@ -623,6 +623,17 @@ function normSlug(s) {
   return String(s || '').toLowerCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+/* MSG400: Strict slug normalization — strips punctuation for entity matching.
+   First removes apostrophes/quotes (joining adjacent chars: "PLAYERUNKNOWN'S" → "PLAYERUNKNOWNS"),
+   then replaces remaining non-alnum with spaces.
+   Used as fallback comparison layer, not as primary normalization. */
+function normSlugStrict(s) {
+  return String(s || '').toLowerCase()
+    .replace(/[''`]/g, '')          /* strip apostrophes/quotes (join chars) */
+    .replace(/[^a-z0-9]+/g, ' ')   /* remaining non-alnum → space */
+    .replace(/\s+/g, ' ').trim();
+}
+
 /* Find popup option that matches a candidate slug/id.
    Returns {value, label} or null.
    Match strategy: slug-normalized comparison of option labels. */
@@ -643,6 +654,15 @@ function resolveProductTypeFromCatalogue(candidateId, options) {
   for (const opt of options) {
     const optParts = normSlug(opt.label).split(/\s+/).sort().join(' ');
     if (optParts === needleParts) return opt;
+  }
+  /* 4. MSG400: Strict-normalized sorted-parts match (strips punctuation).
+     Handles "PLAYERUNKNOWN'S" vs "PLAYERUNKNOWNS" differences. */
+  const needleStrict = normSlugStrict(candidateId).split(/\s+/).sort().join(' ');
+  if (needleStrict) {
+    for (const opt of options) {
+      const optStrict = normSlugStrict(opt.label).split(/\s+/).sort().join(' ');
+      if (optStrict === needleStrict) return opt;
+    }
   }
   return null;
 }
@@ -760,6 +780,12 @@ function compareEntityAnchors(currentEntity, recommendedEntity) {
   if (a === b) return 'confirmed';
   /* Check containment: "Steam Gift Cards" entity contains "Steam" */
   if (a.includes(b) || b.includes(a)) return 'confirmed';
+  /* MSG400: Strict comparison — strips punctuation.
+     "playerunknown's battlegrounds" vs "playerunknowns battlegrounds" */
+  const sa = normSlugStrict(currentEntity);
+  const sb = normSlugStrict(recommendedEntity);
+  if (sa && sb && sa === sb) return 'confirmed';
+  if (sa && sb && (sa.includes(sb) || sb.includes(sa))) return 'confirmed';
   return 'conflict';
 }
 
