@@ -733,6 +733,77 @@ function compareTypeFamilies(currentType, recommendedType) {
   return 'conflict';
 }
 
+/* MSG375 (PT-BLOCK-SPEC-02): Determine relation class between two type families.
+   Returns one of: 'exact_same_type' | 'allowed_related_type' | 'conflicting_type'.
+   allowed_related_type = same entity sells through different but commercially related forms
+   (e.g., Games vs Gift cards for the same brand/service — access/redemption/entitlement link).
+
+   Type families that are considered commercially related (bidirectional):
+   - Gift cards ↔ Games (gift card as access/purchase mechanism for games)
+   - Gift cards ↔ Prepaid Vouchers (redemption mechanism variants)
+   - Gift cards ↔ Entertainment (gift card for entertainment service)
+   - Gift cards ↔ Software (gift card for software service)
+   - Games ↔ Software (game delivered as software)
+   This list is closed. AI cannot invent new relations. */
+const RELATED_TYPE_PAIRS = [
+  ['gift cards', 'games'],
+  ['gift cards', 'prepaid vouchers'],
+  ['gift cards', 'entertainment'],
+  ['gift cards', 'software'],
+  ['gift cards', 'mobile communications'],
+  ['games', 'software'],
+];
+
+function classifyTypeRelation(typeA, typeB) {
+  if (!typeA || !typeB) return 'exact_same_type'; /* fallback: no types to compare */
+  const a = normSlug(typeA);
+  const b = normSlug(typeB);
+  if (!a || !b) return 'exact_same_type';
+  /* Normalize variants */
+  const norm2 = (t) => t
+    .replace(/gift\s*cards?/g, 'gift cards')
+    .replace(/prepaid\s*vouchers?/g, 'prepaid vouchers')
+    .replace(/vouchers?/g, 'vouchers')
+    .replace(/subscriptions?/g, 'subscriptions')
+    .trim();
+  const na = norm2(a), nb = norm2(b);
+  if (na === nb) return 'exact_same_type';
+  /* Check related pairs (bidirectional) */
+  for (const [x, y] of RELATED_TYPE_PAIRS) {
+    if ((na.includes(x) && nb.includes(y)) || (na.includes(y) && nb.includes(x))) {
+      return 'allowed_related_type';
+    }
+  }
+  return 'conflicting_type';
+}
+
+/* MSG377: Access/relation text signals required for allowed_related_type GREEN promotion.
+   Without these signals in productName, type-pair match alone is insufficient.
+   This prevents over-broad GREEN for cases like "Steam Gift Cards" vs "Steam - Games"
+   while allowing "Nintendo Switch Online 12 Month Membership" → GREEN. */
+const RELATED_TYPE_TEXT_SIGNALS = [
+  'membership', 'subscription', 'subscribe',
+  'online', 'pass', 'access',
+  'activate', 'activation', 'redeem', 'redemption',
+  'top up', 'top-up', 'topup', 'recharge',
+  'credit', 'balance', 'wallet',
+  'month', 'year', 'day', 'week',  /* duration signals → subscription/access */
+];
+
+/* Check if productName contains access/relation text signals BEYOND entity name.
+   entityName is stripped from productName to avoid false positives
+   (e.g., "Nintendo Switch Online" contains "online" but that's part of entity, not evidence). */
+function hasRelatedTypeTextEvidence(productName, entityName) {
+  if (!productName) return false;
+  let t = String(productName).toLowerCase();
+  /* Strip entity name to avoid counting entity words as evidence */
+  if (entityName) {
+    const ent = String(entityName).toLowerCase();
+    t = t.replace(ent, ' ').replace(/\s+/g, ' ').trim();
+  }
+  return RELATED_TYPE_TEXT_SIGNALS.some(sig => t.includes(sig));
+}
+
 /* Check if candidate is a generic platform family (e.g., Gift_cards-Xbox) */
 function isGenericPlatformCandidate(candidateSlug) {
   const s = normSlug(candidateSlug);
@@ -777,6 +848,7 @@ function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleSta
     typeFamilyRecommended: '',     /* type family extracted from recommended display label */
     entityMatch: 'uncertain',      /* 'confirmed' | 'conflict' | 'uncertain' */
     typeMatch: 'uncertain',        /* 'confirmed' | 'conflict' | 'uncertain' */
+    relationClass: 'unknown',      /* MSG375: 'exact_same_type' | 'allowed_related_type' | 'generic_platform_only' | 'conflicting_type' | 'unknown' */
     entityTypeParsed: false,       /* true if both labels were successfully parsed */
     showHelper: false,
     helperMode: 'none',       /* 'none' | 'replacement' | 'unresolved' */
@@ -887,11 +959,33 @@ function resolveProductTypeState(currentLabel, candidateId, ptOptions, moduleSta
     state.entityTypeParsed = true;
     state.entityMatch = compareEntityAnchors(etCurrent.entity, etRecommended.entity);
     state.typeMatch = compareTypeFamilies(etCurrent.type, etRecommended.type);
-    /* Gate: entity confirmed + type conflict → green forbidden, even if semanticMatch=true.
-       This catches cases like "Steam Gift Cards - Gift cards" vs "Steam - Games" where
-       canonical match might pass but type family actually differs. */
+    /* MSG375: Classify relation between type families (PT-BLOCK-SPEC-02 §4) */
+    if (state.typeMatch === 'confirmed') {
+      state.relationClass = 'exact_same_type';
+    } else if (state.entityMatch === 'confirmed') {
+      state.relationClass = classifyTypeRelation(etCurrent.type, etRecommended.type);
+    } else if (state.candidateSuspect) {
+      state.relationClass = 'generic_platform_only';
+    } else {
+      state.relationClass = state.entityMatch === 'conflict' ? 'conflicting_type' : 'unknown';
+    }
+    /* Gate: entity confirmed + type conflict → green forbidden, UNLESS allowed_related_type
+       WITH text evidence (MSG377 narrowing of MSG375).
+       PT-BLOCK-SPEC-02 §7: allowed_related_type requires same entity + text supports
+       functional relation. Type-pair match alone is insufficient. */
+    const relatedWithEvidence = state.relationClass === 'allowed_related_type' &&
+      hasRelatedTypeTextEvidence(productName, state.entityAnchorCurrent);
     if (state.semanticMatch && state.entityMatch === 'confirmed' && state.typeMatch === 'conflict') {
-      state.semanticMatch = false;
+      if (relatedWithEvidence) {
+        /* MSG377: same entity + related type + text evidence → keep GREEN */
+      } else {
+        state.semanticMatch = false;
+      }
+    }
+    /* MSG377: Promote to green only with text evidence */
+    if (!state.semanticMatch && state.entityMatch === 'confirmed' &&
+        state.typeMatch === 'conflict' && relatedWithEvidence) {
+      state.semanticMatch = true;
     }
   }
   /* If parsing failed for either label, entityTypeParsed=false → gate skipped,
@@ -2671,6 +2765,10 @@ function renderAiTraceBlock(card, session) {
     trow('PT type current', ptTraceRes.typeFamilyCurrent || '—'),
     trow('PT type recommended', ptTraceRes.typeFamilyRecommended || '—'),
     trow('PT type match', ptTraceRes.typeMatch, ptTraceRes.typeMatch === 'confirmed' ? '#4ade80' : ptTraceRes.typeMatch === 'conflict' ? '#f87171' : '#fbbf24'),
+    trow('PT relation class', ptTraceRes.relationClass || 'unknown',
+      ptTraceRes.relationClass === 'exact_same_type' ? '#4ade80' :
+      ptTraceRes.relationClass === 'allowed_related_type' ? '#a78bfa' :
+      ptTraceRes.relationClass === 'conflicting_type' ? '#f87171' : '#fbbf24'),
     trow('RG current', snapRg),
     trow('RG recommended', rgCand || '—'),
     trow('RG canonical match', String(rgCanonEq), rgCanonEq ? '#4ade80' : '#f87171'),
@@ -2864,7 +2962,13 @@ function renderDetailPanel(session) {
     ? (ptRes3.catalogueResolved ? '(catalogue match)' : '(canonical match)')
     : '';
   let ptAction3;
-  if (ptRes3.semanticMatch) {
+  if (ptRes3.semanticMatch && ptRes3.relationClass === 'allowed_related_type') {
+    /* MSG375: same entity + allowed related type → green with specific reason */
+    ptAction3 = 'Сущность ' + (ptRes3.entityAnchorCurrent || '?') +
+      ' подтверждена. Текущий и рекомендованный типы (' +
+      (ptRes3.typeFamilyCurrent || '?') + ' / ' + (ptRes3.typeFamilyRecommended || '?') +
+      ') относятся к одной сущности и считаются допустимо связанными.';
+  } else if (ptRes3.semanticMatch) {
     ptAction3 = `ProductType подтверждён ${ptMatchLabel}.`;
   } else if (ptRes3.entityTypeParsed && ptRes3.entityMatch === 'confirmed' && ptRes3.typeMatch === 'conflict') {
     /* MSG354: entity confirmed but type family conflicts — specific reason */
@@ -2880,6 +2984,7 @@ function renderDetailPanel(session) {
     { label: 'Текущий', value: ptCur3 },
     { label: 'Рекомендованный', html: esc(ptRes3.recommendedDisplay || ptCur3) +
       (ptRes3.semanticMatch && ptCand3 ? ` <span style="color:#4ade80;font-size:11px;">${ptMatchLabel}</span>` : '') +
+      (ptRes3.relationClass === 'allowed_related_type' ? ' <span style="color:#a78bfa;font-size:11px;">(related type)</span>' : '') +
       (ptRes3.candidateSuspect ? ' <span style="color:#f59e0b;font-size:11px;">(suspect — platform keyword)</span>' : '') },
     { label: 'Действие', value: ptAction3 },
     { label: 'Источник', value: 'catalogue' },
