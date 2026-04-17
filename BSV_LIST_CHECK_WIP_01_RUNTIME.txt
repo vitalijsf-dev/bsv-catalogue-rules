@@ -88,12 +88,25 @@ const ALIAS_SNAPSHOT_CONFIG = {
   timeout:  6000,
 };
 
-/* ── CONFIG: AI RULES SNAPSHOT (Step 4 — preview only) ──────────
+/* ── CONFIG: AI RULES SNAPSHOT (Step 4 preview + Step 5 integration) ─
    Published snapshot from AI_Rules_Center.
-   Used ONLY in preview mode — production path unchanged. */
+   Step 4: preview-only comparison mode.
+   Step 5: production integration with feature flag gate.
+   Feature flag runtime_pt_snapshot_enabled controls production path.
+   Default = false → hardcoded constants used. */
 const AI_RULES_SNAPSHOT_CONFIG = {
   url:     'https://vitalijsf-dev.github.io/bsv-catalogue-rules/AI_RULES_SNAPSHOT_LATEST.json',
   timeout: 8000,
+};
+
+/* ── STEP 5: FEATURE FLAGS (defaults OFF) ───────────────────────
+   runtime_pt_snapshot_enabled:
+     false (default) → hardcoded PT_IDENTITY_KEYWORDS etc.
+     true → snapshot-driven constants from AI_RULES_SNAPSHOT_LATEST.json
+   Activation: set to true ONLY after snapshot verification.
+   Fallback: if snapshot unavailable/invalid → hardcoded regardless of flag. */
+const STEP5_FLAGS = {
+  runtime_pt_snapshot_enabled: false,
 };
 
 /* ── EMBEDDED ALIAS SNAPSHOT FALLBACK (MSG158) ───────────────────
@@ -851,8 +864,8 @@ function classifyTypeRelation(typeA, typeB) {
     .trim();
   const na = norm2(a), nb = norm2(b);
   if (na === nb) return 'exact_same_type';
-  /* Check related pairs (bidirectional) */
-  for (const [x, y] of RELATED_TYPE_PAIRS) {
+  /* Check related pairs (bidirectional) — snapshot-aware via getPtRelatedTypePairs() */
+  for (const [x, y] of getPtRelatedTypePairs()) {
     if ((na.includes(x) && nb.includes(y)) || (na.includes(y) && nb.includes(x))) {
       return 'allowed_related_type';
     }
@@ -884,26 +897,97 @@ function hasRelatedTypeTextEvidence(productName, entityName) {
     const ent = String(entityName).toLowerCase();
     t = t.replace(ent, ' ').replace(/\s+/g, ' ').trim();
   }
-  return RELATED_TYPE_TEXT_SIGNALS.some(sig => t.includes(sig));
+  return getPtTextSignals().some(sig => t.includes(sig));
+}
+
+/* ── STEP 5: SNAPSHOT-AWARE CONSTANTS LAYER ─────────────────────
+   Provides active PT constants: snapshot-driven or hardcoded fallback.
+   Controlled by STEP5_FLAGS.runtime_pt_snapshot_enabled.
+   Snapshot must be loaded via loadRulesSnapshotForProduction() before use.
+   If flag OFF or snapshot unavailable → hardcoded arrays used (zero behavior change). */
+let _snapshotPtConsts = null;   /* populated when snapshot loads successfully */
+let _ptConstsSource = 'hardcoded';   /* diagnostic: 'hardcoded' | 'snapshot' */
+
+function getPtIdentityKeywords() {
+  return (_snapshotPtConsts && STEP5_FLAGS.runtime_pt_snapshot_enabled)
+    ? _snapshotPtConsts.identityKeywords : PT_IDENTITY_KEYWORDS;
+}
+function getPtPlatformKeywords() {
+  return (_snapshotPtConsts && STEP5_FLAGS.runtime_pt_snapshot_enabled)
+    ? _snapshotPtConsts.platformKeywords : PT_PLATFORM_KEYWORDS;
+}
+function getPtGenericFamilies() {
+  return (_snapshotPtConsts && STEP5_FLAGS.runtime_pt_snapshot_enabled)
+    ? _snapshotPtConsts.genericFamilies : PT_GENERIC_FAMILIES;
+}
+function getPtRelatedTypePairs() {
+  return (_snapshotPtConsts && STEP5_FLAGS.runtime_pt_snapshot_enabled)
+    ? _snapshotPtConsts.relatedTypePairs : RELATED_TYPE_PAIRS;
+}
+function getPtTextSignals() {
+  return (_snapshotPtConsts && STEP5_FLAGS.runtime_pt_snapshot_enabled)
+    ? _snapshotPtConsts.textSignals : RELATED_TYPE_TEXT_SIGNALS;
+}
+
+/**
+ * Load snapshot and extract PT constants for production path.
+ * Called at startup. If anything fails → _snapshotPtConsts stays null → hardcoded used.
+ */
+async function loadRulesSnapshotForProduction() {
+  if (!STEP5_FLAGS.runtime_pt_snapshot_enabled) {
+    _ptConstsSource = 'hardcoded';
+    console.log('[Step5] PT snapshot integration OFF — using hardcoded constants');
+    return;
+  }
+  try {
+    const snapshot = await fetchRulesSnapshot();
+    if (!snapshot || !snapshot.identity_keywords || !snapshot.platform_keywords) {
+      console.warn('[Step5] Snapshot invalid/incomplete — falling back to hardcoded');
+      _ptConstsSource = 'hardcoded';
+      return;
+    }
+    _snapshotPtConsts = {
+      identityKeywords: snapshot.identity_keywords.map(k => k.keyword),
+      platformKeywords: snapshot.platform_keywords
+        .filter(k => k.category === 'platform').map(k => k.keyword),
+      genericFamilies: snapshot.platform_keywords
+        .filter(k => k.category === 'generic_family').map(k => k.keyword),
+      relatedTypePairs: (snapshot.related_type_config || {}).type_pairs
+        ? snapshot.related_type_config.type_pairs.map(p => [p.type_a, p.type_b])
+        : RELATED_TYPE_PAIRS,
+      textSignals: (snapshot.related_type_config || {}).text_signals || RELATED_TYPE_TEXT_SIGNALS,
+    };
+    _ptConstsSource = 'snapshot';
+    console.log('[Step5] PT constants loaded from snapshot v' + (snapshot.version || '?') +
+      ' | identity=' + _snapshotPtConsts.identityKeywords.length +
+      ' platform=' + _snapshotPtConsts.platformKeywords.length +
+      ' families=' + _snapshotPtConsts.genericFamilies.length +
+      ' pairs=' + _snapshotPtConsts.relatedTypePairs.length +
+      ' signals=' + _snapshotPtConsts.textSignals.length);
+  } catch (e) {
+    console.warn('[Step5] Snapshot load failed — falling back to hardcoded:', e.message);
+    _snapshotPtConsts = null;
+    _ptConstsSource = 'hardcoded';
+  }
 }
 
 /* Check if candidate is a generic platform family (e.g., Gift_cards-Xbox) */
 function isGenericPlatformCandidate(candidateSlug) {
   const s = normSlug(candidateSlug);
-  return PT_GENERIC_FAMILIES.some(fam => s.includes(fam)) &&
-         PT_PLATFORM_KEYWORDS.some(plat => s.includes(plat));
+  return getPtGenericFamilies().some(fam => s.includes(fam)) &&
+         getPtPlatformKeywords().some(plat => s.includes(plat));
 }
 
 /* Check if text contains strong product identity signals */
 function findIdentitySignals(text) {
   const t = String(text || '').toLowerCase();
-  return PT_IDENTITY_KEYWORDS.filter(kw => t.includes(kw));
+  return getPtIdentityKeywords().filter(kw => t.includes(kw));
 }
 
 /* Check if text's only relevant signal is a platform keyword */
 function findPlatformSignals(text) {
   const t = String(text || '').toLowerCase();
-  return PT_PLATFORM_KEYWORDS.filter(kw => {
+  return getPtPlatformKeywords().filter(kw => {
     /* Match as whole word to avoid false positives (e.g., "switch" in "switching") */
     const re = new RegExp('\\b' + kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b');
     return re.test(t);
@@ -3005,6 +3089,13 @@ function renderAiTraceBlock(card, session) {
     trow('modStatusNew', card.modStatusNew || '—'),
   ].join(''));
 
+  /* H2. Step 5 Diagnostic — PT constants source */
+  const secH2 = tsec('H2. Step 5 Config Source', [
+    trow('pt_constants_source', _ptConstsSource),
+    trow('runtime_pt_snapshot_enabled', String(STEP5_FLAGS.runtime_pt_snapshot_enabled)),
+    trow('snapshot_loaded', String(!!_snapshotPtConsts)),
+  ].join(''));
+
   /* I. Denomination Apply Debug (MSG121 diagnostic) */
   const dnDiag = ((card.recommendations || {}).denomination || {}).applyDiag;
   let secI = '';
@@ -3070,7 +3161,7 @@ function renderAiTraceBlock(card, session) {
       ▼ AI Trace / Debug</button>
     <div style="margin-top:6px;padding:12px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.08);
       border-radius:10px;max-height:500px;overflow-y:auto;">
-      ${secA}${secB}${secC}${secD}${secE}${secF}${secG}${secH}${secI}${secJ}
+      ${secA}${secB}${secC}${secD}${secE}${secF}${secG}${secH}${secH2}${secI}${secJ}
     </div>
   </div>`;
 }
@@ -3580,6 +3671,8 @@ const MOD_STATUS_OPTIONS = [
 async function main() {
   /* MSG158: load alias snapshot before anything else */
   await loadAliasSnapshot();
+  /* Step 5: load AI Rules snapshot for production PT constants (if flag enabled) */
+  await loadRulesSnapshotForProduction();
 
   renderOverlay();
 
@@ -3628,6 +3721,8 @@ async function main() {
    Additive path — does not touch list-mode logic. */
 async function mainCard() {
   await loadAliasSnapshot();
+  /* Step 5: load AI Rules snapshot for production PT constants (if flag enabled) */
+  await loadRulesSnapshotForProduction();
 
   const productId = new URLSearchParams(location.search).get('id') || '';
   const nameEl    = document.querySelector('#product-form input[name="Product[name]"], #product-form [name="Product[name]"]');
