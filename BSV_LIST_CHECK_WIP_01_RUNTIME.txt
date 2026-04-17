@@ -88,6 +88,14 @@ const ALIAS_SNAPSHOT_CONFIG = {
   timeout:  6000,
 };
 
+/* ── CONFIG: AI RULES SNAPSHOT (Step 4 — preview only) ──────────
+   Published snapshot from AI_Rules_Center.
+   Used ONLY in preview mode — production path unchanged. */
+const AI_RULES_SNAPSHOT_CONFIG = {
+  url:     'https://vitalijsf-dev.github.io/bsv-catalogue-rules/AI_RULES_SNAPSHOT_LATEST.json',
+  timeout: 8000,
+};
+
 /* ── EMBEDDED ALIAS SNAPSHOT FALLBACK (MSG158) ───────────────────
    Stable snapshot of AI_Allowed_Aliases — used when live service
    is unavailable. Updated manually when new aliases are confirmed.
@@ -3405,6 +3413,8 @@ function renderActionBar(session) {
     btn('wip01-ms', 'Mod Status', all.length > 0, 'rgba(168,85,247,.15)', '#c084fc'),
     /* MSG221: test harness popup button */
     btn('wip01-test-popup', _s.testMode ? ('🔗 Popup ' + (_s.workerWin && !_s.workerWin.closed ? '✓' : '✗')) : '🧪 Test Popup', true, 'rgba(251,191,36,.12)', '#fbbf24'),
+    /* Step 4: Preview Rules — AI Rules Center snapshot comparison */
+    btn('wip01-previewRules', 'Preview Rules', all.length > 0, 'rgba(196,181,253,.15)', '#c4b5fd'),
   ].join('');
 
   /* Bind */
@@ -3546,6 +3556,10 @@ function renderActionBar(session) {
       alert('Popup заблокирован браузером. Разрешите popup для этого сайта.');
     }
   };
+
+  /* Step 4: Preview Rules — snapshot comparison */
+  const pr = b('wip01-previewRules');
+  if (pr && !pr.disabled) pr.onclick = () => handlePreviewRules(session);
 }
 
 /* ── FULL DASHBOARD RENDER ──────────────────────────────────── */
@@ -3701,6 +3715,475 @@ async function mainCard() {
   } catch (err) {
     container.innerHTML = '<b>BSV AI Review:</b> <span style="color:#ef4444;">Ошибка: ' + esc(err.message || String(err)) + '</span>';
   }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   STEP 4: PREVIEW RULES — AI Rules Center snapshot comparison
+   Read-only preview. No writeback. No production path changes.
+   Compares current hardcoded ProductType logic vs published snapshot.
+   ══════════════════════════════════════════════════════════════════ */
+
+/* Cached snapshot — one fetch per session, cleared on overlay close */
+let _cachedRulesSnapshot = null;
+
+/**
+ * Fetch AI_RULES_SNAPSHOT_LATEST.json from CDN.
+ * Returns parsed JSON or null on failure.
+ */
+async function fetchRulesSnapshot() {
+  if (_cachedRulesSnapshot) return _cachedRulesSnapshot;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), AI_RULES_SNAPSHOT_CONFIG.timeout);
+    const resp = await fetch(AI_RULES_SNAPSHOT_CONFIG.url, {
+      signal: ctrl.signal,
+      cache: 'no-cache',
+    });
+    clearTimeout(timer);
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (data && data.schema_version && data.identity_keywords) {
+      _cachedRulesSnapshot = data;
+      return data;
+    }
+    return null;
+  } catch (e) {
+    console.warn('[Preview Rules] Snapshot fetch failed:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Run ProductType resolution using snapshot-driven constants
+ * instead of hardcoded values. Isolated — does NOT touch production path.
+ *
+ * This re-implements the decision logic from resolveProductTypeState
+ * but substitutes snapshot data for hardcoded constants:
+ *   - identity_keywords → snapshot.identity_keywords
+ *   - platform_keywords → snapshot.platform_keywords (category=platform)
+ *   - generic_families → snapshot.platform_keywords (category=generic_family)
+ *   - related_type_pairs → snapshot.related_type_config.type_pairs
+ *   - text_signals → snapshot.related_type_config.text_signals
+ *   - feature_flags → snapshot.feature_flags
+ */
+function resolveProductTypeWithSnapshot(currentLabel, candidateId, ptOptions, moduleStatus, productName, snapshot) {
+  /* Extract snapshot-driven constants */
+  const snapIdentityKw = (snapshot.identity_keywords || []).map(k => k.keyword);
+  const snapPlatformKw = (snapshot.platform_keywords || [])
+    .filter(k => k.category === 'platform').map(k => k.keyword);
+  const snapGenericFamilies = (snapshot.platform_keywords || [])
+    .filter(k => k.category === 'generic_family').map(k => k.keyword);
+  const snapTypePairs = (snapshot.related_type_config || {}).type_pairs || [];
+  const snapTextSignals = (snapshot.related_type_config || {}).text_signals || [];
+  const flags = snapshot.feature_flags || {};
+
+  /* Local helper: find identity signals using snapshot keywords */
+  const findIdSig = (text) => {
+    const t = String(text || '').toLowerCase();
+    return snapIdentityKw.filter(kw => t.includes(kw));
+  };
+  /* Local helper: find platform signals using snapshot keywords */
+  const findPlatSig = (text) => {
+    const t = String(text || '').toLowerCase();
+    return snapPlatformKw.filter(kw => {
+      const re = new RegExp('\\b' + kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b');
+      return re.test(t);
+    });
+  };
+  /* Local helper: check generic platform candidate using snapshot families */
+  const isGenPlatCand = (slug) => {
+    const s = normSlug(slug);
+    return snapGenericFamilies.some(fam => s.includes(fam)) &&
+           snapPlatformKw.some(plat => s.includes(plat));
+  };
+  /* Local helper: classify type relation using snapshot pairs */
+  const classifyRelSnap = (typeA, typeB) => {
+    if (!typeA || !typeB) return 'exact_same_type';
+    const norm2 = (t) => normSlug(t)
+      .replace(/gift\s*cards?/g, 'gift cards')
+      .replace(/prepaid\s*vouchers?/g, 'prepaid vouchers')
+      .replace(/vouchers?/g, 'vouchers')
+      .replace(/subscriptions?/g, 'subscriptions')
+      .trim();
+    const na = norm2(typeA), nb = norm2(typeB);
+    if (na === nb) return 'exact_same_type';
+    for (const pair of snapTypePairs) {
+      const pa = norm2(pair.type_a), pb = norm2(pair.type_b);
+      if ((na.includes(pa) && nb.includes(pb)) || (na.includes(pb) && nb.includes(pa))) {
+        return 'allowed_related_type';
+      }
+    }
+    return 'conflicting_type';
+  };
+  /* Local helper: text evidence using snapshot signals */
+  const hasTextEvSnap = (pName, entityName) => {
+    if (!pName) return false;
+    let t = String(pName).toLowerCase();
+    if (entityName && flags.entity_strip_for_text_evidence !== false) {
+      t = t.replace(String(entityName).toLowerCase(), ' ').replace(/\s+/g, ' ').trim();
+    }
+    return snapTextSignals.some(sig => t.includes(sig));
+  };
+
+  /* ── Begin resolution (mirrors resolveProductTypeState logic) ── */
+  const result = {
+    currentDisplay: currentLabel || '',
+    recommendedDisplay: candidateId || '',
+    semanticMatch: false,
+    entityMatch: 'uncertain',
+    typeMatch: 'uncertain',
+    relationClass: 'unknown',
+    uiStatus: 'yellow',
+    candidateSuspect: false,
+    suspectReason: '',
+    identitySignals: [],
+    platformSignals: [],
+    reason: '',
+  };
+
+  /* No-candidate guard */
+  if (!candidateId) {
+    const isOther = /^other(\s*-\s*other)?$/i.test(norm(currentLabel));
+    if (flags.no_candidate_requires_backend_match !== false) {
+      if (moduleStatus === 'match' && !isOther) {
+        result.semanticMatch = true;
+        result.uiStatus = 'green';
+        result.reason = 'Нет кандидата, backend confirmed match';
+      } else {
+        result.uiStatus = 'yellow';
+        result.reason = isOther ? 'Other — auto-green запрещён' : 'Нет кандидата, backend не подтвердил';
+      }
+    } else {
+      result.semanticMatch = true;
+      result.uiStatus = 'green';
+      result.reason = 'Нет кандидата (flag: no guard)';
+    }
+    return result;
+  }
+
+  /* Catalogue resolution */
+  const catalogueMatch = resolveProductTypeFromCatalogue(candidateId, ptOptions || []);
+  if (catalogueMatch) {
+    result.recommendedDisplay = catalogueMatch.label;
+  }
+
+  /* Semantic match — same logic as production */
+  if (currentLabel === candidateId || norm(currentLabel) === norm(candidateId)) {
+    result.semanticMatch = true;
+  } else if (canonicalProductType(currentLabel) && canonicalProductType(currentLabel) === canonicalProductType(candidateId)) {
+    result.semanticMatch = true;
+  } else if (catalogueMatch && norm(currentLabel) === norm(catalogueMatch.label)) {
+    result.semanticMatch = true;
+  } else if (catalogueMatch && normSlug(currentLabel) === normSlug(catalogueMatch.label)) {
+    result.semanticMatch = true;
+  } else if (moduleStatus === 'match') {
+    result.semanticMatch = true;
+  }
+
+  /* Candidate quality — using SNAPSHOT identity/platform keywords */
+  if (!result.semanticMatch && productName) {
+    result.identitySignals = findIdSig(productName);
+    result.platformSignals = findPlatSig(productName);
+    const candidateIsGenericPlatform = isGenPlatCand(candidateId);
+
+    if (candidateIsGenericPlatform && result.identitySignals.length > 0) {
+      result.candidateSuspect = true;
+      result.suspectReason = 'generic platform + identity signals: ' + result.identitySignals.join(', ');
+    }
+    if (!result.candidateSuspect && candidateIsGenericPlatform) {
+      const curId = findIdSig(currentLabel);
+      const nameId = findIdSig(productName);
+      if (curId.filter(kw => nameId.includes(kw)).length > 0) {
+        result.candidateSuspect = true;
+        result.suspectReason = 'current PT shares identity with product name';
+      }
+    }
+  }
+
+  /* Suspect → identity promotion */
+  if (result.candidateSuspect && !result.semanticMatch) {
+    const curId = findIdSig(currentLabel);
+    const shared = curId.filter(kw => result.identitySignals.includes(kw));
+    if (shared.length > 0) {
+      result.semanticMatch = true;
+      result.candidateSuspect = false;
+      result.suspectReason = '';
+    }
+  }
+
+  /* Entity/type split — same parsing functions (shared) */
+  const etCurrent = extractEntityAndType(result.currentDisplay);
+  let etRecommended = extractEntityAndType(result.recommendedDisplay);
+  if (!etRecommended.parsed && candidateId) {
+    etRecommended = extractEntityAndTypeFromSlug(candidateId);
+  }
+  if (etCurrent.parsed && etRecommended.parsed) {
+    result.entityMatch = compareEntityAnchors(etCurrent.entity, etRecommended.entity);
+    result.typeMatch = compareTypeFamilies(etCurrent.type, etRecommended.type);
+
+    if (result.typeMatch === 'confirmed') {
+      result.relationClass = 'exact_same_type';
+    } else if (result.entityMatch === 'confirmed') {
+      result.relationClass = classifyRelSnap(etCurrent.type, etRecommended.type);
+    } else if (result.candidateSuspect) {
+      result.relationClass = 'generic_platform_only';
+    } else {
+      result.relationClass = result.entityMatch === 'conflict' ? 'conflicting_type' : 'unknown';
+    }
+
+    /* Gate: entity confirmed + type conflict — using SNAPSHOT related pairs + text signals */
+    const relatedWithEvidence = result.relationClass === 'allowed_related_type' &&
+      (flags.related_type_requires_text_evidence !== false
+        ? hasTextEvSnap(productName, etCurrent.entity)
+        : true);
+
+    if (result.semanticMatch && result.entityMatch === 'confirmed' && result.typeMatch === 'conflict') {
+      if (flags.related_type_policy === 'green' && relatedWithEvidence) {
+        /* keep GREEN */
+      } else {
+        result.semanticMatch = false;
+      }
+    }
+    if (!result.semanticMatch && result.entityMatch === 'confirmed' &&
+        result.typeMatch === 'conflict' && flags.related_type_policy === 'green' && relatedWithEvidence) {
+      result.semanticMatch = true;
+    }
+  }
+
+  /* Other guard — using snapshot flag */
+  if (flags.other_auto_green_forbidden !== false) {
+    const isOther = /^other(\s*-\s*other)?$/i.test(norm(result.currentDisplay));
+    if (isOther && result.semanticMatch) {
+      result.semanticMatch = false;
+    }
+  }
+
+  /* Determine UI status */
+  if (result.semanticMatch) {
+    result.uiStatus = 'green';
+    result.reason = 'Match подтверждён';
+  } else if (result.candidateSuspect) {
+    result.uiStatus = 'yellow';
+    result.reason = 'Suspect: ' + result.suspectReason;
+  } else if (moduleStatus === 'mismatch') {
+    result.uiStatus = 'red';
+    result.reason = 'Mismatch';
+  } else {
+    result.uiStatus = 'yellow';
+    result.reason = 'Uncertain';
+  }
+
+  return result;
+}
+
+/**
+ * Run preview comparison for selected cards.
+ * Returns array of { card, current, preview, diffs }.
+ */
+function previewRulesForCards(cards, snapshot) {
+  return cards.map(card => {
+    const b = card.beforeSnapshot;
+    const raw = card.aiRaw || {};
+    const sel = raw.selection || {};
+    const mods = raw.modules || {};
+
+    const pt = b ? (b.productTypeName || b.productTypeId || '') : card.productType || '';
+    const nm = b ? (b.name || card.productName) : card.productName;
+    const ptCand = sel.product_type_candidate_id || '';
+    const ptModStatus = (mods.product_type || {}).status || '';
+    const ptOptions = b ? (b.productTypeOptions || []) : [];
+
+    /* Current: production resolver (hardcoded constants) */
+    const current = resolveProductTypeState(pt, ptCand, ptOptions, ptModStatus, nm);
+
+    /* Preview: snapshot-driven resolver */
+    const preview = resolveProductTypeWithSnapshot(pt, ptCand, ptOptions, ptModStatus, nm, snapshot);
+
+    /* Compute diffs */
+    const diffs = [];
+    if (current.uiStatus !== preview.uiStatus) {
+      diffs.push({ field: 'uiStatus', from: current.uiStatus, to: preview.uiStatus });
+    }
+    if (current.semanticMatch !== preview.semanticMatch) {
+      diffs.push({ field: 'semanticMatch', from: String(current.semanticMatch), to: String(preview.semanticMatch) });
+    }
+    if (current.entityMatch !== preview.entityMatch) {
+      diffs.push({ field: 'entityMatch', from: current.entityMatch, to: preview.entityMatch });
+    }
+    if (current.typeMatch !== preview.typeMatch) {
+      diffs.push({ field: 'typeMatch', from: current.typeMatch, to: preview.typeMatch });
+    }
+    if (current.relationClass !== preview.relationClass) {
+      diffs.push({ field: 'relationClass', from: current.relationClass, to: preview.relationClass });
+    }
+    if (current.candidateSuspect !== preview.candidateSuspect) {
+      diffs.push({ field: 'candidateSuspect', from: String(current.candidateSuspect), to: String(preview.candidateSuspect) });
+    }
+
+    return {
+      productId: card.productId,
+      productName: card.productName,
+      currentPT: pt,
+      candidateId: ptCand,
+      current: {
+        uiStatus: current.uiStatus,
+        semanticMatch: current.semanticMatch,
+        entityMatch: current.entityMatch,
+        typeMatch: current.typeMatch,
+        relationClass: current.relationClass,
+        candidateSuspect: current.candidateSuspect,
+        recommendedDisplay: current.recommendedDisplay,
+      },
+      preview: {
+        uiStatus: preview.uiStatus,
+        semanticMatch: preview.semanticMatch,
+        entityMatch: preview.entityMatch,
+        typeMatch: preview.typeMatch,
+        relationClass: preview.relationClass,
+        candidateSuspect: preview.candidateSuspect,
+        recommendedDisplay: preview.recommendedDisplay,
+        reason: preview.reason,
+      },
+      diffs,
+      hasChanges: diffs.length > 0,
+    };
+  });
+}
+
+/**
+ * Render preview results in a modal overlay.
+ */
+function renderPreviewRulesModal(results, snapshotVersion, allCards, snapshot) {
+  const colorDot = (status) => {
+    const colors = { green: '#4ade80', yellow: '#facc15', red: '#f87171' };
+    return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${colors[status] || '#6b7280'};margin-right:4px;"></span>`;
+  };
+
+  const diffBadge = (from, to) => {
+    if (from === to) return `<span style="color:#6b7280;">${esc(from)}</span>`;
+    return `<span style="color:#f87171;text-decoration:line-through;">${esc(from)}</span> → <span style="color:#4ade80;font-weight:700;">${esc(to)}</span>`;
+  };
+
+  const changedCount = results.filter(r => r.hasChanges).length;
+  const unchangedCount = results.length - changedCount;
+
+  let rowsHtml = '';
+  for (const r of results) {
+    const bgColor = r.hasChanges ? 'rgba(250,204,21,.06)' : 'rgba(74,222,128,.04)';
+    const borderColor = r.hasChanges ? '#f59e0b' : '#22c55e';
+    rowsHtml += `
+      <div style="border:1px solid ${borderColor};border-radius:8px;padding:10px 14px;margin-bottom:8px;background:${bgColor};">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <div style="font-weight:700;font-size:13px;">${esc(r.productId)} — ${esc(r.productName.substring(0, 60))}${r.productName.length > 60 ? '…' : ''}</div>
+          <div style="font-size:11px;color:#9ca3af;">${r.hasChanges ? '⚠ ' + r.diffs.length + ' diff(s)' : '✓ No change'}</div>
+        </div>
+        <div style="font-size:12px;color:#d1d5db;margin-bottom:4px;">
+          Current PT: <b>${esc(r.currentPT)}</b> | Candidate: <b>${esc(r.candidateId || '—')}</b>
+        </div>
+        <table style="width:100%;font-size:11px;border-collapse:collapse;">
+          <tr style="color:#9ca3af;"><td style="padding:2px 6px;">Field</td><td style="padding:2px 6px;">Production</td><td style="padding:2px 6px;">Snapshot</td></tr>
+          <tr><td style="padding:2px 6px;color:#d1d5db;">Status</td>
+              <td style="padding:2px 6px;">${colorDot(r.current.uiStatus)}${esc(r.current.uiStatus)}</td>
+              <td style="padding:2px 6px;">${colorDot(r.preview.uiStatus)}${esc(r.preview.uiStatus)}</td></tr>
+          <tr><td style="padding:2px 6px;color:#d1d5db;">Semantic Match</td>
+              <td style="padding:2px 6px;">${diffBadge(String(r.current.semanticMatch), String(r.preview.semanticMatch))}</td>
+              <td></td></tr>
+          <tr><td style="padding:2px 6px;color:#d1d5db;">Entity Match</td>
+              <td style="padding:2px 6px;">${diffBadge(r.current.entityMatch, r.preview.entityMatch)}</td>
+              <td></td></tr>
+          <tr><td style="padding:2px 6px;color:#d1d5db;">Type Match</td>
+              <td style="padding:2px 6px;">${diffBadge(r.current.typeMatch, r.preview.typeMatch)}</td>
+              <td></td></tr>
+          <tr><td style="padding:2px 6px;color:#d1d5db;">Relation</td>
+              <td style="padding:2px 6px;">${diffBadge(r.current.relationClass, r.preview.relationClass)}</td>
+              <td></td></tr>
+          <tr><td style="padding:2px 6px;color:#d1d5db;">Suspect</td>
+              <td style="padding:2px 6px;">${diffBadge(String(r.current.candidateSuspect), String(r.preview.candidateSuspect))}</td>
+              <td></td></tr>
+        </table>
+        ${r.preview.reason ? `<div style="font-size:11px;color:#a78bfa;margin-top:4px;">Snapshot reason: ${esc(r.preview.reason)}</div>` : ''}
+      </div>`;
+  }
+
+  const modalId = 'wip01-preview-rules-modal';
+  const existingModal = document.getElementById(modalId);
+  if (existingModal) existingModal.remove();
+
+  const modal = document.createElement('div');
+  modal.id = modalId;
+  modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:100001;display:flex;align-items:center;justify-content:center;';
+  modal.innerHTML = `
+    <div style="background:#1e1e2e;border-radius:12px;padding:20px;max-width:720px;width:90%;max-height:80vh;overflow-y:auto;color:#e5e7eb;box-shadow:0 8px 32px rgba(0,0,0,.5);">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+        <div>
+          <div style="font-size:16px;font-weight:800;color:#c4b5fd;">Preview Rules — ProductType</div>
+          <div style="font-size:11px;color:#9ca3af;margin-top:2px;">
+            Snapshot v${snapshotVersion || '?'} | ${results.length} selected |
+            <span style="color:#4ade80;">${unchangedCount} unchanged</span> |
+            <span style="color:#facc15;">${changedCount} changed</span> |
+            READ-ONLY — production path unchanged
+          </div>
+        </div>
+        <div style="display:flex;gap:6px;">
+          ${allCards && allCards.length > results.length ? `<button id="wip01-preview-all" style="background:rgba(196,181,253,.15);border:1px solid #7c3aed;border-radius:6px;color:#c4b5fd;padding:4px 12px;cursor:pointer;font-size:12px;">All ${allCards.length} cards</button>` : ''}
+          <button id="wip01-preview-close" style="background:none;border:1px solid #4b5563;border-radius:6px;color:#9ca3af;padding:4px 12px;cursor:pointer;font-size:12px;">✕ Close</button>
+        </div>
+      </div>
+      ${rowsHtml || '<div style="color:#6b7280;padding:20px;text-align:center;">No cards to preview</div>'}
+    </div>`;
+  document.body.appendChild(modal);
+
+  document.getElementById('wip01-preview-close').onclick = () => modal.remove();
+  modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+
+  /* "All cards" button — expand preview to all scanned cards */
+  const allBtn = document.getElementById('wip01-preview-all');
+  if (allBtn && allCards && snapshot) {
+    allBtn.onclick = () => {
+      modal.remove();
+      const allResults = previewRulesForCards(allCards, snapshot);
+      renderPreviewRulesModal(allResults, snapshot.version, null, null);
+    };
+  }
+}
+
+/**
+ * Entry point: Preview Rules button handler.
+ * Fetches snapshot, runs comparison, shows modal.
+ */
+async function handlePreviewRules(session) {
+  const all = session.cards || [];
+  if (all.length === 0) {
+    alert('Нет отсканированных карточек для preview.');
+    return;
+  }
+
+  /* Selected card only — if none selected, prompt operator */
+  const sel = _s.uiSelectedId ? all.find(c => c.productId === _s.uiSelectedId) : null;
+  if (!sel) {
+    alert('Сначала выберите карточку в списке слева.');
+    return;
+  }
+  const selectedCards = [sel];
+
+  /* Fetch snapshot */
+  const btn = document.getElementById('wip01-previewRules');
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading snapshot...'; }
+
+  const snapshot = await fetchRulesSnapshot();
+  if (!snapshot) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Preview Rules'; }
+    alert('Не удалось загрузить AI Rules Snapshot с CDN.\nПроверьте сетевое подключение.');
+    return;
+  }
+
+  /* Run comparison for SELECTED card(s) only */
+  const results = previewRulesForCards(selectedCards, snapshot);
+
+  /* Show modal with option to expand to all */
+  renderPreviewRulesModal(results, snapshot.version, all, snapshot);
+
+  if (btn) { btn.disabled = false; btn.textContent = 'Preview Rules'; }
 }
 
 /* ── STARTUP ROUTER (STARTUP-ROUTER-01) ─────────────────────── */
